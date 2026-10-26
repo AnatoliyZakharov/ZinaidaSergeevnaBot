@@ -21,6 +21,7 @@ from datetime import datetime, time
 import pytz
 import requests
 import dateparser
+from dateparser.search import search_dates
 
 from telegram import Update
 from telegram.ext import (
@@ -137,16 +138,21 @@ def transcribe(audio_bytes: bytes) -> str:
 def parse_date(text: str) -> datetime | None:
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
-    return dateparser.parse(
-        text,
-        languages=["ru"],
-        settings={
-            "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": now,
-            "RETURN_AS_TIMEZONE_AWARE": True,
-            "TIMEZONE": TIMEZONE,
-        },
-    )
+    settings = {
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": now,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "TIMEZONE": TIMEZONE,
+    }
+    # Сначала пробуем напрямую (если передана только дата)
+    result = dateparser.parse(text, languages=["ru"], settings=settings)
+    if result:
+        return result
+    # Ищем дату внутри произвольного предложения
+    found = search_dates(text, languages=["ru"], settings=settings)
+    if found:
+        return found[0][1]
+    return None
 
 
 def date_to_ru(dt: datetime) -> str:

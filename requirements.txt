@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+requests==2.32.3
+dateparser==1.2.0
+pytz==2024.2
+google-auth==2.35.0
+google-api-python-client==2.149.0

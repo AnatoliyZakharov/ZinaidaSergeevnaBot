@@ -27,6 +27,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
+from telegram.request import HTTPXRequest
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -226,7 +227,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Запуск ──────────────────────────────────────────────────
 async def run_bot():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    request = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0,
+    )
+    app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

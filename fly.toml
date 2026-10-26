@@ -1,0 +1,11 @@
+# fly.toml - конфигурация для Fly.io
+app = "calendar-bot-anatolii"
+primary_region = "arn"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

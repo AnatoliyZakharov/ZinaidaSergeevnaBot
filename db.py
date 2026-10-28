@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import os
-# На Fly.io используем /data (persistent volume), локально — рядом со скриптом
-DB_PATH = Path(os.environ.get("DB_PATH", "/data/bot.db"))
+DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "bot.db")))
 
 # Блокировка для thread-safe операций (sqlite3 не thread-safe по умолчанию)
 _lock = threading.Lock()

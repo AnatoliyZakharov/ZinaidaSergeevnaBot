@@ -416,7 +416,7 @@ TELEMOST_TRIGGER = re.compile(
 
 CREATE_TRIGGER = re.compile(
     r"(поставь|добавь|создай|запланируй|поставить|добавить|создать|запланировать)"
-    r".{0,50}(встреч|событи|звонок|созвон|митинг|колл)\b",
+    r".{0,50}(встреч|событи|звонок|созвон|митинг|колл)",
     re.IGNORECASE,
 )
 
@@ -505,7 +505,20 @@ async def handle_create_event(text: str, update: Update):
         )
         return
 
-    dt = parse_date(text)
+    # Убираем фразы длительности перед парсингом даты,
+    # иначе dateparser трактует «на 30 минут» как сдвиг времени
+    text_for_date = re.sub(
+        r"\bна\s+\d+\s*(минут|мин|час[аов]?)\b", "", text, flags=re.IGNORECASE
+    )
+    text_for_date = re.sub(r"полчаса|пол\s*часа", "", text_for_date, flags=re.IGNORECASE)
+    # Нормализуем «в 10» → «в 10:00» чтобы dateparser не игнорировал время
+    text_for_date = re.sub(
+        r"\bв\s+(\d{1,2})\b(?!\s*[:.]\d)",
+        lambda m: f"в {m.group(1)}:00",
+        text_for_date, flags=re.IGNORECASE,
+    )
+
+    dt = parse_date(text_for_date)
     if not dt:
         await msg.edit_text(
             "Не понял дату встречи 📅\n\n"

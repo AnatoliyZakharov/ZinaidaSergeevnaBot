@@ -188,7 +188,7 @@ def create_telemost_conference() -> str | None:
     if not YANDEX_TELEMOST_TOKEN:
         logger.error("YANDEX_TELEMOST_TOKEN не задан")
         return None
-    url = "https://api.telemost.yandex.net/v2/conferences"
+    url = "https://cloud-api.yandex.net/v1/telemost-api/conferences"
     resp = requests.post(
         url,
         headers={
@@ -200,7 +200,7 @@ def create_telemost_conference() -> str | None:
     )
     if resp.status_code in (200, 201):
         data = resp.json()
-        link = data.get("conferenceUri") or data.get("uri") or data.get("url")
+        link = data.get("join_url") or data.get("conferenceUri") or data.get("uri")
         if link:
             logger.info("Телемост: создана конференция %s", link)
             return link

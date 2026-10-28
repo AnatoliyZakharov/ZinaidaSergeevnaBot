@@ -393,10 +393,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Привет! Я ZinaidaSergeevnaBot.\n\n"
         "*Что умею:*\n"
         "📅 Показать свободные слоты в Google Календаре\n"
+        "📌 Поставить встречу в календарь\n"
         "🔗 Добавить ссылку Яндекс Телемост к встречам без конференций\n\n"
         "*Примеры команд:*\n"
         "🎙 «Какие слоты свободны завтра?»\n"
         "🎙 «Есть время в четверг?»\n"
+        "🎙 «Поставь встречу с командой в пятницу в 15:00»\n"
+        "🎙 «Запланируй созвон завтра в 10 на 30 минут»\n"
         "✍️ «Свободно в пятницу»\n"
         "✍️ «Добавь ссылки на телемост»\n\n"
         "Ссылки Телемост также добавляются автоматически каждые 3 часа.",
@@ -410,6 +413,127 @@ TELEMOST_TRIGGER = re.compile(
     r"^добавь ссылки$",
     re.IGNORECASE,
 )
+
+CREATE_TRIGGER = re.compile(
+    r"(поставь|добавь|создай|запланируй|поставить|добавить|создать|запланировать)"
+    r".{0,50}(встреч|событи|звонок|созвон|митинг|колл)\b",
+    re.IGNORECASE,
+)
+
+TIME_IN_TEXT = re.compile(
+    r"\d{1,2}[:.]\d{2}|\bв\s+\d{1,2}\s*(час|утра|дня|вечера|ночи)?\b",
+    re.IGNORECASE,
+)
+
+
+def parse_duration_minutes(text: str) -> int:
+    """Извлекаем продолжительность из текста. По умолчанию 60 мин."""
+    tl = text.lower()
+    m = re.search(r"на\s+(\d+)\s*(минут|мин)\b", tl)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*(минут|мин)\b", tl)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"на\s+(\d+)\s*час", tl)
+    if m:
+        return int(m.group(1)) * 60
+    if re.search(r"полчаса|пол\s*часа", tl):
+        return 30
+    if re.search(r"\bна\s+час\b", tl):
+        return 60
+    return 60
+
+
+def extract_event_title(text: str) -> str:
+    """Извлекаем название встречи, убирая командные слова, дату и время."""
+    t = text
+    # Убираем командные слова
+    t = re.sub(
+        r"(поставь|добавь|создай|запланируй|поставить|добавить|создать|запланировать)\s*",
+        "", t, flags=re.IGNORECASE,
+    )
+    # Убираем продолжительность
+    t = re.sub(r"на\s+\d+\s*(минут|мин|час[аов]?)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\d+\s*(минут|мин)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"на\s+(один\s+)?час\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"полчаса|пол\s*часа", "", t, flags=re.IGNORECASE)
+    # Убираем дни недели
+    t = re.sub(
+        r"\b(в\s+)?(понедельник|вторник|среду?|четверг|пятниц[уа]|субботу?|воскресенье)\b",
+        "", t, flags=re.IGNORECASE,
+    )
+    # Убираем относительные даты
+    t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", t, flags=re.IGNORECASE)
+    # Убираем время
+    t = re.sub(r"\bв\s+\d{1,2}[:.]\d{2}\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bв\s+\d{1,2}\s*(час[аов]?|утра|дня|вечера|ночи)?\b", "", t, flags=re.IGNORECASE)
+    # Убираем даты типа «3 ноября»
+    t = re.sub(
+        r"\d+\s+(января|февраля|марта|апреля|мая|июня|июля|августа"
+        r"|сентября|октября|ноября|декабря)\b",
+        "", t, flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\s+", " ", t).strip(" ,.—-")
+    return t if len(t) > 1 else "Встреча"
+
+
+def create_calendar_event(title: str, start_dt: datetime, duration_minutes: int = 60) -> dict:
+    """Создаём событие в Google Calendar."""
+    service = get_calendar_service()
+    tz = pytz.timezone(TIMEZONE)
+    if start_dt.tzinfo is None:
+        start_dt = tz.localize(start_dt)
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    body = {
+        "summary": title,
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
+    }
+    return service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
+
+
+async def handle_create_event(text: str, update: Update):
+    """Обрабатываем команду создания встречи."""
+    msg = await update.message.reply_text("📅 Создаю встречу...")
+
+    # Проверяем, что в тексте есть время
+    if not TIME_IN_TEXT.search(text):
+        await msg.edit_text(
+            "Не понял время встречи 🕐\n\n"
+            "Попробуй: «поставь встречу с командой в пятницу в 15:00»"
+        )
+        return
+
+    dt = parse_date(text)
+    if not dt:
+        await msg.edit_text(
+            "Не понял дату встречи 📅\n\n"
+            "Попробуй: «запланируй созвон завтра в 10:00»"
+        )
+        return
+
+    title = extract_event_title(text)
+    duration = parse_duration_minutes(text)
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: create_calendar_event(title, dt, duration)
+        )
+        tz = pytz.timezone(TIMEZONE)
+        if dt.tzinfo is None:
+            dt = tz.localize(dt)
+        end_dt = dt + timedelta(minutes=duration)
+        await msg.edit_text(
+            f"✅ *Встреча создана!*\n\n"
+            f"📌 {title}\n"
+            f"🗓 {date_to_ru(dt)}\n"
+            f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("Ошибка создания события: %s", e)
+        await msg.edit_text("😔 Не удалось создать встречу. Попробуй позже.")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,6 +553,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await asyncio.get_event_loop().run_in_executor(None, process_telemost_links)
         report = format_telemost_report(res)
         await update.message.reply_text(f"🔗 *Телемост-обход завершён*\n\n{report}", parse_mode="Markdown")
+    elif CREATE_TRIGGER.search(text):
+        await handle_create_event(text, update)
     else:
         await process_query(text, update)
 
@@ -445,6 +571,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error("handle_text telemost error: %s", e)
             await msg.edit_text("😔 Произошла ошибка при обходе встреч. Попробуй позже.")
+    elif CREATE_TRIGGER.search(text):
+        await handle_create_event(text, update)
     else:
         await process_query(text, update)
 

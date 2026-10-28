@@ -453,21 +453,26 @@ def extract_event_title(text: str) -> str:
         r"(поставь|добавь|создай|запланируй|поставить|добавить|создать|запланировать)\s*",
         "", t, flags=re.IGNORECASE,
     )
-    # Убираем продолжительность
-    t = re.sub(r"на\s+\d+\s*(минут|мин|час[аов]?)\b", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\d+\s*(минут|мин)\b", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"на\s+(один\s+)?час\b", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"полчаса|пол\s*часа", "", t, flags=re.IGNORECASE)
-    # Убираем дни недели
+    # Убираем слова-типы события (встречу, созвон и т.п.) — они не часть названия
     t = re.sub(
-        r"\b(в\s+)?(понедельник|вторник|среду?|четверг|пятниц[уа]|субботу?|воскресенье)\b",
+        r"\b(встреч[уаи]?|событи[ея]|созвон|звонок|митинг|колл)\b",
+        "", t, flags=re.IGNORECASE,
+    )
+    # Убираем продолжительность
+    t = re.sub(r"\bна\s+\d+\s*(минут|мин|час[аов]?)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\d+\s*(минут|мин)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bна\s+(один\s+)?час\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"полчаса|пол\s*часа", "", t, flags=re.IGNORECASE)
+    # Убираем дни недели (с предлогами «в» и «на»)
+    t = re.sub(
+        r"\b((в|на)\s+)?(понедельник|вторник|среду?|четверг|пятниц[уа]|субботу?|воскресенье)\b",
         "", t, flags=re.IGNORECASE,
     )
     # Убираем относительные даты
     t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", t, flags=re.IGNORECASE)
-    # Убираем время
-    t = re.sub(r"\bв\s+\d{1,2}[:.]\d{2}\b", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bв\s+\d{1,2}\s*(час[аов]?|утра|дня|вечера|ночи)?\b", "", t, flags=re.IGNORECASE)
+    # Убираем время (с предлогами «в» и «на»)
+    t = re.sub(r"\b(в|на)\s+\d{1,2}[:.]\d{2}\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(в|на)\s+\d{1,2}\s*(час[аов]?|утра|дня|вечера|ночи)?\b", "", t, flags=re.IGNORECASE)
     # Убираем даты типа «3 ноября»
     t = re.sub(
         r"\d+\s+(января|февраля|марта|апреля|мая|июня|июля|августа"
@@ -518,10 +523,16 @@ async def handle_create_event(text: str, update: Update):
         r"\bна\s+\d+\s*(минут|мин|час[аов]?)\b", "", text, flags=re.IGNORECASE
     )
     text_for_date = re.sub(r"полчаса|пол\s*часа", "", text_for_date, flags=re.IGNORECASE)
-    # Нормализуем «в 10» → «в 10:00» чтобы dateparser не игнорировал время
+    # «на 17:00» → «в 17:00» (dateparser лучше понимает «в»)
     text_for_date = re.sub(
-        r"\bв\s+(\d{1,2})\b(?!\s*[:.]\d)",
-        lambda m: f"в {m.group(1)}:00",
+        r"\bна\s+(\d{1,2}[:.]\d{2})\b",
+        r"в \1",
+        text_for_date, flags=re.IGNORECASE,
+    )
+    # «в 10» (без минут) → «в 10:00»
+    text_for_date = re.sub(
+        r"\b(в|на)\s+(\d{1,2})\b(?!\s*[:.]\d)",
+        lambda m: f"в {m.group(2)}:00",
         text_for_date, flags=re.IGNORECASE,
     )
 

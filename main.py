@@ -189,15 +189,26 @@ def create_telemost_conference() -> str | None:
         logger.error("YANDEX_TELEMOST_TOKEN не задан")
         return None
     url = "https://cloud-api.yandex.net/v1/telemost-api/conferences"
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"OAuth {YANDEX_TELEMOST_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={},
-        timeout=15,
-    )
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"OAuth {YANDEX_TELEMOST_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={},
+            timeout=15,
+        )
+    except requests.exceptions.ConnectionError as e:
+        logger.error("Телемост: нет соединения — %s", e)
+        return None
+    except requests.exceptions.Timeout:
+        logger.error("Телемост: таймаут")
+        return None
+    except Exception as e:
+        logger.error("Телемост: неожиданная ошибка — %s", e)
+        return None
+
     if resp.status_code in (200, 201):
         data = resp.json()
         link = data.get("join_url") or data.get("conferenceUri") or data.get("uri")
@@ -427,9 +438,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if TELEMOST_TRIGGER.search(text):
         msg = await update.message.reply_text("⏳ Проверяю встречи и добавляю ссылки...")
-        res = await asyncio.get_event_loop().run_in_executor(None, process_telemost_links)
-        report = format_telemost_report(res)
-        await msg.edit_text(f"🔗 *Телемост-обход завершён*\n\n{report}", parse_mode="Markdown")
+        try:
+            res = await asyncio.get_event_loop().run_in_executor(None, process_telemost_links)
+            report = format_telemost_report(res)
+            await msg.edit_text(f"🔗 *Телемост-обход завершён*\n\n{report}", parse_mode="Markdown")
+        except Exception as e:
+            logger.error("handle_text telemost error: %s", e)
+            await msg.edit_text("😔 Произошла ошибка при обходе встреч. Попробуй позже.")
     else:
         await process_query(text, update)
 

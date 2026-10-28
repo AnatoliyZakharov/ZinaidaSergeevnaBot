@@ -425,6 +425,33 @@ TIME_IN_TEXT = re.compile(
     re.IGNORECASE,
 )
 
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+INVITE_SKIP   = re.compile(
+    r"\b(готово|пропустить|skip|нет|не надо|позже|стоп|без приглашений)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_emails(text: str) -> list[str]:
+    return EMAIL_PATTERN.findall(text)
+
+
+def add_attendees_to_event(event_id: str, emails: list[str]) -> None:
+    """Добавляем участников в существующее событие — Google сам рассылает письма."""
+    service = get_calendar_service()
+    event   = service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    existing = {a["email"] for a in event.get("attendees", [])}
+    merged   = list(event.get("attendees", [])) + [
+        {"email": e} for e in emails if e not in existing
+    ]
+    service.events().patch(
+        calendarId=CALENDAR_ID,
+        eventId=event_id,
+        body={"attendees": merged},
+        sendUpdates="all",   # Google отправляет email-приглашения
+    ).execute()
+    logger.info("Приглашены на %s: %s", event_id, emails)
+
 
 def parse_duration_minutes(text: str) -> int:
     """Извлекаем продолжительность из текста. По умолчанию 60 мин."""
@@ -505,7 +532,7 @@ def create_calendar_event(
     return service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
 
 
-async def handle_create_event(text: str, update: Update):
+async def handle_create_event(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатываем команду создания встречи."""
     msg = await update.message.reply_text("📅 Создаю встречу...")
 
@@ -553,22 +580,44 @@ async def handle_create_event(text: str, update: Update):
         None, create_telemost_conference
     )
 
+    # Email'ы прямо в тексте команды — добавим сразу
+    inline_emails = extract_emails(text)
+
     try:
-        await asyncio.get_event_loop().run_in_executor(
+        created = await asyncio.get_event_loop().run_in_executor(
             None, lambda: create_calendar_event(title, dt, duration, telemost_link)
         )
+        event_id = created["id"]
+
         tz = pytz.timezone(TIMEZONE)
         if dt.tzinfo is None:
             dt = tz.localize(dt)
         end_dt = dt + timedelta(minutes=duration)
 
         telemost_line = f"\n🔗 {telemost_link}" if telemost_link else "\n⚠️ Телемост не удалось создать"
+
+        # Если email'ы были в тексте — сразу приглашаем
+        invite_note = ""
+        if inline_emails:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: add_attendees_to_event(event_id, inline_emails)
+                )
+                invite_note = f"\n📧 Приглашены: {', '.join(inline_emails)}"
+            except Exception as e:
+                logger.error("Ошибка приглашения inline: %s", e)
+
+        # Сохраняем event_id для следующего шага — ввода email'ов
+        context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
+
         await msg.edit_text(
             f"✅ *Встреча создана!*\n\n"
             f"📌 {title}\n"
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
-            f"{telemost_line}",
+            f"{telemost_line}"
+            f"{invite_note}\n\n"
+            f"📧 Кого пригласить? Пришли email(ы) через запятую или напиши «готово»",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -594,13 +643,50 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = format_telemost_report(res)
         await update.message.reply_text(f"🔗 *Телемост-обход завершён*\n\n{report}", parse_mode="Markdown")
     elif CREATE_TRIGGER.search(text):
-        await handle_create_event(text, update)
+        await handle_create_event(text, update, context)
     else:
         await process_query(text, update)
 
 
+async def _handle_pending_invite(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обрабатываем ответ пользователя на запрос «Кого пригласить?».
+    Возвращает True если сообщение было обработано (и больше не нужно его передавать дальше)."""
+    pending = context.user_data.get("pending_invite")
+    if not pending:
+        return False
+
+    if INVITE_SKIP.search(text):
+        context.user_data.pop("pending_invite", None)
+        await update.message.reply_text("👍 Без приглашений — окей!")
+        return True
+
+    emails = extract_emails(text)
+    if emails:
+        context.user_data.pop("pending_invite", None)
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: add_attendees_to_event(pending["event_id"], emails)
+            )
+            names = ", ".join(emails)
+            await update.message.reply_text(
+                f"📧 Приглашения отправлены:\n{names}"
+            )
+        except Exception as e:
+            logger.error("Ошибка добавления участников: %s", e)
+            await update.message.reply_text("😔 Не удалось отправить приглашения.")
+        return True
+
+    # Не email и не «готово» — возможно пользователь спрашивает что-то другое,
+    # оставляем pending и обрабатываем запрос как обычно
+    return False
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+
+    # Проверяем — ждём ли email'ы для приглашений
+    if await _handle_pending_invite(text, update, context):
+        return
 
     if TELEMOST_TRIGGER.search(text):
         msg = await update.message.reply_text("⏳ Проверяю встречи и добавляю ссылки...")
@@ -612,7 +698,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("handle_text telemost error: %s", e)
             await msg.edit_text("😔 Произошла ошибка при обходе встреч. Попробуй позже.")
     elif CREATE_TRIGGER.search(text):
-        await handle_create_event(text, update)
+        await handle_create_event(text, update, context)
     else:
         await process_query(text, update)
 

@@ -1,11 +1,30 @@
-# fly.toml - конфигурация для Fly.io
+# fly.toml — конфигурация для Fly.io (multi-user)
 app = "calendar-bot-anatolii"
 primary_region = "arn"
 
 [build]
   dockerfile = "Dockerfile"
 
+# HTTP-сервис для OAuth callback (/oauth/callback) и healthcheck (/health)
+[http_service]
+  internal_port = 8080
+  force_https   = true
+  auto_stop_machines  = false
+  auto_start_machines = true
+
+  [[http_service.checks]]
+    grace_period  = "10s"
+    interval      = "30s"
+    method        = "GET"
+    path          = "/health"
+    timeout       = "5s"
+
+# Persistent volume для SQLite — база данных не теряется при рестартах
+[[mounts]]
+  source      = "calendar_bot_data"
+  destination = "/data"
+
 [[vm]]
-  memory = "256mb"
+  memory   = "512mb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus     = 1

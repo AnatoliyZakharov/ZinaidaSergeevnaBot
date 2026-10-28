@@ -19,11 +19,6 @@ primary_region = "arn"
     path          = "/health"
     timeout       = "5s"
 
-# Persistent volume для SQLite — база данных не теряется при рестартах
-[[mounts]]
-  source      = "calendar_bot_data"
-  destination = "/data"
-
 [[vm]]
   memory   = "512mb"
   cpu_kind = "shared"

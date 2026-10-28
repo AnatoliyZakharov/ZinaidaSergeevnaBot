@@ -478,8 +478,13 @@ def extract_event_title(text: str) -> str:
     return t if len(t) > 1 else "Встреча"
 
 
-def create_calendar_event(title: str, start_dt: datetime, duration_minutes: int = 60) -> dict:
-    """Создаём событие в Google Calendar."""
+def create_calendar_event(
+    title: str,
+    start_dt: datetime,
+    duration_minutes: int = 60,
+    telemost_link: str | None = None,
+) -> dict:
+    """Создаём событие в Google Calendar. Если есть telemost_link — вшиваем в описание."""
     service = get_calendar_service()
     tz = pytz.timezone(TIMEZONE)
     if start_dt.tzinfo is None:
@@ -490,6 +495,8 @@ def create_calendar_event(title: str, start_dt: datetime, duration_minutes: int 
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
         "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
     }
+    if telemost_link:
+        body["description"] = f"🔗 Яндекс Телемост: {telemost_link}"
     return service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
 
 
@@ -529,19 +536,28 @@ async def handle_create_event(text: str, update: Update):
     title = extract_event_title(text)
     duration = parse_duration_minutes(text)
 
+    # Создаём Телемост-конференцию заранее (не блокирует — ошибка не критична)
+    await msg.edit_text("📅 Создаю встречу и ссылку Телемост...")
+    telemost_link = await asyncio.get_event_loop().run_in_executor(
+        None, create_telemost_conference
+    )
+
     try:
         await asyncio.get_event_loop().run_in_executor(
-            None, lambda: create_calendar_event(title, dt, duration)
+            None, lambda: create_calendar_event(title, dt, duration, telemost_link)
         )
         tz = pytz.timezone(TIMEZONE)
         if dt.tzinfo is None:
             dt = tz.localize(dt)
         end_dt = dt + timedelta(minutes=duration)
+
+        telemost_line = f"\n🔗 {telemost_link}" if telemost_link else "\n⚠️ Телемост не удалось создать"
         await msg.edit_text(
             f"✅ *Встреча создана!*\n\n"
             f"📌 {title}\n"
             f"🗓 {date_to_ru(dt)}\n"
-            f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}",
+            f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
+            f"{telemost_line}",
             parse_mode="Markdown",
         )
     except Exception as e:

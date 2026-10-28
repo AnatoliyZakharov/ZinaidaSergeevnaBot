@@ -786,6 +786,10 @@ async def run_bot():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Необработанное исключение в хендлере:", exc_info=context.error)
+    app.add_error_handler(error_handler)
+
     # APScheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(

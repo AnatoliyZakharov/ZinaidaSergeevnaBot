@@ -19,6 +19,10 @@ primary_region = "arn"
     path          = "/health"
     timeout       = "5s"
 
+[[mounts]]
+  source      = "bot_data"
+  destination = "/data"
+
 [[vm]]
   memory   = "512mb"
   cpu_kind = "shared"

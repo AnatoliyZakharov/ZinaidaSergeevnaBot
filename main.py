@@ -515,7 +515,8 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
             f"{telemost_line}{invite_note}\n\n"
-            f"📧 Кого пригласить? Пришли email(ы) через запятую или напиши «готово»",
+            f"📧 Кого пригласить? Напиши имя из контактов или email(ы) через запятую\n"
+            f"_(или напиши «готово» чтобы пропустить)_",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -659,7 +660,31 @@ async def _handle_pending_invite(telegram_id: int, text: str, update: Update, co
         context.user_data.pop("pending_invite", None)
         await update.message.reply_text("👍 Без приглашений — окей!")
         return True
+
+    # Сначала ищем email-адреса напрямую
     emails = extract_emails(text)
+
+    # Если email-ов нет — пробуем резолвить имена через глоссарий
+    if not emails:
+        found, unknown = db.resolve_names_to_emails(telegram_id, text)
+        if found:
+            emails = found
+            if unknown:
+                # Часть имён не нашлась — сообщим, но отправим что нашли
+                await update.message.reply_text(
+                    f"⚠️ Не нашёл в контактах: {', '.join(unknown)}\n"
+                    f"Продолжаю с найденными: {', '.join(emails)}"
+                )
+        else:
+            # Ничего не нашлось — спрашиваем снова
+            if unknown:
+                await update.message.reply_text(
+                    f"🤷 Не знаю таких контактов: {', '.join(unknown)}\n"
+                    f"Пришли email или добавь через /add\_contact Имя email@example.com"
+                )
+                return True
+            return False
+
     if emails:
         context.user_data.pop("pending_invite", None)
         try:
@@ -765,6 +790,67 @@ async def oauth_callback(request: web.Request) -> web.Response:
 
 # ─── Запуск ──────────────────────────────────────────────────
 
+async def cmd_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список контактов пользователя."""
+    telegram_id = update.effective_user.id
+    rows = db.list_contacts(telegram_id)
+    if not rows:
+        await update.message.reply_text(
+            "📒 Список контактов пуст.\n"
+            "Добавь через: /add\_contact Имя email@example.com",
+            parse_mode="Markdown",
+        )
+        return
+    lines = ["📒 *Контакты для приглашений:*\n"]
+    for r in rows:
+        lines.append(f"👤 *{r['display_name']}* — `{r['email']}`")
+    lines.append("\n_/del\_contact Имя — удалить контакт_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_add_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет контакт: /add_contact Анастасия bragina@hsk.ru"""
+    telegram_id = update.effective_user.id
+    args = context.args  # список аргументов после команды
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Использование: `/add_contact Имя email@example.com`\n\n"
+            "Пример: `/add_contact Анастасия bragina@hsk.ru`",
+            parse_mode="Markdown",
+        )
+        return
+    email = args[-1]          # последний аргумент — email
+    name  = " ".join(args[:-1])  # остальное — имя (может быть несколько слов)
+    if not EMAIL_PATTERN.match(email):
+        await update.message.reply_text(f"❌ Похоже, «{email}» — не email-адрес.")
+        return
+    db.add_contact(telegram_id, name, email)
+    await update.message.reply_text(
+        f"✅ Сохранено: *{name}* → `{email}`\n\n"
+        f"Теперь можно приглашать: просто напиши «{name}» когда бот спросит «Кого пригласить?»",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_del_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет контакт: /del_contact Анастасия"""
+    telegram_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: `/del\_contact Имя`",
+            parse_mode="Markdown",
+        )
+        return
+    name = " ".join(context.args)
+    if db.delete_contact(telegram_id, name):
+        await update.message.reply_text(f"🗑 Контакт «{name}» удалён.")
+    else:
+        await update.message.reply_text(
+            f"🤷 Контакт «{name}» не найден.\n"
+            f"Посмотри список: /contacts"
+        )
+
+
 async def run_bot():
     global _bot
 
@@ -782,7 +868,10 @@ async def run_bot():
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("settings",   cmd_settings))
     app.add_handler(CommandHandler("settz",      cmd_settz))
-    app.add_handler(CommandHandler("sethours",   cmd_sethours))
+    app.add_handler(CommandHandler("sethours",      cmd_sethours))
+    app.add_handler(CommandHandler("contacts",      cmd_contacts))
+    app.add_handler(CommandHandler("add_contact",   cmd_add_contact))
+    app.add_handler(CommandHandler("del_contact",   cmd_del_contact))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

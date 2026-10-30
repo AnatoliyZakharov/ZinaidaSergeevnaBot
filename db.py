@@ -53,6 +53,15 @@ def init_db() -> None:
                 telegram_id INTEGER NOT NULL,
                 created_at  REAL    DEFAULT (unixepoch())
             );
+
+            -- Глоссарий контактов для приглашений
+            CREATE TABLE IF NOT EXISTS contacts (
+                telegram_id  INTEGER NOT NULL,
+                name_lower   TEXT    NOT NULL,
+                display_name TEXT    NOT NULL,
+                email        TEXT    NOT NULL,
+                PRIMARY KEY (telegram_id, name_lower)
+            );
         """)
         conn.commit()
         conn.close()
@@ -201,3 +210,85 @@ def pop_oauth_state(state: str) -> Optional[int]:
             conn.commit()
         conn.close()
     return row["telegram_id"] if row else None
+
+
+# ─── Контакты (глоссарий) ────────────────────────────────────
+
+def add_contact(telegram_id: int, display_name: str, email: str) -> None:
+    """Добавляем или обновляем контакт."""
+    name_lower = display_name.strip().lower()
+    with _lock:
+        conn = _connect()
+        conn.execute("""
+            INSERT INTO contacts (telegram_id, name_lower, display_name, email)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, name_lower) DO UPDATE SET
+                display_name = excluded.display_name,
+                email        = excluded.email
+        """, (telegram_id, name_lower, display_name.strip(), email.strip().lower()))
+        conn.commit()
+        conn.close()
+
+
+def get_contact(telegram_id: int, name: str) -> Optional[sqlite3.Row]:
+    """Ищем контакт: сначала точное, потом по началу строки."""
+    name_lower = name.strip().lower()
+    with _lock:
+        conn = _connect()
+        row = conn.execute(
+            "SELECT * FROM contacts WHERE telegram_id = ? AND name_lower = ?",
+            (telegram_id, name_lower)
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM contacts WHERE telegram_id = ? AND name_lower LIKE ?",
+                (telegram_id, name_lower + "%")
+            ).fetchone()
+        conn.close()
+    return row
+
+
+def list_contacts(telegram_id: int) -> list:
+    """Все контакты пользователя, отсортированные по имени."""
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT * FROM contacts WHERE telegram_id = ? ORDER BY display_name COLLATE NOCASE",
+            (telegram_id,)
+        ).fetchall()
+        conn.close()
+    return rows
+
+
+def delete_contact(telegram_id: int, name: str) -> bool:
+    """Удаляем контакт. Возвращает True если нашёл и удалил."""
+    name_lower = name.strip().lower()
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            "DELETE FROM contacts WHERE telegram_id = ? AND name_lower = ?",
+            (telegram_id, name_lower)
+        )
+        conn.commit()
+        deleted = cur.rowcount > 0
+        conn.close()
+    return deleted
+
+
+def resolve_names_to_emails(telegram_id: int, text: str) -> tuple:
+    """
+    Разбивает text по запятой и слову «и», ищет каждую часть в контактах.
+    Возвращает (found_emails: list[str], unknown_names: list[str]).
+    """
+    parts = re.split(r",|и", text, flags=re.IGNORECASE)
+    found, unknown = [], []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        contact = get_contact(telegram_id, part)
+        if contact:
+            found.append(contact["email"])
+        else:
+            unknown.append(part)
+    return found, unknown

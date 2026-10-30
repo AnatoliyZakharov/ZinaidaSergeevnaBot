@@ -246,6 +246,12 @@ def get_contact(telegram_id: int, name: str) -> Optional[sqlite3.Row]:
                 "SELECT * FROM contacts WHERE telegram_id = ? AND name_lower LIKE ?",
                 (telegram_id, "%" + name_lower + "%")
             ).fetchone()
+        if not row and len(name_lower) > 4:
+            # Падеж: «Алексея» → «Алексе» → находит «Барышников Алексей»
+            row = conn.execute(
+                "SELECT * FROM contacts WHERE telegram_id = ? AND name_lower LIKE ?",
+                (telegram_id, "%" + name_lower[:-1] + "%")
+            ).fetchone()
         conn.close()
     return row
 
@@ -282,7 +288,7 @@ def resolve_names_to_emails(telegram_id: int, text: str) -> tuple:
     Разбивает text по запятой и слову «и», ищет каждую часть в контактах.
     Возвращает (found_emails: list[str], unknown_names: list[str]).
     """
-    parts = re.split(r",|и", text, flags=re.IGNORECASE)
+    parts = re.split(r"\s*,\s*|\s+и\s+", text, flags=re.IGNORECASE)
     found, unknown = [], []
     for part in parts:
         part = part.strip()

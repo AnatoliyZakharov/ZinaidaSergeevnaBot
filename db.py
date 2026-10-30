@@ -240,9 +240,10 @@ def get_contact(telegram_id: int, name: str) -> Optional[sqlite3.Row]:
             (telegram_id, name_lower)
         ).fetchone()
         if not row:
+            # Ищем вхождение в любом месте: «Алексей» найдёт «Барышников Алексей»
             row = conn.execute(
                 "SELECT * FROM contacts WHERE telegram_id = ? AND name_lower LIKE ?",
-                (telegram_id, name_lower + "%")
+                (telegram_id, "%" + name_lower + "%")
             ).fetchone()
         conn.close()
     return row

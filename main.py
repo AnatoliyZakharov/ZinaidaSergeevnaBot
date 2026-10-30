@@ -652,38 +652,53 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_query(telegram_id, text, update)
 
 
+# Глагольные префиксы которые пользователь добавляет перед именем («Пригласи Анастасию»)
+INVITE_VERB_PREFIX = re.compile(
+    r"^\s*(пригласи(ть)?|добавь|invite|пригласите)\s+",
+    re.IGNORECASE,
+)
+
 async def _handle_pending_invite(telegram_id: int, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     pending = context.user_data.get("pending_invite")
     if not pending:
         return False
+
+    # Если текст похож на новую команду — завершаем режим приглашения и пропускаем дальше
+    if CREATE_TRIGGER.search(text) or TELEMOST_TRIGGER.search(text):
+        context.user_data.pop("pending_invite", None)
+        return False
+
     if INVITE_SKIP.search(text):
         context.user_data.pop("pending_invite", None)
         await update.message.reply_text("👍 Без приглашений — окей!")
         return True
 
+    # Убираем глагольный префикс: «Пригласи Анастасию» → «Анастасию»
+    text_clean = INVITE_VERB_PREFIX.sub("", text).strip()
+
     # Сначала ищем email-адреса напрямую
-    emails = extract_emails(text)
+    emails = extract_emails(text_clean)
 
     # Если email-ов нет — пробуем резолвить имена через глоссарий
     if not emails:
-        found, unknown = db.resolve_names_to_emails(telegram_id, text)
+        found, unknown = db.resolve_names_to_emails(telegram_id, text_clean)
         if found:
             emails = found
             if unknown:
-                # Часть имён не нашлась — сообщим, но отправим что нашли
                 await update.message.reply_text(
                     f"⚠️ Не нашёл в контактах: {', '.join(unknown)}\n"
                     f"Продолжаю с найденными: {', '.join(emails)}"
                 )
         else:
-            # Ничего не нашлось — спрашиваем снова
-            if unknown:
-                await update.message.reply_text(
-                    f"🤷 Не знаю таких контактов: {', '.join(unknown)}\n"
-                    f"Пришли email или добавь через /add\_contact Имя email@example.com"
-                )
-                return True
-            return False
+            # Ничего не нашлось — сообщаем и сбрасываем режим, чтобы бот не завис
+            context.user_data.pop("pending_invite", None)
+            await update.message.reply_text(
+                f"🤷 Не нашёл в контактах: «{text_clean}»\n"
+                f"Встреча создана без приглашений.\n"
+                f"Добавь контакт через /add\_contact Имя email@example.com",
+                parse_mode="Markdown",
+            )
+            return True
 
     if emails:
         context.user_data.pop("pending_invite", None)

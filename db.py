@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import os
+import re
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "bot.db")))
 
 # Блокировка для thread-safe операций (sqlite3 не thread-safe по умолчанию)

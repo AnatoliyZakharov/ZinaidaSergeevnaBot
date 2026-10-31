@@ -44,6 +44,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 import db
+import gtasks
 import auth
 
 # ─── Логирование ─────────────────────────────────────────────
@@ -658,6 +659,16 @@ INVITE_VERB_PREFIX = re.compile(
     re.IGNORECASE,
 )
 
+TASKS_TRIGGER = re.compile(
+    r"(покажи|список|мои|открой).{0,20}(задач|таск)|^/tasks$",
+    re.IGNORECASE,
+)
+
+SKIP_TASK_RE = re.compile(
+    r"^\s*скип\s*(\d+)?\s*$",
+    re.IGNORECASE,
+)
+
 async def _handle_pending_invite(telegram_id: int, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     pending = context.user_data.get("pending_invite")
     if not pending:
@@ -744,6 +755,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── APScheduler: per-user Телемост ──────────────────────────
 
+
+async def send_daily_schedule(bot):
+    """Каждый день в 8:00 MSK: отправляем расписание встреч на сегодня."""
+    users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
+    for user in users:
+        telegram_id = user["telegram_id"]
+        try:
+            tz = _tz(user)
+            now = datetime.now(tz)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+            service = get_calendar_service(telegram_id)
+            if not service:
+                continue
+
+            calendar_id = _get_calendar_id(user)
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=today_start.isoformat(),
+                    timeMax=today_end.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=50,
+                ).execute()
+            )
+            events = result.get("items", [])
+
+            if not events:
+                text = "📅 *Расписание на сегодня*
+
+Встреч нет — свободный день! 🎉"
+            else:
+                lines = ["📅 *Расписание на сегодня:*
+"]
+                for ev in events:
+                    start_raw = ev.get("start", {})
+                    end_raw   = ev.get("end",   {})
+                    if "dateTime" in start_raw:
+                        s = datetime.fromisoformat(start_raw["dateTime"]).astimezone(tz)
+                        e = datetime.fromisoformat(end_raw["dateTime"]).astimezone(tz)
+                        time_str = f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')}"
+                    else:
+                        time_str = "весь день"
+                    title = ev.get("summary", "(без названия)").strip()
+                    lines.append(f"• {time_str}  {title}")
+                text = "
+".join(lines)
+
+            await bot.send_message(chat_id=telegram_id, text=text, parse_mode="Markdown", disable_notification=True)
+        except Exception as e:
+            logger.error("Ошибка daily_schedule для user %s: %s", telegram_id, e)
+
+
 async def scheduled_telemost_all_users(bot: Bot):
     """Каждые 3 часа: добавляем ссылки для всех активных пользователей."""
     users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
@@ -758,6 +825,7 @@ async def scheduled_telemost_all_users(bot: Bot):
                     chat_id=telegram_id,
                     text=f"🔗 *Авто-обход Телемост*\n\n{format_telemost_report(res)}",
                     parse_mode="Markdown",
+                    disable_notification=True,
                 )
         except Exception as e:
             logger.error("Ошибка scheduled для user %s: %s", telegram_id, e)
@@ -804,6 +872,92 @@ async def oauth_callback(request: web.Request) -> web.Response:
 
 
 # ─── Запуск ──────────────────────────────────────────────────
+
+def _format_tasks(tasks: list) -> str:
+    """Форматирует список задач для вывода в Telegram."""
+    if not tasks:
+        return "✅ Нет открытых задач!"
+    lines = ["📋 *Открытые задачи:*\n"]
+    for i, t in enumerate(tasks, 1):
+        title = t.get("title", "(без названия)").strip()
+        due   = (t.get("due") or "")[:10]
+        note  = f" _({due})_" if due else ""
+        lines.append(f"{i}\. {title}{note}")
+    lines.append("\nНапиши *скип* — закрыть первую, *скип 2* — конкретную\.")
+    return "\n".join(lines)
+
+
+async def _handle_pending_tasks(
+    telegram_id: int,
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Перехватывает «скип [N]» когда есть кеш задач. Возвращает True если перехватил."""
+    tasks = context.user_data.get("tasks")
+    if tasks is None:
+        return False
+
+    m = SKIP_TASK_RE.match(text)
+    if not m:
+        return False
+
+    raw_idx = m.group(1)
+    idx = (int(raw_idx) - 1) if raw_idx else 0
+
+    if idx < 0 or idx >= len(tasks):
+        await update.message.reply_text(
+            f"⚠️ Нет задачи с номером {idx + 1}\.",
+            parse_mode="MarkdownV2",
+        )
+        return True
+
+    task = tasks[idx]
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: gtasks.complete_task(telegram_id, task["id"], task["_listId"])
+    )
+
+    if ok:
+        tasks.pop(idx)
+        context.user_data["tasks"] = tasks
+        title = task.get("title", "").strip()
+        reply = f"✅ Закрыто: _{title}_\n\n" + _format_tasks(tasks)
+        if not tasks:
+            context.user_data.pop("tasks", None)
+    else:
+        reply = "⚠️ Не удалось закрыть задачу, попробуй ещё раз\."
+
+    await update.message.reply_text(reply, parse_mode="MarkdownV2")
+    return True
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает открытые задачи из Google Tasks."""
+    telegram_id = update.effective_user.id
+    if not db.is_google_connected(telegram_id):
+        await update.message.reply_text("🔑 Сначала подключи Google Calendar: /connect")
+        return
+
+    tasks, err = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: gtasks.list_all_tasks(telegram_id)
+    )
+
+    if err == "no_scope":
+        await update.message.reply_text(
+            "⚠️ Нет доступа к Google Tasks\.
+
+"
+            "Переподключи аккаунт: /connect",
+            parse_mode="MarkdownV2",
+        )
+        return
+    if err:
+        await update.message.reply_text("⚠️ Не удалось загрузить задачи\. Попробуй позже\.", parse_mode="MarkdownV2")
+        return
+
+    context.user_data["tasks"] = tasks
+    await update.message.reply_text(_format_tasks(tasks), parse_mode="MarkdownV2")
+
 
 async def cmd_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список контактов пользователя."""
@@ -903,6 +1057,17 @@ async def run_bot():
         args=[app.bot],
         id="telemost_auto",
         replace_existing=True,
+    )
+    scheduler.add_job(
+        send_daily_schedule,
+        "cron",
+        day_of_week="mon-fri",
+        hour=5,
+        minute=0,
+        args=[app.bot],
+        id="daily_schedule",
+        replace_existing=True,
+        timezone="UTC",
     )
     scheduler.start()
 

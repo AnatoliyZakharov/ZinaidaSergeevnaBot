@@ -825,6 +825,7 @@ async def scheduled_telemost_all_users(bot: Bot):
                     chat_id=telegram_id,
                     text=f"🔗 *Авто-обход Телемост*\n\n{format_telemost_report(res)}",
                     parse_mode="Markdown",
+                    disable_notification=True,
                 )
         except Exception as e:
             logger.error("Ошибка scheduled для user %s: %s", telegram_id, e)

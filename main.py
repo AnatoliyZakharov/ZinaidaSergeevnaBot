@@ -806,7 +806,7 @@ async def send_daily_schedule(bot):
                 text = "
 ".join(lines)
 
-            await bot.send_message(chat_id=telegram_id, text=text, parse_mode="Markdown")
+            await bot.send_message(chat_id=telegram_id, text=text, parse_mode="Markdown", disable_notification=True)
         except Exception as e:
             logger.error("Ошибка daily_schedule для user %s: %s", telegram_id, e)
 

@@ -1060,6 +1060,7 @@ async def run_bot():
     scheduler.add_job(
         send_daily_schedule,
         "cron",
+        day_of_week="mon-fri",
         hour=5,
         minute=0,
         args=[app.bot],

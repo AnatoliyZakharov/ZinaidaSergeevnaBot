@@ -64,6 +64,7 @@ DEFAULT_WORK_START    = int(os.environ.get("WORK_START", "9"))
 DEFAULT_WORK_END      = int(os.environ.get("WORK_END", "19"))
 WEBHOOK_HOST          = os.environ.get("WEBHOOK_HOST", "")   # напр. https://bot.example.com
 OAUTH_CALLBACK_PORT   = int(os.environ.get("OAUTH_CALLBACK_PORT", "8080"))
+ADMIN_TELEGRAM_ID     = int(os.environ.get("ADMIN_TELEGRAM_ID", "0"))
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -511,7 +512,8 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
 
         context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
         await msg.edit_text(
-            f"✅ *Встреча создана!*\n\n"
+            db.log_event(telegram_id, "meeting_created")
+        f"✅ *Встреча создана!*\n\n"
             f"📌 {title}\n"
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
@@ -531,6 +533,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     username    = update.effective_user.username
     db.upsert_user(telegram_id, username)
+    db.log_event(telegram_id, "start")
 
     if db.is_google_connected(telegram_id):
         await update.message.reply_text(
@@ -573,6 +576,7 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     db.save_google_tokens(telegram_id, "", "", 0)
+    db.log_event(telegram_id, "google_disconnected")
     await update.message.reply_text(
         "🔌 Google Календарь отключён.\nДля повторного подключения: /connect"
     )
@@ -630,6 +634,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_google(update):
         return
     telegram_id = update.effective_user.id
+    db.log_event(telegram_id, "voice_message")
     msg = await update.message.reply_text("🎙 Слушаю...")
     tg_file = await context.bot.get_file(update.message.voice.file_id)
     audio   = await tg_file.download_as_bytearray()
@@ -821,6 +826,7 @@ async def scheduled_telemost_all_users(bot: Bot):
                 None, lambda uid=telegram_id: process_telemost_links(uid)
             )
             if res["added"]:
+                db.log_event(telegram_id, "telemost_auto")
                 await bot.send_message(
                     chat_id=telegram_id,
                     text=f"🔗 *Авто-обход Телемост*\n\n{format_telemost_report(res)}",
@@ -862,6 +868,7 @@ async def oauth_callback(request: web.Request) -> web.Response:
                 text="✅ *Google Календарь подключён!*\n\nТеперь можешь спрашивать про свободные слоты голосом или текстом.",
                 parse_mode="Markdown",
             )
+            db.log_event(telegram_id, "google_connected")
         except Exception as e:
             logger.error("Не удалось отправить сообщение после OAuth: %s", e)
 
@@ -918,6 +925,7 @@ async def _handle_pending_tasks(
     )
 
     if ok:
+        db.log_event(telegram_id, "task_completed")
         tasks.pop(idx)
         context.user_data["tasks"] = tasks
         title = task.get("title", "").strip()
@@ -956,6 +964,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["tasks"] = tasks
+    db.log_event(telegram_id, "tasks_viewed")
     await update.message.reply_text(_format_tasks(tasks), parse_mode="MarkdownV2")
 
 
@@ -1020,6 +1029,40 @@ async def cmd_del_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+EVENT_LABELS = {
+    "start":               "🚀 Запустили бота",
+    "google_connected":    "🔗 Подключили Google",
+    "google_disconnected": "🔌 Отключили Google",
+    "voice_message":       "🎙 Голосовых сообщений",
+    "meeting_created":     "📌 Встреч создано",
+    "tasks_viewed":        "📋 Просмотров задач",
+    "task_completed":      "✅ Задач закрыто",
+    "telemost_auto":       "🔗 Авто-Телемост",
+}
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика использования бота — только для администратора."""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    stats = await asyncio.get_event_loop().run_in_executor(None, db.get_stats)
+    lines = [
+        "📊 *Статистика бота*\n",
+        f"👥 Всего пользователей: *{stats['total_users']}*",
+        f"🔗 С Google Calendar: *{stats['google_connected']}*",
+        f"🆕 Новых за 7 дней: *{stats['new_users_7d']}*",
+        f"📈 Активных за 7 дней: *{stats['active_7d']}*",
+        f"📈 Активных за 30 дней: *{stats['active_30d']}*",
+        f"⚡ Событий сегодня: *{stats['total_events_today']}*",
+    ]
+    if stats["top_events"]:
+        lines.append("\n*Топ действий за 30 дней:*")
+        for event_type, cnt in stats["top_events"]:
+            label = EVENT_LABELS.get(event_type, event_type)
+            lines.append(f"  {label}: {cnt}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def run_bot():
     global _bot
 
@@ -1041,6 +1084,7 @@ async def run_bot():
     app.add_handler(CommandHandler("contacts",      cmd_contacts))
     app.add_handler(CommandHandler("add_contact",   cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",   cmd_del_contact))
+    app.add_handler(CommandHandler("stats",         cmd_stats))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

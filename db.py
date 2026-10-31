@@ -63,6 +63,15 @@ def init_db() -> None:
                 email        TEXT    NOT NULL,
                 PRIMARY KEY (telegram_id, name_lower)
             );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                event_type  TEXT    NOT NULL,
+                created_at  REAL    DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_user ON events(telegram_id, created_at);
         """)
         conn.commit()
         conn.close()
@@ -300,3 +309,68 @@ def resolve_names_to_emails(telegram_id: int, text: str) -> tuple:
         else:
             unknown.append(part)
     return found, unknown
+
+
+# ─── Метрики событий ─────────────────────────────────────────
+
+def log_event(telegram_id: int, event_type: str) -> None:
+    """Записываем событие в лог."""
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO events (telegram_id, event_type) VALUES (?, ?)",
+            (telegram_id, event_type)
+        )
+        conn.commit()
+        conn.close()
+
+
+def get_stats() -> dict:
+    """Сводная статистика для /stats."""
+    with _lock:
+        conn = _connect()
+
+        total_users = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        google_connected = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE google_refresh_token IS NOT NULL"
+        ).fetchone()[0]
+
+        new_users_7d = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')"
+        ).fetchone()[0]
+
+        active_7d = conn.execute(
+            "SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at >= unixepoch('now', '-7 days')"
+        ).fetchone()[0]
+
+        active_30d = conn.execute(
+            "SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at >= unixepoch('now', '-30 days')"
+        ).fetchone()[0]
+
+        top_events = conn.execute("""
+            SELECT event_type, COUNT(*) as cnt
+            FROM events
+            WHERE created_at >= unixepoch('now', '-30 days')
+            GROUP BY event_type
+            ORDER BY cnt DESC
+            LIMIT 10
+        """).fetchall()
+
+        total_events_today = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at >= unixepoch('now', 'start of day')"
+        ).fetchone()[0]
+
+        conn.close()
+
+    return {
+        "total_users": total_users,
+        "google_connected": google_connected,
+        "new_users_7d": new_users_7d,
+        "active_7d": active_7d,
+        "active_30d": active_30d,
+        "top_events": [(row["event_type"], row["cnt"]) for row in top_events],
+        "total_events_today": total_events_today,
+    }

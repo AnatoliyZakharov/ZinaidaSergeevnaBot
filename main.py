@@ -511,9 +511,9 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
                 logger.error("Ошибка приглашения: %s", e)
 
         context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
+        db.log_event(telegram_id, "meeting_created")
         await msg.edit_text(
-            db.log_event(telegram_id, "meeting_created")
-        f"✅ *Встреча создана!*\n\n"
+            f"✅ *Встреча создана!*\n\n"
             f"📌 {title}\n"
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
@@ -791,12 +791,9 @@ async def send_daily_schedule(bot):
             events = result.get("items", [])
 
             if not events:
-                text = "📅 *Расписание на сегодня*
-
-Встреч нет — свободный день! 🎉"
+                text = "📅 *Расписание на сегодня*\n\nВстреч нет — свободный день! 🎉"
             else:
-                lines = ["📅 *Расписание на сегодня:*
-"]
+                lines = ["📅 *Расписание на сегодня:*\n"]
                 for ev in events:
                     start_raw = ev.get("start", {})
                     end_raw   = ev.get("end",   {})
@@ -808,8 +805,7 @@ async def send_daily_schedule(bot):
                         time_str = "весь день"
                     title = ev.get("summary", "(без названия)").strip()
                     lines.append(f"• {time_str}  {title}")
-                text = "
-".join(lines)
+                text = "\n".join(lines)
 
             await bot.send_message(chat_id=telegram_id, text=text, parse_mode="Markdown", disable_notification=True)
         except Exception as e:
@@ -952,10 +948,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if err == "no_scope":
         await update.message.reply_text(
-            "⚠️ Нет доступа к Google Tasks\.
-
-"
-            "Переподключи аккаунт: /connect",
+            "⚠️ Нет доступа к Google Tasks\.\n\nПереподключи аккаунт: /connect",
             parse_mode="MarkdownV2",
         )
         return

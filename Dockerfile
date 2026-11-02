@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     apt-get update -qq && apt-get install -y -qq sqlite3 && rm -rf /var/lib/apt/lists/*
 
-COPY main.py auth.py db.py ./
+COPY main.py auth.py db.py gtasks.py ./
 
 # Директория для SQLite (монтируется как Fly volume)
 RUN mkdir -p /data

@@ -1034,6 +1034,11 @@ EVENT_LABELS = {
     "telemost_auto":       "🔗 Авто-Телемост",
 }
 
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ваш Telegram ID."""
+    uid = update.effective_user.id
+    await update.message.reply_text(f"🆔 Ваш Telegram ID: `{uid}`", parse_mode="Markdown")
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика использования бота — только для администратора."""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -1077,6 +1082,7 @@ async def run_bot():
     app.add_handler(CommandHandler("contacts",      cmd_contacts))
     app.add_handler(CommandHandler("add_contact",   cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",   cmd_del_contact))
+    app.add_handler(CommandHandler("myid",          cmd_myid))
     app.add_handler(CommandHandler("stats",         cmd_stats))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

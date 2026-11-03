@@ -19,6 +19,9 @@ primary_region = "arn"
     path          = "/health"
     timeout       = "5s"
 
+[env]
+  DB_PATH = "/data/bot.db"
+
 [[mounts]]
   source      = "bot_data"
   destination = "/data"

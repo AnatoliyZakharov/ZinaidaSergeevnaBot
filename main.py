@@ -499,7 +499,7 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
             dt = tz.localize(dt)
         end_dt = dt + timedelta(minutes=duration)
 
-        telemost_line = f"\n🔗 {telemost_link}" if telemost_link else "\n⚠️ Телемост не удалось создать"
+        telemost_line = f"\n[🔗 Яндекс Телемост]({telemost_link})" if telemost_link else "\n⚠️ Телемост не удалось создать"
         invite_note   = ""
         if inline_emails:
             try:

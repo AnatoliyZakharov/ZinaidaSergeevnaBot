@@ -66,8 +66,8 @@ def _fetch_meetings() -> list:
         data  = resp.json()
 
         # API may wrap items in different keys depending on version
-        items = (data.get("items") or data.get("meetings") or
-                 data.get("data") or [])
+        items = (data.get("followups") or data.get("items") or
+         data.get("meetings") or data.get("data") or [])
         if not items:
             break
         meetings.extend(items)

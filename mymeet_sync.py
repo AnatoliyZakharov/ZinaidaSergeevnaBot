@@ -101,11 +101,10 @@ def _extract_tasks(protocol: dict | None) -> list:
         return []
     tasks = []
     try:
-        templates = (
-            protocol.get("data", {})
-                    .get("followup_v2", {})
-                    .get("templates", [])
-        )
+       templates = (
+    protocol.get("followup_v2", {})
+            .get("templates", [])
+)
         for tmpl in templates:
             for entity in tmpl.get("entities", []):
                 if entity.get("name") != "tasks":

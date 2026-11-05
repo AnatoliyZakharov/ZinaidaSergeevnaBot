@@ -67,7 +67,7 @@ def _fetch_meetings() -> list:
 
         # API may wrap items in different keys depending on version
         items = (data.get("followups") or data.get("items") or
-         data.get("meetings") or data.get("data") or [])
+                 data.get("meetings") or data.get("data") or [])
         if not items:
             break
         meetings.extend(items)
@@ -101,10 +101,10 @@ def _extract_tasks(protocol: dict | None) -> list:
         return []
     tasks = []
     try:
-       templates = (
-    protocol.get("followup_v2", {})
-            .get("templates", [])
-)
+        templates = (
+            protocol.get("followup_v2", {})
+                    .get("templates", [])
+        )
         for tmpl in templates:
             for entity in tmpl.get("entities", []):
                 if entity.get("name") != "tasks":

@@ -8,3 +8,4 @@ aiohttp==3.10.10
 requests==2.32.3
 pytz==2024.2
 dateparser==1.2.0
+gspread==6.1.2

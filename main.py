@@ -14,6 +14,7 @@ ZinaidaSergeevnaBot — мультипользовательский голос�
   WORK_START            — начало рабочего дня по умолчанию (9)
   WORK_END              — конец рабочего дня по умолчанию (19)
   WEBHOOK_HOST          — публичный домен для Telegram webhook (если используется)
+  GOOGLE_SA_KEY         — JSON сервисного аккаунта для записи в Google Sheets (MYmeet)
 """
 
 import asyncio
@@ -46,6 +47,7 @@ from googleapiclient.discovery import build
 import db
 import gtasks
 import auth
+from mymeet_sync import sync_to_sheets_async
 
 # ─── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -64,7 +66,6 @@ DEFAULT_WORK_START    = int(os.environ.get("WORK_START", "9"))
 DEFAULT_WORK_END      = int(os.environ.get("WORK_END", "19"))
 WEBHOOK_HOST          = os.environ.get("WEBHOOK_HOST", "")   # напр. https://bot.example.com
 OAUTH_CALLBACK_PORT   = int(os.environ.get("OAUTH_CALLBACK_PORT", "8080"))
-ADMIN_TELEGRAM_ID     = int(os.environ.get("ADMIN_TELEGRAM_ID", "0"))
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -499,7 +500,7 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
             dt = tz.localize(dt)
         end_dt = dt + timedelta(minutes=duration)
 
-        telemost_line = f"\n[🔗 Яндекс Телемост]({telemost_link})" if telemost_link else "\n⚠️ Телемост не удалось создать"
+        telemost_line = f"\n🔗 {telemost_link}" if telemost_link else "\n⚠️ Телемост не удалось создать"
         invite_note   = ""
         if inline_emails:
             try:
@@ -511,7 +512,6 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
                 logger.error("Ошибка приглашения: %s", e)
 
         context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
-        db.log_event(telegram_id, "meeting_created")
         await msg.edit_text(
             f"✅ *Встреча создана!*\n\n"
             f"📌 {title}\n"
@@ -533,7 +533,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     username    = update.effective_user.username
     db.upsert_user(telegram_id, username)
-    db.log_event(telegram_id, "start")
 
     if db.is_google_connected(telegram_id):
         await update.message.reply_text(
@@ -576,7 +575,6 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     db.save_google_tokens(telegram_id, "", "", 0)
-    db.log_event(telegram_id, "google_disconnected")
     await update.message.reply_text(
         "🔌 Google Календарь отключён.\nДля повторного подключения: /connect"
     )
@@ -634,7 +632,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_google(update):
         return
     telegram_id = update.effective_user.id
-    db.log_event(telegram_id, "voice_message")
     msg = await update.message.reply_text("🎙 Слушаю...")
     tg_file = await context.bot.get_file(update.message.voice.file_id)
     audio   = await tg_file.download_as_bytearray()
@@ -822,7 +819,6 @@ async def scheduled_telemost_all_users(bot: Bot):
                 None, lambda uid=telegram_id: process_telemost_links(uid)
             )
             if res["added"]:
-                db.log_event(telegram_id, "telemost_auto")
                 await bot.send_message(
                     chat_id=telegram_id,
                     text=f"🔗 *Авто-обход Телемост*\n\n{format_telemost_report(res)}",
@@ -831,6 +827,28 @@ async def scheduled_telemost_all_users(bot: Bot):
                 )
         except Exception as e:
             logger.error("Ошибка scheduled для user %s: %s", telegram_id, e)
+
+
+# ─── MYmeet sync ─────────────────────────────────────────────
+
+async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная синхронизация MYmeet → Google Sheets (/sync_mymeet)."""
+    msg = await update.message.reply_text("⏳ Синхронизирую задачи из MYmeet...")
+    try:
+        result = await sync_to_sheets_async()
+        await msg.edit_text(result)
+    except Exception as e:
+        logger.error("MYmeet sync error: %s", e, exc_info=True)
+        await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+
+
+async def scheduled_mymeet_sync():
+    """Ежедневно в 19:00 MSK: синхронизируем MYmeet → Google Sheets."""
+    try:
+        result = await sync_to_sheets_async()
+        logger.info("Scheduled MYmeet sync: %s", result.replace("\n", " | "))
+    except Exception as e:
+        logger.error("Scheduled MYmeet sync error: %s", e, exc_info=True)
 
 
 # ─── OAuth callback (aiohttp web server) ─────────────────────
@@ -864,7 +882,6 @@ async def oauth_callback(request: web.Request) -> web.Response:
                 text="✅ *Google Календарь подключён!*\n\nТеперь можешь спрашивать про свободные слоты голосом или текстом.",
                 parse_mode="Markdown",
             )
-            db.log_event(telegram_id, "google_connected")
         except Exception as e:
             logger.error("Не удалось отправить сообщение после OAuth: %s", e)
 
@@ -921,7 +938,6 @@ async def _handle_pending_tasks(
     )
 
     if ok:
-        db.log_event(telegram_id, "task_completed")
         tasks.pop(idx)
         context.user_data["tasks"] = tasks
         title = task.get("title", "").strip()
@@ -948,7 +964,8 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if err == "no_scope":
         await update.message.reply_text(
-            "⚠️ Нет доступа к Google Tasks\.\n\nПереподключи аккаунт: /connect",
+            "⚠️ Нет доступа к Google Tasks\.\n\n"
+            "Переподключи аккаунт: /connect",
             parse_mode="MarkdownV2",
         )
         return
@@ -957,7 +974,6 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["tasks"] = tasks
-    db.log_event(telegram_id, "tasks_viewed")
     await update.message.reply_text(_format_tasks(tasks), parse_mode="MarkdownV2")
 
 
@@ -1022,45 +1038,6 @@ async def cmd_del_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-
-EVENT_LABELS = {
-    "start":               "🚀 Запустили бота",
-    "google_connected":    "🔗 Подключили Google",
-    "google_disconnected": "🔌 Отключили Google",
-    "voice_message":       "🎙 Голосовых сообщений",
-    "meeting_created":     "📌 Встреч создано",
-    "tasks_viewed":        "📋 Просмотров задач",
-    "task_completed":      "✅ Задач закрыто",
-    "telemost_auto":       "🔗 Авто-Телемост",
-}
-
-async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает ваш Telegram ID."""
-    uid = update.effective_user.id
-    await update.message.reply_text(f"🆔 Ваш Telegram ID: `{uid}`", parse_mode="Markdown")
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика использования бота — только для администратора."""
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
-    stats = await asyncio.get_event_loop().run_in_executor(None, db.get_stats)
-    lines = [
-        "📊 *Статистика бота*\n",
-        f"👥 Всего пользователей: *{stats['total_users']}*",
-        f"🔗 С Google Calendar: *{stats['google_connected']}*",
-        f"🆕 Новых за 7 дней: *{stats['new_users_7d']}*",
-        f"📈 Активных за 7 дней: *{stats['active_7d']}*",
-        f"📈 Активных за 30 дней: *{stats['active_30d']}*",
-        f"⚡ Событий сегодня: *{stats['total_events_today']}*",
-    ]
-    if stats["top_events"]:
-        lines.append("\n*Топ действий за 30 дней:*")
-        for event_type, cnt in stats["top_events"]:
-            label = EVENT_LABELS.get(event_type, event_type)
-            lines.append(f"  {label}: {cnt}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 async def run_bot():
     global _bot
 
@@ -1073,17 +1050,17 @@ async def run_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
     _bot = app.bot
 
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("connect",    cmd_connect))
-    app.add_handler(CommandHandler("disconnect", cmd_disconnect))
-    app.add_handler(CommandHandler("settings",   cmd_settings))
-    app.add_handler(CommandHandler("settz",      cmd_settz))
-    app.add_handler(CommandHandler("sethours",      cmd_sethours))
-    app.add_handler(CommandHandler("contacts",      cmd_contacts))
-    app.add_handler(CommandHandler("add_contact",   cmd_add_contact))
-    app.add_handler(CommandHandler("del_contact",   cmd_del_contact))
-    app.add_handler(CommandHandler("myid",          cmd_myid))
-    app.add_handler(CommandHandler("stats",         cmd_stats))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("connect",      cmd_connect))
+    app.add_handler(CommandHandler("disconnect",   cmd_disconnect))
+    app.add_handler(CommandHandler("settings",     cmd_settings))
+    app.add_handler(CommandHandler("settz",        cmd_settz))
+    app.add_handler(CommandHandler("sethours",     cmd_sethours))
+    app.add_handler(CommandHandler("contacts",     cmd_contacts))
+    app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
+    app.add_handler(CommandHandler("del_contact",  cmd_del_contact))
+    app.add_handler(CommandHandler("tasks",        cmd_tasks))
+    app.add_handler(CommandHandler("sync_mymeet",  cmd_sync_mymeet))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -1109,6 +1086,15 @@ async def run_bot():
         minute=0,
         args=[app.bot],
         id="daily_schedule",
+        replace_existing=True,
+        timezone="UTC",
+    )
+    scheduler.add_job(
+        scheduled_mymeet_sync,
+        "cron",
+        hour=16,       # 19:00 MSK = 16:00 UTC
+        minute=0,
+        id="mymeet_daily_sync",
         replace_existing=True,
         timezone="UTC",
     )

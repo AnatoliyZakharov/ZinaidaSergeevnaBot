@@ -46,10 +46,36 @@ HEADER_TEXT_FORMAT = {
 }
 
 
+# ── Write-rate limiter ────────────────────────────────────────────────────────
+# Google Sheets API: 60 write requests/min/user.  We use a simple sliding-window
+# limiter so the sync never issues more than ~50 writes per 60 s.
+
+_WRITE_WINDOW  = 60.0   # seconds
+_WRITE_MAX     = 50     # requests per window (keep some head-room)
+_write_times: list = [] # timestamps of recent writes (module-level, single-threaded)
+
+
+def _throttle():
+    """Block until another write is allowed by the rate limit."""
+    now = time.monotonic()
+    # Evict timestamps older than the window
+    while _write_times and now - _write_times[0] >= _WRITE_WINDOW:
+        _write_times.pop(0)
+    if len(_write_times) >= _WRITE_MAX:
+        wait = _WRITE_WINDOW - (now - _write_times[0]) + 0.2
+        logger.debug("Rate-limit: sleeping %.1fs before next write", wait)
+        time.sleep(wait)
+        now = time.monotonic()
+        while _write_times and now - _write_times[0] >= _WRITE_WINDOW:
+            _write_times.pop(0)
+    _write_times.append(time.monotonic())
+
+
 # ── Retry helper ──────────────────────────────────────────────────────────────
 
-def _gs_call(fn, *args, retries: int = 6, **kwargs):
-    """Call a gspread method with exponential backoff on 429/503."""
+def _gs_call(fn, *args, retries: int = 7, **kwargs):
+    """Call a gspread method with rate limiting + exponential backoff on 429/503."""
+    _throttle()
     for attempt in range(retries):
         try:
             return fn(*args, **kwargs)
@@ -57,8 +83,9 @@ def _gs_call(fn, *args, retries: int = 6, **kwargs):
             status = getattr(e, "response", None)
             code = status.status_code if status else 0
             if code in (429, 503) and attempt < retries - 1:
-                wait = 2 ** attempt          # 1 2 4 8 16 32 s
-                logger.warning("Sheets quota hit (attempt %d), waiting %ds…", attempt + 1, wait)
+                wait = 2 ** (attempt + 1)   # 2 4 8 16 32 64 s
+                logger.warning("Sheets quota hit (attempt %d/%d), waiting %ds…",
+                               attempt + 1, retries, wait)
                 time.sleep(wait)
             else:
                 raise

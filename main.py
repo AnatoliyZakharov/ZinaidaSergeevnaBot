@@ -973,9 +973,11 @@ async def _handle_mymeet_setup(
         context.user_data.pop("mymeet_setup", None)
         await update.message.reply_text(
             "🎉 *MYmeet настроен!*\n\n"
-            "Запусти первую синхронизацию:\n"
-            "/sync_mymeet\n\n"
-            "_Ежедневный авто-синк запускается в 19:00 МСК._",
+            "Запусти первоначальную загрузку (например, за 30 дней):\n"
+            "`/sync_mymeet_full 30`\n\n"
+            "Ежедневный синк (только сегодня):\n"
+            "`/sync_mymeet`\n\n"
+            "_Авто-синк запускается ежедневно в 19:00 МСК._",
             parse_mode="Markdown",
         )
         return True
@@ -1014,7 +1016,7 @@ def _user_row_to_mymeet_config(user) -> dict | None:
 
 
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительная синхронизация MYmeet → Google Sheets (/sync_mymeet)."""
+    """Синхронизация за сегодня (/sync_mymeet) — добавляет сегодняшние задачи."""
     telegram_id = update.effective_user.id
     db.upsert_user(telegram_id, update.effective_user.username)
     user = db.get_user(telegram_id)
@@ -1027,12 +1029,52 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = await update.message.reply_text("⏳ Синхронизирую задачи из MYmeet...")
+    msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
     try:
-        result = await sync_to_sheets_async(user_config=user_config)
+        result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
         await msg.edit_text(result)
     except Exception as e:
         logger.error("MYmeet sync error: %s", e, exc_info=True)
+        await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+
+
+async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полная синхронизация MYmeet за N дней (/sync_mymeet_full [дней]).
+
+    Пример: /sync_mymeet_full 30  — синхронизировать за последние 30 дней (полная перезапись).
+    По умолчанию: 30 дней.
+    """
+    telegram_id = update.effective_user.id
+    db.upsert_user(telegram_id, update.effective_user.username)
+    user = db.get_user(telegram_id)
+    user_config = _user_row_to_mymeet_config(user)
+
+    if not user_config:
+        await update.message.reply_text(
+            "⚙️ MYmeet ещё не настроен.\n\n"
+            "Запусти: /setup_mymeet"
+        )
+        return
+
+    # Парсим аргумент — количество дней
+    days = 30
+    if context.args:
+        try:
+            days = max(1, min(365, int(context.args[0])))
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Укажи целое число дней. Пример: /sync_mymeet_full 30"
+            )
+            return
+
+    msg = await update.message.reply_text(
+        f"⏳ Полная синхронизация MYmeet за {days} дней (перезапись таблицы)..."
+    )
+    try:
+        result = await sync_to_sheets_async(days=days, append=False, user_config=user_config)
+        await msg.edit_text(result)
+    except Exception as e:
+        logger.error("MYmeet sync full error: %s", e, exc_info=True)
         await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
 
 
@@ -1260,9 +1302,10 @@ async def run_bot():
     app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",  cmd_del_contact))
     app.add_handler(CommandHandler("tasks",         cmd_tasks))
-    app.add_handler(CommandHandler("sync_mymeet",   cmd_sync_mymeet))
-    app.add_handler(CommandHandler("setup_mymeet",  cmd_setup_mymeet))
-    app.add_handler(CommandHandler("reset_mymeet",  cmd_setup_mymeet))
+    app.add_handler(CommandHandler("sync_mymeet",      cmd_sync_mymeet))
+    app.add_handler(CommandHandler("sync_mymeet_full", cmd_sync_mymeet_full))
+    app.add_handler(CommandHandler("setup_mymeet",     cmd_setup_mymeet))
+    app.add_handler(CommandHandler("reset_mymeet",     cmd_setup_mymeet))
     app.add_handler(CallbackQueryHandler(
         lambda u, c: _handle_mymeet_ws_callback(u, c),
         pattern=r"^mymeet_ws:",

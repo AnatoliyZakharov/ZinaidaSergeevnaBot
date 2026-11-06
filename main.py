@@ -1017,25 +1017,34 @@ def _user_row_to_mymeet_config(user) -> dict | None:
 
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Синхронизация за сегодня (/sync_mymeet) — добавляет сегодняшние задачи."""
-    telegram_id = update.effective_user.id
-    db.upsert_user(telegram_id, update.effective_user.username)
-    user = db.get_user(telegram_id)
-    user_config = _user_row_to_mymeet_config(user)
-
-    if not user_config:
-        await update.message.reply_text(
-            "⚙️ MYmeet ещё не настроен.\n\n"
-            "Запусти: /setup_mymeet"
-        )
-        return
-
-    msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
     try:
-        result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
-        await msg.edit_text(result)
-    except Exception as e:
-        logger.error("MYmeet sync error: %s", e, exc_info=True)
-        await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+        telegram_id = update.effective_user.id
+        db.upsert_user(telegram_id, update.effective_user.username)
+        user = db.get_user(telegram_id)
+        logger.info("cmd_sync_mymeet: user=%s mymeet_setup_done=%s",
+                    telegram_id, user["mymeet_setup_done"] if user else None)
+        user_config = _user_row_to_mymeet_config(user)
+
+        if not user_config:
+            await update.message.reply_text(
+                "⚙️ MYmeet ещё не настроен.\n\n"
+                "Запусти: /setup_mymeet"
+            )
+            return
+
+        msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
+        try:
+            result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
+            await msg.edit_text(result)
+        except Exception as e:
+            logger.error("MYmeet sync error: %s", e, exc_info=True)
+            await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+    except Exception as fatal:
+        logger.error("cmd_sync_mymeet fatal: %s", fatal, exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Внутренняя ошибка:\n{fatal}")
+        except Exception:
+            pass
 
 
 async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1044,38 +1053,45 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
     Пример: /sync_mymeet_full 30  — синхронизировать за последние 30 дней (полная перезапись).
     По умолчанию: 30 дней.
     """
-    telegram_id = update.effective_user.id
-    db.upsert_user(telegram_id, update.effective_user.username)
-    user = db.get_user(telegram_id)
-    user_config = _user_row_to_mymeet_config(user)
+    try:
+        telegram_id = update.effective_user.id
+        db.upsert_user(telegram_id, update.effective_user.username)
+        user = db.get_user(telegram_id)
+        user_config = _user_row_to_mymeet_config(user)
 
-    if not user_config:
-        await update.message.reply_text(
-            "⚙️ MYmeet ещё не настроен.\n\n"
-            "Запусти: /setup_mymeet"
-        )
-        return
-
-    # Парсим аргумент — количество дней
-    days = 30
-    if context.args:
-        try:
-            days = max(1, min(365, int(context.args[0])))
-        except ValueError:
+        if not user_config:
             await update.message.reply_text(
-                "⚠️ Укажи целое число дней. Пример: /sync_mymeet_full 30"
+                "⚙️ MYmeet ещё не настроен.\n\n"
+                "Запусти: /setup_mymeet"
             )
             return
 
-    msg = await update.message.reply_text(
-        f"⏳ Полная синхронизация MYmeet за {days} дней (перезапись таблицы)..."
-    )
-    try:
-        result = await sync_to_sheets_async(days=days, append=False, user_config=user_config)
-        await msg.edit_text(result)
-    except Exception as e:
-        logger.error("MYmeet sync full error: %s", e, exc_info=True)
-        await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+        # Парсим аргумент — количество дней
+        days = 30
+        if context.args:
+            try:
+                days = max(1, min(365, int(context.args[0])))
+            except ValueError:
+                await update.message.reply_text(
+                    "⚠️ Укажи целое число дней. Пример: /sync_mymeet_full 30"
+                )
+                return
+
+        msg = await update.message.reply_text(
+            f"⏳ Полная синхронизация MYmeet за {days} дней (перезапись таблицы)..."
+        )
+        try:
+            result = await sync_to_sheets_async(days=days, append=False, user_config=user_config)
+            await msg.edit_text(result)
+        except Exception as e:
+            logger.error("MYmeet sync full error: %s", e, exc_info=True)
+            await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+    except Exception as fatal:
+        logger.error("cmd_sync_mymeet_full fatal: %s", fatal, exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Внутренняя ошибка:\n{fatal}")
+        except Exception:
+            pass
 
 
 async def scheduled_mymeet_sync():

@@ -115,21 +115,45 @@ def _format_header(ws, col_range: str) -> None:
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
 
-def _mymeet_headers() -> dict:
-    return {"X-API-KEY": MYMEET_TOKEN}
+def _mymeet_headers(token: str | None = None) -> dict:
+    return {"X-API-KEY": token or MYMEET_TOKEN}
 
 
-def _fetch_meetings(days: int = 30) -> list:
+def fetch_workspaces(token: str) -> list:
+    """Запрашиваем список рабочих пространств MYmeet по токену."""
+    for endpoint in ("/api/workspaces", "/api/user/workspaces", "/api/workspace"):
+        try:
+            resp = requests.get(
+                f"{MYMEET_BASE}{endpoint}",
+                headers=_mymeet_headers(token),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data if isinstance(data, list) else (
+                    data.get("items") or data.get("workspaces") or data.get("data") or []
+                )
+                if items:
+                    return items
+        except Exception:
+            pass
+    return []
+
+
+def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None = None) -> list:
     """Return list of raw meeting objects for the past N days."""
+    _token = token or MYMEET_TOKEN
+    _ws_id = ws_id or MYMEET_WS_ID
+
     now       = datetime.now(timezone.utc)
     date_to   = int(now.timestamp() * 1000)
     date_from = int((now - timedelta(days=days)).timestamp() * 1000)
 
     meetings, page = [], 0
     while True:
-        url    = f"{MYMEET_BASE}/api/workspaces/{MYMEET_WS_ID}/all-meetings"
+        url    = f"{MYMEET_BASE}/api/workspaces/{_ws_id}/all-meetings"
         params = {"page": page, "perPage": 50, "dateFrom": date_from, "dateTo": date_to}
-        resp   = requests.get(url, headers=_mymeet_headers(), params=params, timeout=30)
+        resp   = requests.get(url, headers=_mymeet_headers(_token), params=params, timeout=30)
         resp.raise_for_status()
         data   = resp.json()
 
@@ -149,11 +173,11 @@ def _fetch_meetings(days: int = 30) -> list:
     return meetings
 
 
-def _fetch_protocol(meeting_id: str) -> dict | None:
+def _fetch_protocol(meeting_id: str, token: str | None = None) -> dict | None:
     url    = f"{MYMEET_BASE}/api/storage/download"
     params = {"meeting_id": meeting_id, "format": "json"}
     try:
-        resp = requests.get(url, headers=_mymeet_headers(), params=params, timeout=30)
+        resp = requests.get(url, headers=_mymeet_headers(token), params=params, timeout=30)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -231,20 +255,22 @@ def _safe_sheet_name(name: str) -> str:
     return s[:100].strip()
 
 
-def _is_organizer(m: dict) -> bool:
+def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
     """Return True if the current user is the organizer of this meeting.
 
     MYmeet embeds Google Calendar event data, where the organizer field looks like:
       {"email": "user@example.com", "self": true}
     We check several possible locations for this structure.
     """
+    _email = organizer_email or ORGANIZER_EMAIL
+
     def _check_organizer_obj(obj) -> bool | None:
         if not isinstance(obj, dict):
             return None
         if obj.get("self"):
             return True
         email = obj.get("email", "")
-        if email and email.lower() == ORGANIZER_EMAIL.lower():
+        if email and email.lower() == _email.lower():
             return True
         if email:          # organizer field exists but it's someone else
             return False
@@ -279,8 +305,20 @@ def _is_organizer(m: dict) -> bool:
         return False
 
     # Can't determine — include the meeting and log for later inspection
-    logger.debug("_is_organizer: could not determine, fields=%s", list(m.keys()))
+    logger.debug("_is_organizer: could not determine for %s, keys=%s",
+                 m.get("id", "?"), list(m.keys()))
     return True
+
+
+def _build_user_config(user_config: dict | None) -> dict:
+    """Merge user_config with module-level defaults."""
+    cfg = user_config or {}
+    return {
+        "token":    cfg.get("mymeet_token")          or MYMEET_TOKEN,
+        "ws_id":    cfg.get("mymeet_ws_id")          or MYMEET_WS_ID,
+        "sheet_id": cfg.get("mymeet_spreadsheet_id") or SPREADSHEET_ID,
+        "email":    cfg.get("mymeet_organizer_email") or ORGANIZER_EMAIL,
+    }
 
 
 GROUPER_FORMAT = {
@@ -291,19 +329,22 @@ GROUPER_FORMAT = {
 
 # ── Core sync ─────────────────────────────────────────────────────────────────
 
-def sync_to_sheets(days: int = 30, append: bool = False) -> str:
+def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | None = None) -> str:
     """
     Fetch MYmeet data and write to Google Sheets.
 
     days=30, append=False  — full overwrite (manual /sync_mymeet command)
     days=1,  append=True   — append yesterday's new tasks (daily scheduler)
+    user_config            — per-user dict with mymeet_token, mymeet_ws_id,
+                             mymeet_spreadsheet_id, mymeet_organizer_email
     """
-    logger.info("MYmeet sync started (days=%d, append=%s)", days, append)
+    cfg = _build_user_config(user_config)
+    logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
 
-    raw_meetings = _fetch_meetings(days=days)
+    raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
     logger.info("Fetched %d raw meetings", len(raw_meetings))
 
-    raw_meetings = [m for m in raw_meetings if _is_organizer(m)]
+    raw_meetings = [m for m in raw_meetings if _is_organizer(m, cfg["email"])]
     logger.info("After organizer filter: %d meetings", len(raw_meetings))
 
     all_meetings = []
@@ -312,7 +353,7 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
         name = (m.get("name") or m.get("title") or m.get("meetingName") or "Без названия").strip()
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
 
-        protocol = _fetch_protocol(mid) if mid else None
+        protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
         tasks    = _extract_tasks(protocol)
 
         all_meetings.append({
@@ -340,7 +381,7 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
             one_time.append(m)
 
     gc          = _gs_client()
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    spreadsheet = gc.open_by_key(cfg["sheet_id"])
     sheets_written = 0
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
@@ -458,6 +499,13 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
 
 # ── Async wrapper ─────────────────────────────────────────────────────────────
 
-async def sync_to_sheets_async(days: int = 30, append: bool = False) -> str:
+async def sync_to_sheets_async(
+    days: int = 30,
+    append: bool = False,
+    user_config: dict | None = None,
+) -> str:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: sync_to_sheets(days=days, append=append))
+    return await loop.run_in_executor(
+        None,
+        lambda: sync_to_sheets(days=days, append=append, user_config=user_config),
+    )

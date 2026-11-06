@@ -47,7 +47,7 @@ from googleapiclient.discovery import build
 import db
 import gtasks
 import auth
-from mymeet_sync import sync_to_sheets_async
+from mymeet_sync import sync_to_sheets_async, fetch_workspaces
 
 # ─── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -728,10 +728,15 @@ async def _handle_pending_invite(telegram_id: int, text: str, update: Update, co
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_google(update):
-        return
     telegram_id = update.effective_user.id
     text = update.message.text
+
+    # MYmeet визард перехватывает сообщения до проверки Google
+    if await _handle_mymeet_setup(telegram_id, text, update, context):
+        return
+
+    if not await _require_google(update):
+        return
 
     if await _handle_pending_invite(telegram_id, text, update, context):
         return
@@ -829,13 +834,202 @@ async def scheduled_telemost_all_users(bot: Bot):
             logger.error("Ошибка scheduled для user %s: %s", telegram_id, e)
 
 
+# ─── MYmeet setup wizard ─────────────────────────────────────
+
+_SETUP_STEP_TOKEN  = "mymeet_token"
+_SETUP_STEP_WS     = "mymeet_ws"
+_SETUP_STEP_SHEET  = "mymeet_sheet"
+
+
+async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает визард настройки MYmeet (/setup_mymeet или /reset_mymeet)."""
+    telegram_id = update.effective_user.id
+    db.upsert_user(telegram_id, update.effective_user.username)
+    db.reset_mymeet_config(telegram_id)
+    context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
+    await update.message.reply_text(
+        "🔧 *Настройка MYmeet*\n\n"
+        "Шаг 1 из 3: введи свой *MYmeet API-токен*.\n\n"
+        "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
+        "_Токен начинается с `mm_`_",
+        parse_mode="Markdown",
+    )
+
+
+async def _handle_mymeet_setup(
+    telegram_id: int,
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Перехватывает сообщения во время визарда настройки MYmeet.
+    Возвращает True если сообщение было обработано."""
+    setup = context.user_data.get("mymeet_setup")
+    if not setup:
+        return False
+
+    step = setup.get("step")
+    text = text.strip()
+
+    # Шаг 1: получаем токен и пробуем найти рабочие пространства
+    if step == _SETUP_STEP_TOKEN:
+        if not text.startswith("mm_") and len(text) < 10:
+            await update.message.reply_text(
+                "❌ Похоже, это не MYmeet-токен. Токен должен начинаться с `mm_`.\n\n"
+                "Попробуй ещё раз или введи /cancel чтобы отменить.",
+                parse_mode="Markdown",
+            )
+            return True
+
+        msg = await update.message.reply_text("⏳ Проверяю токен...")
+        try:
+            workspaces = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: fetch_workspaces(text)
+            )
+        except Exception:
+            workspaces = []
+
+        if workspaces:
+            if len(workspaces) == 1:
+                # Единственное пространство — берём автоматически
+                ws = workspaces[0]
+                ws_id = ws.get("id") or ws.get("workspaceId") or ws.get("workspace_id") or ""
+                ws_name = ws.get("name") or ws.get("title") or ws_id
+                setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
+                context.user_data["mymeet_setup"] = setup
+                await msg.edit_text(
+                    f"✅ Токен принят! Рабочее пространство: *{ws_name}*\n\n"
+                    f"Шаг 2 из 3: введи *ID Google Таблицы*.\n\n"
+                    f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
+                    f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`\n\n"
+                    f"Не забудь открыть доступ к таблице сервисному аккаунту!",
+                    parse_mode="Markdown",
+                )
+            else:
+                # Несколько — показываем кнопки
+                setup.update({"step": _SETUP_STEP_WS, "token": text})
+                context.user_data["mymeet_setup"] = setup
+                keyboard = []
+                for ws in workspaces[:8]:  # Telegram limit: max ~8 кнопок читаемо
+                    ws_id   = ws.get("id") or ws.get("workspaceId") or ""
+                    ws_name = (ws.get("name") or ws.get("title") or ws_id)[:60]
+                    keyboard.append([InlineKeyboardButton(ws_name, callback_data=f"mymeet_ws:{ws_id}")])
+                await msg.edit_text(
+                    "✅ Токен принят! Выбери рабочее пространство:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+        else:
+            # Не смогли загрузить воркспейсы — спрашиваем вручную
+            setup.update({"step": _SETUP_STEP_WS, "token": text})
+            context.user_data["mymeet_setup"] = setup
+            await msg.edit_text(
+                "✅ Токен принят!\n\n"
+                "Шаг 2 из 3: введи *ID рабочего пространства MYmeet*.\n\n"
+                "Где взять: mymeet.ai → URL после `/workspaces/`\n"
+                "Формат: `4e9bb2c4-7382-4c86-903f-…`",
+                parse_mode="Markdown",
+            )
+        return True
+
+    # Шаг 2: рабочее пространство (если вводится вручную)
+    if step == _SETUP_STEP_WS:
+        if len(text) < 5:
+            await update.message.reply_text("❌ Похоже, это не ID рабочего пространства. Попробуй ещё раз.")
+            return True
+        setup.update({"step": _SETUP_STEP_SHEET, "ws_id": text})
+        context.user_data["mymeet_setup"] = setup
+        await update.message.reply_text(
+            f"✅ Пространство сохранено: `{text}`\n\n"
+            f"Шаг 3 из 3: введи *ID Google Таблицы*.\n\n"
+            f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
+            f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`",
+            parse_mode="Markdown",
+        )
+        return True
+
+    # Шаг 3: ID таблицы
+    if step == _SETUP_STEP_SHEET:
+        sheet_id = text.strip().strip("/")
+        # Извлекаем ID из полного URL если вставили URL
+        import re as _re
+        url_match = _re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", sheet_id)
+        if url_match:
+            sheet_id = url_match.group(1)
+        if len(sheet_id) < 20:
+            await update.message.reply_text(
+                "❌ Похоже, это не ID таблицы. Скопируй именно ID из URL (длинная строка).\nПопробуй ещё раз."
+            )
+            return True
+
+        token = setup.get("token")
+        ws_id = setup.get("ws_id")
+        db.save_mymeet_config(
+            telegram_id,
+            token=token,
+            ws_id=ws_id,
+            spreadsheet_id=sheet_id,
+            organizer_email=None,  # определяется через organizer.self в Google Calendar
+        )
+        context.user_data.pop("mymeet_setup", None)
+        await update.message.reply_text(
+            "🎉 *MYmeet настроен!*\n\n"
+            "Запусти первую синхронизацию:\n"
+            "/sync_mymeet\n\n"
+            "_Ежедневный авто-синк запускается в 19:00 МСК._",
+            parse_mode="Markdown",
+        )
+        return True
+
+    return False
+
+
+async def _handle_mymeet_ws_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обрабатывает нажатие кнопки выбора рабочего пространства MYmeet."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("mymeet_ws:"):
+        return False
+
+    ws_id = query.data.split(":", 1)[1]
+    setup = context.user_data.get("mymeet_setup", {})
+    setup.update({"step": _SETUP_STEP_SHEET, "ws_id": ws_id})
+    context.user_data["mymeet_setup"] = setup
+    await query.answer()
+    await query.edit_message_text(
+        f"✅ Пространство выбрано: `{ws_id}`\n\n"
+        f"Шаг 3 из 3: введи *ID Google Таблицы*.\n\n"
+        f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
+        f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`",
+        parse_mode="Markdown",
+    )
+    return True
+
+
 # ─── MYmeet sync ─────────────────────────────────────────────
+
+def _user_row_to_mymeet_config(user) -> dict | None:
+    """Преобразует строку users в user_config для sync_to_sheets_async."""
+    if not user or not user["mymeet_setup_done"]:
+        return None
+    return dict(user)  # sqlite3.Row → dict
+
 
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принудительная синхронизация MYmeet → Google Sheets (/sync_mymeet)."""
+    telegram_id = update.effective_user.id
+    db.upsert_user(telegram_id, update.effective_user.username)
+    user = db.get_user(telegram_id)
+    user_config = _user_row_to_mymeet_config(user)
+
+    if not user_config:
+        await update.message.reply_text(
+            "⚙️ MYmeet ещё не настроен.\n\n"
+            "Запусти: /setup_mymeet"
+        )
+        return
+
     msg = await update.message.reply_text("⏳ Синхронизирую задачи из MYmeet...")
     try:
-        result = await sync_to_sheets_async()
+        result = await sync_to_sheets_async(user_config=user_config)
         await msg.edit_text(result)
     except Exception as e:
         logger.error("MYmeet sync error: %s", e, exc_info=True)
@@ -843,12 +1037,18 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_mymeet_sync():
-    """Ежедневно в 19:00 MSK: синхронизируем MYmeet → Google Sheets."""
-    try:
-        result = await sync_to_sheets_async(days=1, append=True)
-        logger.info("Scheduled MYmeet sync: %s", result.replace("\n", " | "))
-    except Exception as e:
-        logger.error("Scheduled MYmeet sync error: %s", e, exc_info=True)
+    """Ежедневно в 19:00 MSK: синхронизируем MYmeet → Google Sheets для всех пользователей."""
+    users = await asyncio.get_event_loop().run_in_executor(None, db.get_mymeet_users)
+    logger.info("Scheduled MYmeet sync: %d users", len(users))
+    for user in users:
+        user_config = _user_row_to_mymeet_config(user)
+        if not user_config:
+            continue
+        try:
+            result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
+            logger.info("MYmeet sync [%s]: %s", user["telegram_id"], result.replace("\n", " | "))
+        except Exception as e:
+            logger.error("MYmeet sync error [%s]: %s", user["telegram_id"], e, exc_info=True)
 
 
 # ─── OAuth callback (aiohttp web server) ─────────────────────
@@ -1059,8 +1259,14 @@ async def run_bot():
     app.add_handler(CommandHandler("contacts",     cmd_contacts))
     app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",  cmd_del_contact))
-    app.add_handler(CommandHandler("tasks",        cmd_tasks))
-    app.add_handler(CommandHandler("sync_mymeet",  cmd_sync_mymeet))
+    app.add_handler(CommandHandler("tasks",         cmd_tasks))
+    app.add_handler(CommandHandler("sync_mymeet",   cmd_sync_mymeet))
+    app.add_handler(CommandHandler("setup_mymeet",  cmd_setup_mymeet))
+    app.add_handler(CommandHandler("reset_mymeet",  cmd_setup_mymeet))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: _handle_mymeet_ws_callback(u, c),
+        pattern=r"^mymeet_ws:",
+    ))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

@@ -74,7 +74,26 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_events_user ON events(telegram_id, created_at);
         """)
         conn.commit()
+        # Миграция: добавляем MYmeet-поля если их ещё нет
+        _migrate_mymeet(conn)
         conn.close()
+
+
+def _migrate_mymeet(conn: sqlite3.Connection) -> None:
+    """Добавляет MYmeet-колонки в таблицу users (идемпотентно)."""
+    mymeet_cols = [
+        ("mymeet_token",          "TEXT"),
+        ("mymeet_ws_id",          "TEXT"),
+        ("mymeet_spreadsheet_id", "TEXT"),
+        ("mymeet_organizer_email","TEXT"),
+        ("mymeet_setup_done",     "INTEGER DEFAULT 0"),
+    ]
+    for col, ddl in mymeet_cols:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # колонка уже существует
 
 
 # ─── Пользователи ────────────────────────────────────────────
@@ -309,6 +328,62 @@ def resolve_names_to_emails(telegram_id: int, text: str) -> tuple:
         else:
             unknown.append(part)
     return found, unknown
+
+
+# ─── MYmeet конфигурация ─────────────────────────────────────
+
+def save_mymeet_config(
+    telegram_id: int,
+    token: str,
+    ws_id: str,
+    spreadsheet_id: str,
+    organizer_email: Optional[str] = None,
+) -> None:
+    """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done."""
+    with _lock:
+        conn = _connect()
+        conn.execute("""
+            UPDATE users SET
+                mymeet_token          = ?,
+                mymeet_ws_id          = ?,
+                mymeet_spreadsheet_id = ?,
+                mymeet_organizer_email = ?,
+                mymeet_setup_done     = 1
+            WHERE telegram_id = ?
+        """, (token, ws_id, spreadsheet_id, organizer_email, telegram_id))
+        conn.commit()
+        conn.close()
+
+
+def get_mymeet_users() -> list:
+    """Все пользователи с настроенным MYmeet (для ежедневного синка)."""
+    with _lock:
+        conn = _connect()
+        rows = conn.execute("""
+            SELECT * FROM users
+            WHERE mymeet_setup_done = 1
+              AND mymeet_token IS NOT NULL
+              AND is_active = 1
+        """).fetchall()
+        conn.close()
+    return rows
+
+
+def reset_mymeet_config(telegram_id: int) -> None:
+    """Сбрасываем MYmeet-конфиг (пересетап)."""
+    with _lock:
+        conn = _connect()
+        conn.execute("""
+            UPDATE users SET
+                mymeet_token          = NULL,
+                mymeet_ws_id          = NULL,
+                mymeet_spreadsheet_id = NULL,
+                mymeet_organizer_email = NULL,
+                mymeet_setup_done     = 0
+            WHERE telegram_id = ?
+        """, (telegram_id,))
+        conn.commit()
+        conn.close()
 
 
 # ─── Метрики событий ─────────────────────────────────────────

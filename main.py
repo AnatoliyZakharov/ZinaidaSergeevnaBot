@@ -845,7 +845,7 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scheduled_mymeet_sync():
     """Ежедневно в 19:00 MSK: синхронизируем MYmeet → Google Sheets."""
     try:
-        result = await sync_to_sheets_async()
+        result = await sync_to_sheets_async(days=1, append=True)
         logger.info("Scheduled MYmeet sync: %s", result.replace("\n", " | "))
     except Exception as e:
         logger.error("Scheduled MYmeet sync error: %s", e, exc_info=True)

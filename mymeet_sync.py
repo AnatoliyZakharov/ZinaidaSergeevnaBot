@@ -344,11 +344,27 @@ def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
 def _build_user_config(user_config: dict | None) -> dict:
     """Merge user_config with module-level defaults."""
     cfg = user_config or {}
+    token    = cfg.get("mymeet_token")          or MYMEET_TOKEN
+    ws_id    = cfg.get("mymeet_ws_id")          or MYMEET_WS_ID
+    sheet_id = cfg.get("mymeet_spreadsheet_id") or SPREADSHEET_ID
+    email    = cfg.get("mymeet_organizer_email") or ORGANIZER_EMAIL
+
+    # HTTP headers must be latin-1 encodable. Catch bad token early with
+    # a human-readable message instead of a cryptic UnicodeEncodeError.
+    if token:
+        try:
+            token.encode("latin-1")
+        except (UnicodeEncodeError, AttributeError):
+            raise ValueError(
+                "MYmeet-токен содержит недопустимые символы (кириллица или спецсимволы).\n"
+                "Пожалуйста, сброси конфигурацию и введи корректный токен: /reset_mymeet"
+            )
+
     return {
-        "token":    cfg.get("mymeet_token")          or MYMEET_TOKEN,
-        "ws_id":    cfg.get("mymeet_ws_id")          or MYMEET_WS_ID,
-        "sheet_id": cfg.get("mymeet_spreadsheet_id") or SPREADSHEET_ID,
-        "email":    cfg.get("mymeet_organizer_email") or ORGANIZER_EMAIL,
+        "token":    token,
+        "ws_id":    ws_id,
+        "sheet_id": sheet_id,
+        "email":    email,
     }
 
 

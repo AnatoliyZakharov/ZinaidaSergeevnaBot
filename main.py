@@ -843,17 +843,24 @@ _SETUP_STEP_SHEET  = "mymeet_sheet"
 
 async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запускает визард настройки MYmeet (/setup_mymeet или /reset_mymeet)."""
-    telegram_id = update.effective_user.id
-    db.upsert_user(telegram_id, update.effective_user.username)
-    db.reset_mymeet_config(telegram_id)
-    context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
-    await update.message.reply_text(
-        "🔧 *Настройка MYmeet*\n\n"
-        "Шаг 1 из 3: введи свой *MYmeet API-токен*.\n\n"
-        "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
-        "_Токен начинается с `mm_`_",
-        parse_mode="Markdown",
-    )
+    try:
+        telegram_id = update.effective_user.id
+        db.upsert_user(telegram_id, update.effective_user.username)
+        db.reset_mymeet_config(telegram_id)
+        context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
+        await update.message.reply_text(
+            "🔧 *Настройка MYmeet*\n\n"
+            "Шаг 1 из 3: введи свой *MYmeet API-токен*.\n\n"
+            "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
+            "_Токен начинается с `mm_`_",
+            parse_mode="Markdown",
+        )
+    except Exception as fatal:
+        logger.error("cmd_setup_mymeet fatal: %s", fatal, exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Ошибка запуска настройки:\n{fatal}")
+        except Exception:
+            pass
 
 
 async def _handle_mymeet_setup(
@@ -873,9 +880,14 @@ async def _handle_mymeet_setup(
 
     # Шаг 1: получаем токен и пробуем найти рабочие пространства
     if step == _SETUP_STEP_TOKEN:
-        if not text.startswith("mm_") and len(text) < 10:
+        # Токен должен быть ASCII-только (не кириллица) и начинаться с mm_
+        is_ascii = all(ord(c) < 128 for c in text)
+        if not text.startswith("mm_") or not is_ascii:
             await update.message.reply_text(
-                "❌ Похоже, это не MYmeet-токен. Токен должен начинаться с `mm_`.\n\n"
+                "❌ Похоже, это не MYmeet API-токен.\n\n"
+                "• Токен должен начинаться с `mm_`\n"
+                "• Только латинские буквы и цифры\n\n"
+                "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
                 "Попробуй ещё раз или введи /cancel чтобы отменить.",
                 parse_mode="Markdown",
             )

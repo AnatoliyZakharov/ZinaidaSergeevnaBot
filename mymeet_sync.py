@@ -27,10 +27,11 @@ from google.oauth2.service_account import Credentials
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MYMEET_TOKEN   = os.environ.get("MYMEET_TOKEN",  "MYMEET_TOKEN_REMOVED")
-MYMEET_WS_ID   = os.environ.get("MYMEET_WS_ID",  "4e9bb2c4-7382-4c86-903f-15b580dfcf82")
-MYMEET_BASE    = "https://backend.mymeet.ai"
-SPREADSHEET_ID = os.environ.get("MYMEET_SPREADSHEET_ID", "1uDGE4qpDKML_2ZJernysRN0eZWzSu6MikmRFuqfUocs")
+MYMEET_TOKEN      = os.environ.get("MYMEET_TOKEN",  "MYMEET_TOKEN_REMOVED")
+MYMEET_WS_ID      = os.environ.get("MYMEET_WS_ID",  "4e9bb2c4-7382-4c86-903f-15b580dfcf82")
+MYMEET_BASE       = "https://backend.mymeet.ai"
+SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "1uDGE4qpDKML_2ZJernysRN0eZWzSu6MikmRFuqfUocs")
+ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "ztstroy@gmail.com")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -230,6 +231,64 @@ def _safe_sheet_name(name: str) -> str:
     return s[:100].strip()
 
 
+def _is_organizer(m: dict) -> bool:
+    """Return True if the current user is the organizer of this meeting.
+
+    MYmeet embeds Google Calendar event data, where the organizer field looks like:
+      {"email": "user@example.com", "self": true}
+    We check several possible locations for this structure.
+    """
+    def _check_organizer_obj(obj) -> bool | None:
+        if not isinstance(obj, dict):
+            return None
+        if obj.get("self"):
+            return True
+        email = obj.get("email", "")
+        if email and email.lower() == ORGANIZER_EMAIL.lower():
+            return True
+        if email:          # organizer field exists but it's someone else
+            return False
+        return None        # organizer field absent/empty — keep looking
+
+    # Try direct and nested organizer fields
+    for path in (
+        ("organizer",),
+        ("calendarEvent", "organizer"),
+        ("event", "organizer"),
+        ("calendar", "organizer"),
+        ("meetingData", "organizer"),
+    ):
+        obj = m
+        for key in path:
+            obj = obj.get(key) if isinstance(obj, dict) else None
+        result = _check_organizer_obj(obj)
+        if result is not None:
+            return result
+
+    # Boolean shortcut fields some APIs use
+    for field in ("isOrganizer", "is_organizer", "isMy", "isMine", "isOwner"):
+        val = m.get(field)
+        if val is not None:
+            return bool(val)
+
+    # Role-based fields
+    role = (m.get("role") or m.get("userRole") or m.get("myRole") or "").lower()
+    if role in ("organizer", "owner", "host", "creator"):
+        return True
+    if role in ("attendee", "guest", "participant"):
+        return False
+
+    # Can't determine — include the meeting and log for later inspection
+    logger.debug("_is_organizer: could not determine, fields=%s", list(m.keys()))
+    return True
+
+
+GROUPER_FORMAT = {
+    "textFormat": {"bold": True, "fontSize": 10},
+    "backgroundColor": {"red": 0.878, "green": 0.878, "blue": 0.878},
+}
+
+
 # ── Core sync ─────────────────────────────────────────────────────────────────
 
 def sync_to_sheets(days: int = 30, append: bool = False) -> str:
@@ -243,6 +302,9 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
 
     raw_meetings = _fetch_meetings(days=days)
     logger.info("Fetched %d raw meetings", len(raw_meetings))
+
+    raw_meetings = [m for m in raw_meetings if _is_organizer(m)]
+    logger.info("After organizer filter: %d meetings", len(raw_meetings))
 
     all_meetings = []
     for m in raw_meetings:
@@ -328,6 +390,8 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
         time.sleep(1)   # stay under 60 writes/min quota
 
     # ── One-time meetings ─────────────────────────────────────────────────────
+    # Format: № | Дата | Задача | Ответственный | Срок | Статус
+    # Bold grouper row with meeting name before each meeting's tasks.
     ot_name = "Разовые встречи"
     try:
         ws = spreadsheet.worksheet(ot_name)
@@ -337,27 +401,38 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
         ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
     if not append:
-        _gs_call(ws.update, "A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
-        _format_header(ws, "A1:E1")
+        _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
+        _format_header(ws, "A1:F1")
         start_idx = 1
         start_row = 2
     else:
         existing = _gs_call(ws.get_all_values)
         if not existing:
-            _gs_call(ws.update, "A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
-            _format_header(ws, "A1:E1")
+            _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
+            _format_header(ws, "A1:F1")
             start_idx = 1
             start_row = 2
         else:
             start_idx = len(existing)
             start_row = len(existing) + 1
 
-    rows = []
-    idx  = start_idx
+    # Build rows list; track grouper row positions (0-based relative to start_row)
+    all_rows: list = []
+    grouper_rel_positions: list[int] = []
+    idx = start_idx
+
     for m in one_time:
+        if not m["tasks"]:
+            continue
+        # Grouper row: meeting name (+ date if available)
+        label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
+        grouper_rel_positions.append(len(all_rows))
+        all_rows.append([label, "", "", "", "", ""])
+        # Task rows
         for task in m["tasks"]:
-            rows.append([
+            all_rows.append([
                 idx,
+                m["date"],
                 task["name"],
                 task["assignee"],
                 task["deadline"],
@@ -365,8 +440,12 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
             ])
             idx += 1
 
-    if rows:
-        _gs_call(ws.update, f"A{start_row}:E{start_row - 1 + len(rows)}", rows)
+    if all_rows:
+        _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(all_rows)}", all_rows)
+        # Apply bold grey formatting to each grouper row
+        for rel in grouper_rel_positions:
+            abs_row = start_row + rel
+            _gs_call(ws.format, f"A{abs_row}:F{abs_row}", GROUPER_FORMAT)
 
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"

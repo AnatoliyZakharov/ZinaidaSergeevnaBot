@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -104,13 +105,43 @@ def _gs_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def _format_header(ws, col_range: str) -> None:
-    """Apply bold blue formatting to header row and freeze it."""
+def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
+    """Apply header format + freeze row 1 in a single Sheets batch_update call (saves 1 API op)."""
     try:
-        _gs_call(ws.format, col_range, HEADER_TEXT_FORMAT)
-        _gs_call(ws.freeze, rows=1)
+        sid = ws.id
+        _gs_call(spreadsheet.batch_update, {"requests": [
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sid,
+                        "startRowIndex": 0, "endRowIndex": 1,
+                        "startColumnIndex": 0, "endColumnIndex": num_cols,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {
+                                "bold": True, "fontSize": 10,
+                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                            },
+                            "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
+                            "horizontalAlignment": "CENTER",
+                        }
+                    },
+                    "fields": "userEnteredFormat",
+                }
+            },
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sid,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+        ]})
     except Exception as e:
-        logger.debug("Header formatting failed: %s", e)
+        logger.debug("Batch format/freeze failed: %s", e)
 
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
@@ -347,21 +378,27 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     raw_meetings = [m for m in raw_meetings if _is_organizer(m, cfg["email"])]
     logger.info("After organizer filter: %d meetings", len(raw_meetings))
 
-    all_meetings = []
-    for m in raw_meetings:
+    # ── Параллельная загрузка протоколов ──────────────────────────────────────
+    def _fetch_one(m: dict) -> dict:
         mid  = m.get("id") or m.get("meetingId") or m.get("meeting_id") or ""
         name = (m.get("name") or m.get("title") or m.get("meetingName") or "Без названия").strip()
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
-
         protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
-        tasks    = _extract_tasks(protocol)
-
-        all_meetings.append({
+        return {
             "id":    mid,
             "name":  name,
             "date":  _fmt_date(date),
-            "tasks": tasks,
-        })
+            "tasks": _extract_tasks(protocol),
+        }
+
+    all_meetings = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
+        for fut in as_completed(futures):
+            try:
+                all_meetings.append(fut.result())
+            except Exception as e:
+                logger.debug("Protocol fetch error: %s", e)
 
     total_tasks = sum(len(m["tasks"]) for m in all_meetings)
     logger.info("Total tasks: %d", total_tasks)
@@ -384,6 +421,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     spreadsheet = gc.open_by_key(cfg["sheet_id"])
     sheets_written = 0
 
+    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]
+
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
         sheet_name = _safe_sheet_name(meeting_name)
@@ -395,40 +434,56 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
 
         if not append:
-            _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
-            _format_header(ws, "A1:F1")
-            start_idx = 1
-            start_row = 2
+            # Build task rows
+            rows = []
+            idx  = 1
+            for m in sorted(meetings, key=lambda x: x["date"]):
+                for task in m["tasks"]:
+                    rows.append([
+                        idx, m["date"], task["name"], task["assignee"],
+                        task["deadline"],
+                        "Выполнено" if task["done"] else "Требует верификации",
+                    ])
+                    idx += 1
+            # Single update: header + data together (saves 1 API call vs separate header update)
+            all_data = [HEADER_ROW] + rows
+            _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
+            # Format header + freeze in one batch call (saves 1 API call vs format+freeze separately)
+            _batch_format_freeze(spreadsheet, ws)
         else:
             # append: find last filled row
             existing = _gs_call(ws.get_all_values)
             if not existing:
-                _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
-                _format_header(ws, "A1:F1")
-                start_idx = 1
-                start_row = 2
+                rows = []
+                idx  = 1
+                for m in sorted(meetings, key=lambda x: x["date"]):
+                    for task in m["tasks"]:
+                        rows.append([
+                            idx, m["date"], task["name"], task["assignee"],
+                            task["deadline"],
+                            "Выполнено" if task["done"] else "Требует верификации",
+                        ])
+                        idx += 1
+                all_data = [HEADER_ROW] + rows
+                _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
+                _batch_format_freeze(spreadsheet, ws)
             else:
-                start_idx = len(existing)  # last № + 1
+                start_idx = len(existing)
                 start_row = len(existing) + 1
-
-        rows = []
-        idx  = start_idx
-        for m in sorted(meetings, key=lambda x: x["date"]):
-            for task in m["tasks"]:
-                rows.append([
-                    idx,
-                    m["date"],
-                    task["name"],
-                    task["assignee"],
-                    task["deadline"],
-                    "Выполнено" if task["done"] else "Требует верификации",
-                ])
-                idx += 1
-
-        if rows:
-            _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+                rows = []
+                idx  = start_idx
+                for m in sorted(meetings, key=lambda x: x["date"]):
+                    for task in m["tasks"]:
+                        rows.append([
+                            idx, m["date"], task["name"], task["assignee"],
+                            task["deadline"],
+                            "Выполнено" if task["done"] else "Требует верификации",
+                        ])
+                        idx += 1
+                if rows:
+                    _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
         sheets_written += 1
-        time.sleep(1)   # stay under 60 writes/min quota
+        # No explicit sleep — rate limiter in _gs_call handles quota
 
     # ── One-time meetings ─────────────────────────────────────────────────────
     # Format: № | Дата | Задача | Ответственный | Срок | Статус
@@ -442,20 +497,19 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
     if not append:
-        _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
-        _format_header(ws, "A1:F1")
         start_idx = 1
         start_row = 2
+        new_sheet  = True
     else:
         existing = _gs_call(ws.get_all_values)
         if not existing:
-            _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
-            _format_header(ws, "A1:F1")
             start_idx = 1
             start_row = 2
+            new_sheet  = True
         else:
             start_idx = len(existing)
             start_row = len(existing) + 1
+            new_sheet  = False
 
     # Build rows list; track grouper row positions (0-based relative to start_row)
     all_rows: list = []
@@ -465,11 +519,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     for m in one_time:
         if not m["tasks"]:
             continue
-        # Grouper row: meeting name (+ date if available)
         label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
         grouper_rel_positions.append(len(all_rows))
         all_rows.append([label, "", "", "", "", ""])
-        # Task rows
         for task in m["tasks"]:
             all_rows.append([
                 idx,
@@ -481,12 +533,42 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             ])
             idx += 1
 
-    if all_rows:
+    if new_sheet:
+        # Combine header + data in single write (saves 1 API call)
+        write_data = [HEADER_ROW] + all_rows
+        if write_data:
+            _gs_call(ws.update, f"A1:F{len(write_data)}", write_data)
+        # Format+freeze header in single batch call (saves 1 API call)
+        _batch_format_freeze(spreadsheet, ws)
+    elif all_rows:
         _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(all_rows)}", all_rows)
-        # Apply bold grey formatting to each grouper row
+
+    # Batch-format all grouper rows in a single API call (saves N-1 API calls)
+    if all_rows and grouper_rel_positions:
+        sid = ws.id
+        grouper_requests = []
         for rel in grouper_rel_positions:
-            abs_row = start_row + rel
-            _gs_call(ws.format, f"A{abs_row}:F{abs_row}", GROUPER_FORMAT)
+            abs_row = start_row + rel - 1  # 0-based row index
+            grouper_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sid,
+                        "startRowIndex": abs_row, "endRowIndex": abs_row + 1,
+                        "startColumnIndex": 0, "endColumnIndex": 6,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {"bold": True, "fontSize": 10},
+                            "backgroundColor": {"red": 0.878, "green": 0.878, "blue": 0.878},
+                        }
+                    },
+                    "fields": "userEnteredFormat",
+                }
+            })
+        try:
+            _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
+        except Exception as e:
+            logger.debug("Grouper batch format failed: %s", e)
 
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -45,6 +46,25 @@ HEADER_TEXT_FORMAT = {
 }
 
 
+# ── Retry helper ──────────────────────────────────────────────────────────────
+
+def _gs_call(fn, *args, retries: int = 6, **kwargs):
+    """Call a gspread method with exponential backoff on 429/503."""
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(e, "response", None)
+            code = status.status_code if status else 0
+            if code in (429, 503) and attempt < retries - 1:
+                wait = 2 ** attempt          # 1 2 4 8 16 32 s
+                logger.warning("Sheets quota hit (attempt %d), waiting %ds…", attempt + 1, wait)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("unreachable")
+
+
 # ── Google Sheets client ──────────────────────────────────────────────────────
 
 def _gs_client() -> gspread.Client:
@@ -59,8 +79,8 @@ def _gs_client() -> gspread.Client:
 def _format_header(ws, col_range: str) -> None:
     """Apply bold blue formatting to header row and freeze it."""
     try:
-        ws.format(col_range, HEADER_TEXT_FORMAT)
-        ws.freeze(rows=1)
+        _gs_call(ws.format, col_range, HEADER_TEXT_FORMAT)
+        _gs_call(ws.freeze, rows=1)
     except Exception as e:
         logger.debug("Header formatting failed: %s", e)
 
@@ -240,20 +260,20 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
         try:
             ws = spreadsheet.worksheet(sheet_name)
             if not append:
-                ws.clear()
+                _gs_call(ws.clear)
         except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+            ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
 
         if not append:
-            ws.update("A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
+            _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
             _format_header(ws, "A1:F1")
             start_idx = 1
             start_row = 2
         else:
             # append: find last filled row
-            existing = ws.get_all_values()
+            existing = _gs_call(ws.get_all_values)
             if not existing:
-                ws.update("A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
+                _gs_call(ws.update, "A1:F1", [["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]])
                 _format_header(ws, "A1:F1")
                 start_idx = 1
                 start_row = 2
@@ -276,27 +296,28 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
                 idx += 1
 
         if rows:
-            ws.update(f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+            _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
         sheets_written += 1
+        time.sleep(1)   # stay under 60 writes/min quota
 
     # ── One-time meetings ─────────────────────────────────────────────────────
     ot_name = "Разовые встречи"
     try:
         ws = spreadsheet.worksheet(ot_name)
         if not append:
-            ws.clear()
+            _gs_call(ws.clear)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=ot_name, rows=2000, cols=10)
+        ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
     if not append:
-        ws.update("A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
+        _gs_call(ws.update, "A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
         _format_header(ws, "A1:E1")
         start_idx = 1
         start_row = 2
     else:
-        existing = ws.get_all_values()
+        existing = _gs_call(ws.get_all_values)
         if not existing:
-            ws.update("A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
+            _gs_call(ws.update, "A1:E1", [["№", "Задача", "Ответственный", "Срок", "Статус"]])
             _format_header(ws, "A1:E1")
             start_idx = 1
             start_row = 2
@@ -318,7 +339,7 @@ def sync_to_sheets(days: int = 30, append: bool = False) -> str:
             idx += 1
 
     if rows:
-        ws.update(f"A{start_row}:E{start_row - 1 + len(rows)}", rows)
+        _gs_call(ws.update, f"A{start_row}:E{start_row - 1 + len(rows)}", rows)
 
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"

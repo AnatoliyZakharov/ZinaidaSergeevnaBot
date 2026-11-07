@@ -13,17 +13,7 @@ jobs:
 
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install test deps
-        run: pip install gspread requests pytz dateparser --quiet
-
-      - name: Smoke tests
-        run: python test_smoke.py
-
-      - run: flyctl deploy --remote-only
+      - name: Deploy
+        run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

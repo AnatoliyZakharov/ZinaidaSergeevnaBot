@@ -849,11 +849,11 @@ async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.reset_mymeet_config(telegram_id)
         context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
         await update.message.reply_text(
-            "🔧 *Настройка MYmeet*\n\n"
-            "Шаг 1 из 3: введи свой *MYmeet API-токен*.\n\n"
+            "🔧 <b>Настройка MYmeet</b>\n\n"
+            "Шаг 1 из 3: введи свой <b>MYmeet API-токен</b>.\n\n"
             "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
-            "_Токен начинается с `mm_`_",
-            parse_mode="Markdown",
+            "Токен начинается с <code>mm_</code>",
+            parse_mode="HTML",
         )
     except Exception as fatal:
         logger.error("cmd_setup_mymeet fatal: %s", fatal, exc_info=True)

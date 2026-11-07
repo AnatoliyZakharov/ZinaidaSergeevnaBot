@@ -28,11 +28,11 @@ from google.oauth2.service_account import Credentials
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MYMEET_TOKEN      = os.environ.get("MYMEET_TOKEN",  "mm_RFt7vMJN1zTLCcZkTx4dfDs-8peN3vb6i7Xs8WFMA1I")
-MYMEET_WS_ID      = os.environ.get("MYMEET_WS_ID",  "4e9bb2c4-7382-4c86-903f-15b580dfcf82")
+MYMEET_TOKEN      = os.environ.get("MYMEET_TOKEN", "")
+MYMEET_WS_ID      = os.environ.get("MYMEET_WS_ID", "")
 MYMEET_BASE       = "https://backend.mymeet.ai"
-SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "1uDGE4qpDKML_2ZJernysRN0eZWzSu6MikmRFuqfUocs")
-ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "ztstroy@gmail.com")
+SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "")
+ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 

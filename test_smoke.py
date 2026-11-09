@@ -99,11 +99,184 @@ def test_build_user_config_rejects_cyrillic():
         )
 
 
+
+# ── Formatting / deduplication tests ─────────────────────────────────────────
+
+def test_status_values():
+    """STATUS_VALUES содержит ровно 5 ожидаемых статусов."""
+    mod = _load_mymeet()
+    expected = [
+        "Требует верификации",
+        "В работе",
+        "Выполнено",
+        "Просрочено",
+        "Отменено",
+    ]
+    assert mod.STATUS_VALUES == expected, (
+        f"STATUS_VALUES = {mod.STATUS_VALUES!r}, ожидалось {expected!r}"
+    )
+
+
+def test_col_widths_px():
+    """COL_WIDTHS_PX соответствует ТЗ: [50, 110, 420, 180, 120, 190]."""
+    mod = _load_mymeet()
+    expected = [50, 110, 420, 180, 120, 190]
+    assert mod.COL_WIDTHS_PX == expected, (
+        f"COL_WIDTHS_PX = {mod.COL_WIDTHS_PX!r}, ожидалось {expected!r}"
+    )
+
+
+def test_task_key_normal():
+    """_task_key возвращает корректный ключ для строки с данными."""
+    mod = _load_mymeet()
+    row = ["1", "2024-01-15", "Подготовить отчёт", "Иванов И.И.", "2024-01-20", "В работе"]
+    key = mod._task_key(row)
+    assert key == "2024-01-15|подготовить отчёт|иванов и.и.", (
+        f"Неожиданный ключ: {key!r}"
+    )
+
+
+def test_task_key_grouper_row():
+    """_task_key возвращает None для строки-разделителя (пустая дата)."""
+    mod = _load_mymeet()
+    row = ["Плановое совещание  (2024-01-15)", "", "", "", "", ""]
+    key = mod._task_key(row)
+    assert key is None, f"Ожидался None для строки-разделителя, получено: {key!r}"
+
+
+def test_task_key_short_row():
+    """_task_key возвращает None для строки с менее чем 4 колонками."""
+    mod = _load_mymeet()
+    assert mod._task_key([]) is None
+    assert mod._task_key(["1", "2024-01-15"]) is None
+
+
+def test_task_key_empty_task():
+    """_task_key возвращает None, если задача или дата пустые."""
+    mod = _load_mymeet()
+    row_no_task = ["1", "2024-01-15", "", "Иванов", "2024-01-20", "В работе"]
+    assert mod._task_key(row_no_task) is None
+    row_no_date = ["1", "", "Задача", "Иванов", "2024-01-20", "В работе"]
+    assert mod._task_key(row_no_date) is None
+
+
+def test_existing_keys_dedup():
+    """_existing_keys правильно извлекает множество ключей из листа."""
+    mod = _load_mymeet()
+    sheet_data = [
+        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус"],  # header — skip
+        ["1", "2024-01-15", "Подготовить отчёт", "Иванов И.И.", "2024-01-20", "В работе"],
+        ["2", "2024-01-15", "Согласовать план", "Петров П.П.", "2024-01-18", "Выполнено"],
+        ["Совещание  (2024-01-16)", "", "", "", "", ""],               # grouper — skip
+        ["3", "2024-01-16", "Провести встречу", "Сидоров С.С.", "2024-01-17", "В работе"],
+    ]
+    keys = mod._existing_keys(sheet_data)
+    assert "2024-01-15|подготовить отчёт|иванов и.и." in keys
+    assert "2024-01-15|согласовать план|петров п.п." in keys
+    assert "2024-01-16|провести встречу|сидоров с.с." in keys
+    assert len(keys) == 3, f"Ожидалось 3 ключа, получено {len(keys)}: {keys}"
+
+
+def test_no_duplicate_on_resync():
+    """При повторной синхронизации тех же задач дубликаты не добавляются.
+    
+    Проверяем логику: если ключ уже есть в ex_keys, строка пропускается.
+    """
+    mod = _load_mymeet()
+
+    meetings = [
+        {
+            "date": "2024-01-15",
+            "tasks": [
+                {"name": "Подготовить отчёт", "assignee": "Иванов И.И.",
+                 "deadline": "2024-01-20", "done": False},
+                {"name": "Согласовать план", "assignee": "Петров П.П.",
+                 "deadline": "2024-01-18", "done": True},
+            ],
+        }
+    ]
+
+    # Симулируем уже существующий лист (после первой синхронизации)
+    existing = [
+        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус"],
+        ["1", "2024-01-15", "Подготовить отчёт", "Иванов И.И.", "2024-01-20", "В работе"],
+        ["2", "2024-01-15", "Согласовать план", "Петров П.П.", "2024-01-18", "Выполнено"],
+    ]
+
+    ex_keys = mod._existing_keys(existing)
+
+    # Повторяем логику фильтрации из sync_to_sheets (recurring path)
+    new_rows = []
+    for m in meetings:
+        for task in m["tasks"]:
+            key = mod._task_key([
+                None, m["date"], task["name"], task["assignee"],
+                task["deadline"], None,
+            ])
+            if key and key in ex_keys:
+                continue
+            new_rows.append(task["name"])
+
+    assert new_rows == [], (
+        f"Ожидалось 0 новых строк при повторной синхронизации, "
+        f"получено {len(new_rows)}: {new_rows}"
+    )
+
+
+def test_new_task_added_on_resync():
+    """Новая задача, которой нет на листе, добавляется при повторной синхронизации."""
+    mod = _load_mymeet()
+
+    existing = [
+        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус"],
+        ["1", "2024-01-15", "Подготовить отчёт", "Иванов И.И.", "2024-01-20", "В работе"],
+    ]
+    ex_keys = mod._existing_keys(existing)
+
+    meetings = [
+        {
+            "date": "2024-01-15",
+            "tasks": [
+                # уже есть
+                {"name": "Подготовить отчёт", "assignee": "Иванов И.И.",
+                 "deadline": "2024-01-20", "done": False},
+                # новая
+                {"name": "Провести встречу", "assignee": "Петров П.П.",
+                 "deadline": "2024-01-17", "done": False},
+            ],
+        }
+    ]
+
+    new_rows = []
+    for m in meetings:
+        for task in m["tasks"]:
+            key = mod._task_key([
+                None, m["date"], task["name"], task["assignee"],
+                task["deadline"], None,
+            ])
+            if key and key in ex_keys:
+                continue
+            new_rows.append(task["name"])
+
+    assert new_rows == ["Провести встречу"], (
+        f"Ожидалась 1 новая строка, получено {len(new_rows)}: {new_rows}"
+    )
+
+
 if __name__ == "__main__":
     tests = [
-        (test_no_hardcoded_secrets,          "нет захардкоженных секретов"),
-        (test_mymeet_sync_imports,            "mymeet_sync импортируется"),
-        (test_build_user_config_rejects_cyrillic, "кириллица в токене отклоняется"),
+        (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
+        (test_mymeet_sync_imports,               "mymeet_sync импортируется"),
+        (test_build_user_config_rejects_cyrillic,"кириллица в токене отклоняется"),
+        (test_status_values,                     "STATUS_VALUES содержит 5 статусов"),
+        (test_col_widths_px,                     "COL_WIDTHS_PX = [50,110,420,180,120,190]"),
+        (test_task_key_normal,                   "_task_key возвращает корректный ключ"),
+        (test_task_key_grouper_row,              "_task_key=None для строки-разделителя"),
+        (test_task_key_short_row,                "_task_key=None для короткой строки"),
+        (test_task_key_empty_task,               "_task_key=None при пустой задаче/дате"),
+        (test_existing_keys_dedup,               "_existing_keys извлекает 3 ключа"),
+        (test_no_duplicate_on_resync,            "дубликаты не добавляются при ресинке"),
+        (test_new_task_added_on_resync,          "новая задача добавляется при ресинке"),
     ]
     failed = []
     for fn, label in tests:

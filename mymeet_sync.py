@@ -36,6 +36,13 @@ ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# ── Sheet formatting constants ────────────────────────────────────────────────
+STATUS_VALUES = [
+    "Требует верификации", "В работе", "Выполнено", "Просрочено", "Отменено",
+]
+COL_WIDTHS_PX = [50, 110, 420, 180, 120, 190]  # A B C D E F (pixels)
+
+
 HEADER_FORMAT = {
     "textFormat": {"bold": True, "fontSize": 10},
     "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
@@ -105,43 +112,148 @@ def _gs_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
-    """Apply header format + freeze row 1 in a single Sheets batch_update call (saves 1 API op)."""
+def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
+    """Apply unified sheet formatting in one batch_update call:
+    header style + freeze, column widths A-F, text wrap, row auto-resize,
+    dropdown validation for column F (Статус).
+    """
+    sid = ws.id
+    # Validation covers up to 10 000 rows so new rows also get the dropdown
+    VAL_END = 10_000
+
+    requests: list = [
+        # 1. Header: bold/color/freeze
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 0, "endRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": 6,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "bold": True, "fontSize": 10,
+                            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                        },
+                        "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
+                        "horizontalAlignment": "CENTER",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat",
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sid,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        # 2. Text wrap + top align on all data rows
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": 6,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "wrapStrategy": "WRAP",
+                        "verticalAlignment": "TOP",
+                    }
+                },
+                "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
+            }
+        },
+        # 3. Dropdown validation for column F (index 5)
+        {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 5, "endColumnIndex": 6,
+                },
+                "rule": {
+                    "condition": {
+                        "type": "ONE_OF_LIST",
+                        "values": [{"userEnteredValue": v} for v in STATUS_VALUES],
+                    },
+                    "showCustomUi": True,
+                    "strict": False,
+                }
+            }
+        },
+    ]
+
+    # 4. Column widths A–F
+    for col_idx, px in enumerate(COL_WIDTHS_PX):
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sid,
+                    "dimension": "COLUMNS",
+                    "startIndex": col_idx,
+                    "endIndex": col_idx + 1,
+                },
+                "properties": {"pixelSize": px},
+                "fields": "pixelSize",
+            }
+        })
+
     try:
-        sid = ws.id
-        _gs_call(spreadsheet.batch_update, {"requests": [
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sid,
-                        "startRowIndex": 0, "endRowIndex": 1,
-                        "startColumnIndex": 0, "endColumnIndex": num_cols,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "textFormat": {
-                                "bold": True, "fontSize": 10,
-                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                            },
-                            "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
-                            "horizontalAlignment": "CENTER",
-                        }
-                    },
-                    "fields": "userEnteredFormat",
-                }
-            },
-            {
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sid,
-                        "gridProperties": {"frozenRowCount": 1},
-                    },
-                    "fields": "gridProperties.frozenRowCount",
-                }
-            },
-        ]})
+        _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
-        logger.debug("Batch format/freeze failed: %s", e)
+        logger.debug("Full format batch failed: %s", e)
+
+    # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
+    if data_rows > 0:
+        try:
+            _gs_call(spreadsheet.batch_update, {"requests": [{
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": sid,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": data_rows + 1,
+                    }
+                }
+            }]})
+        except Exception as e:
+            logger.debug("Auto-resize rows failed: %s", e)
+
+
+def _task_key(row: list) -> str | None:
+    """Return a deduplication key for a data row: '{date}|{task}|{assignee}'.
+    Returns None for header rows, grouper rows (empty date), or short rows.
+    """
+    if len(row) < 4:
+        return None
+    date  = str(row[1]).strip()
+    task  = str(row[2]).strip()
+    asgn  = str(row[3]).strip()
+    if not task or not date:
+        return None
+    return f"{date}|{task.lower()}|{asgn.lower()}"
+
+
+def _existing_keys(existing_rows: list) -> set:
+    """Return set of task keys from already-fetched get_all_values() result."""
+    keys = set()
+    for row in existing_rows[1:]:   # skip header
+        k = _task_key(row)
+        if k:
+            keys.add(k)
+    return keys
+
+
+# Keep old name as alias for callers not yet updated (will be removed in a future cleanup).
+def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
+    _apply_full_format(spreadsheet, ws, data_rows=0)
 
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
@@ -450,7 +562,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
 
         if not append:
-            # Build task rows
+            # Full overwrite: build header + all task rows, write in one call
             rows = []
             idx  = 1
             for m in sorted(meetings, key=lambda x: x["date"]):
@@ -461,43 +573,48 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         "Выполнено" if task["done"] else "Требует верификации",
                     ])
                     idx += 1
-            # Single update: header + data together (saves 1 API call vs separate header update)
             all_data = [HEADER_ROW] + rows
             _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
-            # Format header + freeze in one batch call (saves 1 API call vs format+freeze separately)
-            _batch_format_freeze(spreadsheet, ws)
+            _apply_full_format(spreadsheet, ws, data_rows=len(rows))
         else:
-            # append: find last filled row
+            # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
+            # existing rows on repeated daily runs; preserve manually-changed statuses.
             existing = _gs_call(ws.get_all_values)
+            ex_keys  = _existing_keys(existing) if existing else set()
+
+            # Determine next sequential №
+            last_num = 0
+            for row in (existing[1:] if existing else []):
+                if row and str(row[0]).strip().isdigit():
+                    last_num = max(last_num, int(row[0]))
+
+            start_row = (len(existing) + 1) if existing else 2
+            rows = []
+            idx  = last_num + 1
+            for m in sorted(meetings, key=lambda x: x["date"]):
+                for task in m["tasks"]:
+                    key = _task_key([
+                        None, m["date"], task["name"], task["assignee"],
+                        task["deadline"], None,
+                    ])
+                    if key and key in ex_keys:
+                        continue   # already present — skip to preserve any manual status edits
+                    rows.append([
+                        idx, m["date"], task["name"], task["assignee"],
+                        task["deadline"],
+                        "Выполнено" if task["done"] else "Требует верификации",
+                    ])
+                    idx += 1
+
             if not existing:
-                rows = []
-                idx  = 1
-                for m in sorted(meetings, key=lambda x: x["date"]):
-                    for task in m["tasks"]:
-                        rows.append([
-                            idx, m["date"], task["name"], task["assignee"],
-                            task["deadline"],
-                            "Выполнено" if task["done"] else "Требует верификации",
-                        ])
-                        idx += 1
                 all_data = [HEADER_ROW] + rows
                 _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
-                _batch_format_freeze(spreadsheet, ws)
-            else:
-                start_idx = len(existing)
-                start_row = len(existing) + 1
-                rows = []
-                idx  = start_idx
-                for m in sorted(meetings, key=lambda x: x["date"]):
-                    for task in m["tasks"]:
-                        rows.append([
-                            idx, m["date"], task["name"], task["assignee"],
-                            task["deadline"],
-                            "Выполнено" if task["done"] else "Требует верификации",
-                        ])
-                        idx += 1
-                if rows:
-                    _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+            elif rows:
+                _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+
+            # Always (re-)apply formatting so existing sheets get widths/wrap/dropdown too
+            total_data_rows = (len(existing) - 1 if existing else 0) + len(rows)
+            _apply_full_format(spreadsheet, ws, data_rows=total_data_rows)
         sheets_written += 1
         # No explicit sleep — rate limiter in _gs_call handles quota
 
@@ -516,29 +633,51 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         start_idx = 1
         start_row = 2
         new_sheet  = True
+        existing_ot: list = []
     else:
-        existing = _gs_call(ws.get_all_values)
-        if not existing:
+        existing_ot = _gs_call(ws.get_all_values)
+        if not existing_ot:
             start_idx = 1
             start_row = 2
             new_sheet  = True
         else:
-            start_idx = len(existing)
-            start_row = len(existing) + 1
             new_sheet  = False
+            start_row = len(existing_ot) + 1
+            start_idx = start_row  # will be refined below
+
+    # Dedup keys for one-time sheet (append mode)
+    ex_keys_ot = _existing_keys(existing_ot) if (append and existing_ot) else set()
+
+    # Determine next sequential №
+    last_num_ot = 0
+    for row in (existing_ot[1:] if existing_ot else []):
+        if row and str(row[0]).strip().isdigit():
+            last_num_ot = max(last_num_ot, int(row[0]))
+    idx = last_num_ot + 1 if (append and existing_ot) else start_idx
 
     # Build rows list; track grouper row positions (0-based relative to start_row)
     all_rows: list = []
     grouper_rel_positions: list[int] = []
-    idx = start_idx
 
     for m in one_time:
         if not m["tasks"]:
             continue
+        # In append mode filter tasks already present
+        new_tasks = []
+        for task in m["tasks"]:
+            if append and existing_ot:
+                key = _task_key([None, m["date"], task["name"], task["assignee"], None, None])
+                if key and key in ex_keys_ot:
+                    continue  # skip — already in sheet, status may have been edited manually
+            new_tasks.append(task)
+
+        if not new_tasks:
+            continue   # all tasks for this meeting already exist
+
         label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
         grouper_rel_positions.append(len(all_rows))
         all_rows.append([label, "", "", "", "", ""])
-        for task in m["tasks"]:
+        for task in new_tasks:
             all_rows.append([
                 idx,
                 m["date"],
@@ -550,14 +689,19 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             idx += 1
 
     if new_sheet:
-        # Combine header + data in single write (saves 1 API call)
         write_data = [HEADER_ROW] + all_rows
         if write_data:
             _gs_call(ws.update, f"A1:F{len(write_data)}", write_data)
-        # Format+freeze header in single batch call (saves 1 API call)
-        _batch_format_freeze(spreadsheet, ws)
+        _apply_full_format(spreadsheet, ws, data_rows=len(all_rows))
     elif all_rows:
         _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(all_rows)}", all_rows)
+        # Always re-apply formatting to pick up widths/wrap/dropdown on existing sheet
+        total_ot_rows = (len(existing_ot) - 1 if existing_ot else 0) + len(all_rows)
+        _apply_full_format(spreadsheet, ws, data_rows=total_ot_rows)
+    else:
+        # Nothing new to write but still (re-)apply formatting to existing sheet
+        if existing_ot:
+            _apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1)
 
     # Batch-format all grouper rows in a single API call (saves N-1 API calls)
     if all_rows and grouper_rel_positions:

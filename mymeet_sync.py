@@ -41,6 +41,7 @@ STATUS_VALUES = [
     "Требует верификации", "В работе", "Выполнено", "Просрочено", "Отменено",
 ]
 COL_WIDTHS_PX = [50, 110, 420, 180, 120, 190]  # A B C D E F (pixels)
+MTG_ID_COL_PX = 60                             # G — internal meeting-id column
 
 
 HEADER_FORMAT = {
@@ -159,7 +160,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 "range": {
                     "sheetId": sid,
                     "startRowIndex": 1,
-                    "startColumnIndex": 0, "endColumnIndex": 6,
+                    "startColumnIndex": 0, "endColumnIndex": 7,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -205,10 +206,22 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
             }
         })
 
+    # Column G (mtg_id) — narrow internal column
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                       "startIndex": 6, "endIndex": 7},
+            "properties": {"pixelSize": MTG_ID_COL_PX},
+            "fields": "pixelSize",
+        }
+    })
+    fmt_warnings: list[str] = []
     try:
         _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
-        logger.warning("Sheet formatting error (batch_update): %s", e)
+        msg = f"batch_update: {e}"
+        logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+        fmt_warnings.append(msg)
 
     # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
     if data_rows > 0:
@@ -224,11 +237,20 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 }
             }]})
         except Exception as e:
-            logger.warning("Sheet formatting error (auto-resize rows): %s", e)
+            msg = f"auto-resize: {e}"
+            logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+            fmt_warnings.append(msg)
+    return fmt_warnings
 
 
 def _task_key(row: list) -> str | None:
-    """Return a deduplication key for a data row: '{date}|{task}|{assignee}'.
+    """Return a deduplication key for a data row.
+
+    Key format with meeting_id present in col G (index 6):
+        '{mid}|{date}|{task}|{assignee}'
+    Fallback for legacy rows without col G:
+        '{date}|{task}|{assignee}'
+
     Returns None for header rows, grouper rows (empty date), or short rows.
     """
     if len(row) < 4:
@@ -238,6 +260,9 @@ def _task_key(row: list) -> str | None:
     asgn  = str(row[3]).strip()
     if not task or not date:
         return None
+    mid = str(row[6]).strip() if len(row) > 6 else ""
+    if mid:
+        return f"{mid}|{date}|{task.lower()}|{asgn.lower()}"
     return f"{date}|{task.lower()}|{asgn.lower()}"
 
 
@@ -262,7 +287,7 @@ def _run_key(meeting_id: str, date: str, task: str, assignee: str) -> str:
 
 # Keep old name as alias for callers not yet updated (will be removed in a future cleanup).
 def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
-    _apply_full_format(spreadsheet, ws, data_rows=0)
+    all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=0))
 
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
@@ -557,8 +582,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     gc          = _gs_client()
     spreadsheet = gc.open_by_key(cfg["sheet_id"])
     sheets_written = 0
+    all_fmt_warnings: list[str] = []
 
-    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]
+    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус", "mtg_id"]
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
@@ -594,7 +620,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     seen_in_run.add(rkey)
                     tkey = _task_key([
                         None, m["date"], task["name"], task["assignee"],
-                        task["deadline"], None,
+                        task["deadline"], None, m["id"],
                     ])
                     # Restore manually-set status; fall back to MYmeet status
                     status = manual_statuses.get(tkey) if tkey else None
@@ -602,12 +628,12 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         status = "Выполнено" if task["done"] else "Требует верификации"
                     rows.append([
                         idx, m["date"], task["name"], task["assignee"],
-                        task["deadline"], status,
+                        task["deadline"], status, m["id"],
                     ])
                     idx += 1
             all_data = [HEADER_ROW] + rows
-            _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
-            _apply_full_format(spreadsheet, ws, data_rows=len(rows))
+            _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(rows)))
         else:
             # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
             # existing rows on repeated daily runs; preserve manually-changed statuses.
@@ -640,18 +666,19 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         idx, m["date"], task["name"], task["assignee"],
                         task["deadline"],
                         "Выполнено" if task["done"] else "Требует верификации",
+                        m["id"],
                     ])
                     idx += 1
 
             if not existing:
                 all_data = [HEADER_ROW] + rows
-                _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
+                _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
             elif rows:
-                _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+                _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(rows)}", rows)
 
             # Always (re-)apply formatting so existing sheets get widths/wrap/dropdown too
             total_data_rows = (len(existing) - 1 if existing else 0) + len(rows)
-            _apply_full_format(spreadsheet, ws, data_rows=total_data_rows)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=total_data_rows))
         sheets_written += 1
         # No explicit sleep — rate limiter in _gs_call handles quota
 
@@ -718,7 +745,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
         label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
         grouper_rel_positions.append(len(all_rows))
-        all_rows.append([label, "", "", "", "", ""])
+        all_rows.append([label, "", "", "", "", "", ""])
         for task in new_tasks:
             all_rows.append([
                 idx,
@@ -727,6 +754,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                 task["assignee"],
                 task["deadline"],
                 "Выполнено" if task["done"] else "Требует верификации",
+                m["id"],
             ])
             idx += 1
 
@@ -734,16 +762,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         write_data = [HEADER_ROW] + all_rows
         if write_data:
             _gs_call(ws.update, f"A1:F{len(write_data)}", write_data)
-        _apply_full_format(spreadsheet, ws, data_rows=len(all_rows))
+        all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(all_rows)))
     elif all_rows:
-        _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(all_rows)}", all_rows)
+        _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(all_rows)}", all_rows)
         # Always re-apply formatting to pick up widths/wrap/dropdown on existing sheet
         total_ot_rows = (len(existing_ot) - 1 if existing_ot else 0) + len(all_rows)
-        _apply_full_format(spreadsheet, ws, data_rows=total_ot_rows)
+        all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=total_ot_rows))
     else:
         # Nothing new to write but still (re-)apply formatting to existing sheet
         if existing_ot:
-            _apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1))
 
     # Batch-format all grouper rows in a single API call (saves N-1 API calls)
     if all_rows and grouper_rel_positions:
@@ -772,10 +800,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         except Exception as e:
             logger.warning("Sheet formatting error (grouper rows): %s", e)
 
+    fmt_warn_text = (
+        f"\n⚠️ Ошибки форматирования ({len(all_fmt_warnings)}):\n"
+        + "\n".join(f"  • {w}" for w in all_fmt_warnings)
+        if all_fmt_warnings else ""
+    )
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"
         f"📋 {sheets_written} листов по регулярным встречам\n"
         f"📝 Разовые встречи: {len(one_time)} встреч"
+        + fmt_warn_text
     )
     logger.info("MYmeet sync done: %s", result.replace('\n', ' | '))
     return result

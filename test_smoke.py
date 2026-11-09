@@ -344,13 +344,13 @@ def test_different_meetings_not_deduped():
 
 
 def test_manual_status_preserved_on_full_overwrite():
-    """При полной перезаписи вручную изменённый статус сохраняется."""
+    """При полной перезаписи вручную изменённый статус сохраняется (7-col лист с mtg_id)."""
     mod = _load_mymeet()
 
-    # Существующий лист — пользователь поменял статус с 'Требует верификации' на 'В работе'
+    # Существующий лист с колонкой G (mtg_id) — пользователь поменял статус на 'В работе'
     existing_full = [
-        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус"],
-        ["1", "2024-01-15", "Подготовить отчёт", "Иванов", "2024-01-20", "В работе"],
+        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус", "mtg_id"],
+        ["1", "2024-01-15", "Подготовить отчёт", "Иванов", "2024-01-20", "В работе", "mtg-1"],
     ]
     manual_statuses: dict = {}
     for row in existing_full[1:]:
@@ -371,7 +371,8 @@ def test_manual_status_preserved_on_full_overwrite():
             if rkey in seen:
                 continue
             seen.add(rkey)
-            tkey = mod._task_key([None, m["date"], t["name"], t["assignee"], t["deadline"], None])
+            # tkey must include meeting_id (col G) so lookup is unambiguous
+            tkey = mod._task_key([None, m["date"], t["name"], t["assignee"], t["deadline"], None, m["id"]])
             status = manual_statuses.get(tkey) if tkey else None
             if not status:
                 status = "Выполнено" if t["done"] else "Требует верификации"
@@ -379,6 +380,46 @@ def test_manual_status_preserved_on_full_overwrite():
 
     assert rows == ["В работе"], (
         f"Ожидался сохранённый статус 'В работе', получено: {rows}"
+    )
+
+
+def test_cross_run_dedup_different_meetings_not_merged():
+    """Одинаковая задача из двух разных встреч должна давать два разных _task_key."""
+    mod = _load_mymeet()
+
+    # Existing 7-col sheet: same task text from mtg-1 and mtg-2 on same date
+    existing_full = [
+        ["#", "Дата", "Задача", "Ответственный", "Срок", "Статус", "mtg_id"],
+        ["1", "2024-01-15", "Написать отчёт", "Петров", "2024-01-20", "В работе", "mtg-1"],
+        ["2", "2024-01-15", "Написать отчёт", "Петров", "2024-01-20", "Требует верификации", "mtg-2"],
+    ]
+    keys = set()
+    for row in existing_full[1:]:
+        k = mod._task_key(row)
+        assert k is not None, f"_task_key вернул None для строки {row}"
+        keys.add(k)
+
+    assert len(keys) == 2, (
+        f"Ожидались 2 разных ключа для задач из разных встреч, получено {len(keys)}: {keys}"
+    )
+    # Also verify the keys include meeting_id
+    for k in keys:
+        assert "mtg-" in k, f"Ключ не содержит meeting_id: {k}"
+
+
+def test_fmt_warnings_in_result():
+    """Ошибки форматирования попадают в строку результата пользователю."""
+    import pathlib
+    sync_src = (pathlib.Path(__file__).parent / "mymeet_sync.py").read_text(encoding="utf-8")
+    # Result string must include fmt_warn_text
+    assert "fmt_warn_text" in sync_src, (
+        "Переменная fmt_warn_text не найдена в mymeet_sync.py"
+    )
+    assert "Ошибки форматирования" in sync_src, (
+        "Текст 'Ошибки форматирования' не найден в mymeet_sync.py"
+    )
+    assert "all_fmt_warnings.extend" in sync_src, (
+        "all_fmt_warnings.extend не найден — ошибки форматирования не собираются"
     )
 
 
@@ -421,6 +462,8 @@ if __name__ == "__main__":
         (test_intra_run_dedup,                   "дубль внутри запуска не добавляется"),
         (test_different_meetings_not_deduped,    "одинак. задача из разных встреч — 2 ряда"),
         (test_manual_status_preserved_on_full_overwrite, "статус сохраняется при перезаписи"),
+        (test_cross_run_dedup_different_meetings_not_merged, "задачи из разных встреч не сливаются"),
+        (test_fmt_warnings_in_result,            "ошибки форматирования в результате"),
         (test_formatting_errors_not_silent,      "ошибки форматирования видны (warning)"),
     ]
     failed = []

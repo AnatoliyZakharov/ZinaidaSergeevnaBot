@@ -36,6 +36,14 @@ ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# ── Sheet formatting constants ────────────────────────────────────────────────
+STATUS_VALUES = [
+    "Требует верификации", "В работе", "Выполнено", "Просрочено", "Отменено",
+]
+COL_WIDTHS_PX = [50, 110, 420, 180, 120, 190]  # A B C D E F (pixels)
+MTG_ID_COL_PX = 60                             # G — internal meeting-id column
+
+
 HEADER_FORMAT = {
     "textFormat": {"bold": True, "fontSize": 10},
     "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
@@ -105,43 +113,177 @@ def _gs_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
-    """Apply header format + freeze row 1 in a single Sheets batch_update call (saves 1 API op)."""
+def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
+    """Apply unified sheet formatting in one batch_update call:
+    header style + freeze, column widths A-F, text wrap, row auto-resize,
+    dropdown validation for column F (Статус).
+    """
+    sid = ws.id
+    # Validation covers up to 10 000 rows so new rows also get the dropdown
+    VAL_END = 10_000
+
+    requests: list = [
+        # 1. Header: bold/color/freeze
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 0, "endRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": 6,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "bold": True, "fontSize": 10,
+                            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                        },
+                        "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
+                        "horizontalAlignment": "CENTER",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat",
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sid,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        # 2. Text wrap + top align on all data rows
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": 7,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "wrapStrategy": "WRAP",
+                        "verticalAlignment": "TOP",
+                    }
+                },
+                "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
+            }
+        },
+        # 3. Dropdown validation for column F (index 5)
+        {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 5, "endColumnIndex": 6,
+                },
+                "rule": {
+                    "condition": {
+                        "type": "ONE_OF_LIST",
+                        "values": [{"userEnteredValue": v} for v in STATUS_VALUES],
+                    },
+                    "showCustomUi": True,
+                    "strict": True,
+                }
+            }
+        },
+    ]
+
+    # 4. Column widths A–F
+    for col_idx, px in enumerate(COL_WIDTHS_PX):
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sid,
+                    "dimension": "COLUMNS",
+                    "startIndex": col_idx,
+                    "endIndex": col_idx + 1,
+                },
+                "properties": {"pixelSize": px},
+                "fields": "pixelSize",
+            }
+        })
+
+    # Column G (mtg_id) — hidden internal column
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {"sheetId": sid, "dimension": "COLUMNS",
+                       "startIndex": 6, "endIndex": 7},
+            "properties": {"pixelSize": MTG_ID_COL_PX, "hiddenByUser": True},
+            "fields": "pixelSize,hiddenByUser",
+        }
+    })
+    fmt_warnings: list[str] = []
     try:
-        sid = ws.id
-        _gs_call(spreadsheet.batch_update, {"requests": [
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sid,
-                        "startRowIndex": 0, "endRowIndex": 1,
-                        "startColumnIndex": 0, "endColumnIndex": num_cols,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "textFormat": {
-                                "bold": True, "fontSize": 10,
-                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                            },
-                            "backgroundColor": {"red": 0.204, "green": 0.396, "blue": 0.643},
-                            "horizontalAlignment": "CENTER",
-                        }
-                    },
-                    "fields": "userEnteredFormat",
-                }
-            },
-            {
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sid,
-                        "gridProperties": {"frozenRowCount": 1},
-                    },
-                    "fields": "gridProperties.frozenRowCount",
-                }
-            },
-        ]})
+        _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
-        logger.debug("Batch format/freeze failed: %s", e)
+        msg = f"batch_update: {e}"
+        logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+        fmt_warnings.append(msg)
+
+    # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
+    if data_rows > 0:
+        try:
+            _gs_call(spreadsheet.batch_update, {"requests": [{
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": sid,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": data_rows + 1,
+                    }
+                }
+            }]})
+        except Exception as e:
+            msg = f"auto-resize: {e}"
+            logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+            fmt_warnings.append(msg)
+    return fmt_warnings
+
+
+def _task_key(row: list) -> str | None:
+    """Return a deduplication key for a data row.
+
+    Key format with meeting_id present in col G (index 6):
+        '{mid}|{date}|{task}|{assignee}'
+    Fallback for legacy rows without col G:
+        '{date}|{task}|{assignee}'
+
+    Returns None for header rows, grouper rows (empty date), or short rows.
+    """
+    if len(row) < 4:
+        return None
+    date  = str(row[1]).strip()
+    task  = str(row[2]).strip()
+    asgn  = str(row[3]).strip()
+    if not task or not date:
+        return None
+    mid = str(row[6]).strip() if len(row) > 6 else ""
+    if mid:
+        return f"{mid}|{date}|{task.lower()}|{asgn.lower()}"
+    return f"{date}|{task.lower()}|{asgn.lower()}"
+
+
+def _existing_keys(existing_rows: list) -> set:
+    """Return set of task keys from already-fetched get_all_values() result."""
+    keys = set()
+    for row in existing_rows[1:]:   # skip header
+        k = _task_key(row)
+        if k:
+            keys.add(k)
+    return keys
+
+
+
+
+def _run_key(meeting_id: str, date: str, task: str, assignee: str) -> str:
+    """Intra-run deduplication key that includes meeting identity.
+    Prevents adding the same task twice within one sync run when it appears
+    in two different meetings (different meeting_id → different run_key).
+    """
+    return f"{meeting_id}|{date}|{task.lower().strip()}|{assignee.lower().strip()}"
 
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
@@ -436,8 +578,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     gc          = _gs_client()
     spreadsheet = gc.open_by_key(cfg["sheet_id"])
     sheets_written = 0
+    all_fmt_warnings: list[str] = []
 
-    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус"]
+    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус", "mtg_id"]
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
@@ -445,59 +588,94 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             ws = spreadsheet.worksheet(sheet_name)
             if not append:
+                # Read existing data BEFORE clearing so we can restore manual statuses.
+                try:
+                    existing_full: list = _gs_call(ws.get_all_values)
+                except Exception:
+                    existing_full = []
                 _gs_call(ws.clear)
         except gspread.WorksheetNotFound:
             ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
+            existing_full = []
 
         if not append:
-            # Build task rows
+            # Full overwrite: preserve manually-set statuses from existing sheet.
+            manual_statuses: dict[str, str] = {}
+            for _row in (existing_full[1:] if existing_full else []):
+                _k = _task_key(_row)
+                if _k and len(_row) >= 6 and str(_row[5]).strip():
+                    manual_statuses[_k] = str(_row[5]).strip()
+
             rows = []
             idx  = 1
+            seen_in_run: set[str] = set()
             for m in sorted(meetings, key=lambda x: x["date"]):
                 for task in m["tasks"]:
+                    rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+                    if rkey in seen_in_run:
+                        continue   # intra-run duplicate from same meeting
+                    seen_in_run.add(rkey)
+                    tkey = _task_key([
+                        None, m["date"], task["name"], task["assignee"],
+                        task["deadline"], None, m["id"],
+                    ])
+                    # Restore manually-set status; fall back to MYmeet status
+                    status = manual_statuses.get(tkey) if tkey else None
+                    if not status:
+                        status = "Выполнено" if task["done"] else "Требует верификации"
+                    rows.append([
+                        idx, m["date"], task["name"], task["assignee"],
+                        task["deadline"], status, m["id"],
+                    ])
+                    idx += 1
+            all_data = [HEADER_ROW] + rows
+            _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(rows)))
+        else:
+            # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
+            # existing rows on repeated daily runs; preserve manually-changed statuses.
+            existing = _gs_call(ws.get_all_values)
+            ex_keys  = _existing_keys(existing) if existing else set()
+
+            # Determine next sequential №
+            last_num = 0
+            for row in (existing[1:] if existing else []):
+                if row and str(row[0]).strip().isdigit():
+                    last_num = max(last_num, int(row[0]))
+
+            start_row = (len(existing) + 1) if existing else 2
+            rows = []
+            idx  = last_num + 1
+            seen_in_run_app: set[str] = set()
+            for m in sorted(meetings, key=lambda x: x["date"]):
+                for task in m["tasks"]:
+                    rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+                    if rkey in seen_in_run_app:
+                        continue   # intra-run duplicate
+                    seen_in_run_app.add(rkey)
+                    key = _task_key([
+                        None, m["date"], task["name"], task["assignee"],
+                        task["deadline"], None, m["id"],
+                    ])
+                    if key and key in ex_keys:
+                        continue   # already present — preserve any manual status edits
                     rows.append([
                         idx, m["date"], task["name"], task["assignee"],
                         task["deadline"],
                         "Выполнено" if task["done"] else "Требует верификации",
+                        m["id"],
                     ])
                     idx += 1
-            # Single update: header + data together (saves 1 API call vs separate header update)
-            all_data = [HEADER_ROW] + rows
-            _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
-            # Format header + freeze in one batch call (saves 1 API call vs format+freeze separately)
-            _batch_format_freeze(spreadsheet, ws)
-        else:
-            # append: find last filled row
-            existing = _gs_call(ws.get_all_values)
+
             if not existing:
-                rows = []
-                idx  = 1
-                for m in sorted(meetings, key=lambda x: x["date"]):
-                    for task in m["tasks"]:
-                        rows.append([
-                            idx, m["date"], task["name"], task["assignee"],
-                            task["deadline"],
-                            "Выполнено" if task["done"] else "Требует верификации",
-                        ])
-                        idx += 1
                 all_data = [HEADER_ROW] + rows
-                _gs_call(ws.update, f"A1:F{len(all_data)}", all_data)
-                _batch_format_freeze(spreadsheet, ws)
-            else:
-                start_idx = len(existing)
-                start_row = len(existing) + 1
-                rows = []
-                idx  = start_idx
-                for m in sorted(meetings, key=lambda x: x["date"]):
-                    for task in m["tasks"]:
-                        rows.append([
-                            idx, m["date"], task["name"], task["assignee"],
-                            task["deadline"],
-                            "Выполнено" if task["done"] else "Требует верификации",
-                        ])
-                        idx += 1
-                if rows:
-                    _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(rows)}", rows)
+                _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
+            elif rows:
+                _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(rows)}", rows)
+
+            # Always (re-)apply formatting so existing sheets get widths/wrap/dropdown too
+            total_data_rows = (len(existing) - 1 if existing else 0) + len(rows)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=total_data_rows))
         sheets_written += 1
         # No explicit sleep — rate limiter in _gs_call handles quota
 
@@ -508,56 +686,109 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     try:
         ws = spreadsheet.worksheet(ot_name)
         if not append:
+            # Read BEFORE clear to preserve manually-set statuses.
+            try:
+                existing_ot_before: list = _gs_call(ws.get_all_values)
+            except Exception:
+                existing_ot_before = []
             _gs_call(ws.clear)
+        else:
+            existing_ot_before = []
     except gspread.WorksheetNotFound:
         ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
+        existing_ot_before = []
 
     if not append:
         start_idx = 1
         start_row = 2
         new_sheet  = True
+        existing_ot: list = []
+        # Restore manual statuses from before-clear snapshot
+        manual_statuses_ot: dict[str, str] = {}
+        for _row in (existing_ot_before[1:] if existing_ot_before else []):
+            _k = _task_key(_row)
+            if _k and len(_row) >= 6 and str(_row[5]).strip():
+                manual_statuses_ot[_k] = str(_row[5]).strip()
     else:
-        existing = _gs_call(ws.get_all_values)
-        if not existing:
+        existing_ot = _gs_call(ws.get_all_values)
+        manual_statuses_ot = {}
+        if not existing_ot:
             start_idx = 1
             start_row = 2
             new_sheet  = True
         else:
-            start_idx = len(existing)
-            start_row = len(existing) + 1
             new_sheet  = False
+            start_row = len(existing_ot) + 1
+            start_idx = start_row  # will be refined below
+
+    # Dedup keys for one-time sheet (append mode)
+    ex_keys_ot = _existing_keys(existing_ot) if (append and existing_ot) else set()
+
+    # Determine next sequential №
+    last_num_ot = 0
+    for row in (existing_ot[1:] if existing_ot else []):
+        if row and str(row[0]).strip().isdigit():
+            last_num_ot = max(last_num_ot, int(row[0]))
+    idx = last_num_ot + 1 if (append and existing_ot) else start_idx
 
     # Build rows list; track grouper row positions (0-based relative to start_row)
     all_rows: list = []
     grouper_rel_positions: list[int] = []
-    idx = start_idx
+    seen_in_run_ot: set[str] = set()
 
     for m in one_time:
         if not m["tasks"]:
             continue
+        # In append mode filter tasks already present; also dedup within this run
+        new_tasks = []
+        for task in m["tasks"]:
+            rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+            if rkey in seen_in_run_ot:
+                continue   # intra-run duplicate
+            seen_in_run_ot.add(rkey)
+            if append and existing_ot:
+                key = _task_key([None, m["date"], task["name"], task["assignee"], None, None, m["id"]])
+                if key and key in ex_keys_ot:
+                    continue  # skip — already in sheet, status may have been edited manually
+            new_tasks.append(task)
+
+        if not new_tasks:
+            continue   # all tasks for this meeting already exist
+
         label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
         grouper_rel_positions.append(len(all_rows))
-        all_rows.append([label, "", "", "", "", ""])
-        for task in m["tasks"]:
+        all_rows.append([label, "", "", "", "", "", ""])
+        for task in new_tasks:
+            tkey_ot = _task_key([None, m["date"], task["name"], task["assignee"],
+                                  task["deadline"], None, m["id"]])
+            status_ot = (manual_statuses_ot.get(tkey_ot) if not append else None) or (
+                "Выполнено" if task["done"] else "Требует верификации"
+            )
             all_rows.append([
                 idx,
                 m["date"],
                 task["name"],
                 task["assignee"],
                 task["deadline"],
-                "Выполнено" if task["done"] else "Требует верификации",
+                status_ot,
+                m["id"],
             ])
             idx += 1
 
     if new_sheet:
-        # Combine header + data in single write (saves 1 API call)
         write_data = [HEADER_ROW] + all_rows
         if write_data:
-            _gs_call(ws.update, f"A1:F{len(write_data)}", write_data)
-        # Format+freeze header in single batch call (saves 1 API call)
-        _batch_format_freeze(spreadsheet, ws)
+            _gs_call(ws.update, f"A1:G{len(write_data)}", write_data)
+        all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(all_rows)))
     elif all_rows:
-        _gs_call(ws.update, f"A{start_row}:F{start_row - 1 + len(all_rows)}", all_rows)
+        _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(all_rows)}", all_rows)
+        # Always re-apply formatting to pick up widths/wrap/dropdown on existing sheet
+        total_ot_rows = (len(existing_ot) - 1 if existing_ot else 0) + len(all_rows)
+        all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=total_ot_rows))
+    else:
+        # Nothing new to write but still (re-)apply formatting to existing sheet
+        if existing_ot:
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1))
 
     # Batch-format all grouper rows in a single API call (saves N-1 API calls)
     if all_rows and grouper_rel_positions:
@@ -584,12 +815,18 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
         except Exception as e:
-            logger.debug("Grouper batch format failed: %s", e)
+            logger.warning("Sheet formatting error (grouper rows): %s", e)
 
+    fmt_warn_text = (
+        f"\n⚠️ Ошибки форматирования ({len(all_fmt_warnings)}):\n"
+        + "\n".join(f"  • {w}" for w in all_fmt_warnings)
+        if all_fmt_warnings else ""
+    )
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"
         f"📋 {sheets_written} листов по регулярным встречам\n"
         f"📝 Разовые встречи: {len(one_time)} встреч"
+        + fmt_warn_text
     )
     logger.info("MYmeet sync done: %s", result.replace('\n', ' | '))
     return result

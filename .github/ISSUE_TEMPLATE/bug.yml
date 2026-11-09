@@ -1,0 +1,72 @@
+name: "🐛 Bug Report"
+description: "Бот ведёт себя неправильно"
+title: "[BUG] "
+labels: ["type: bug", "status: new"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Опиши баг максимально точно. Чем подробнее — тем быстрее исправим.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Описание бага"
+      description: "Что происходит? Чего ожидал?"
+      placeholder: "При вводе команды /sync_mymeet бот не отвечает вместо..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Шаги воспроизведения"
+      description: "Пошаговая инструкция для воспроизведения"
+      placeholder: |
+        1. Написать `/reset_mymeet`
+        2. Ввести токен с кириллицей
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Ожидаемое поведение"
+      placeholder: "Бот должен ответить сообщением об ошибке с подсказкой"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Фактическое поведение"
+      placeholder: "Бот не отвечает (silent fail)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Логи / Traceback"
+      description: "Вставь релевантные строки из `fly logs` или локального запуска"
+      render: text
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: "Severity"
+      options:
+        - "🔴 Critical — бот полностью не работает"
+        - "🟠 High — важная функция сломана"
+        - "🟡 Medium — неудобство, есть обходной путь"
+        - "🟢 Low — косметический дефект"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: "Окружение"
+      placeholder: "Fly.io production / local Python 3.11"

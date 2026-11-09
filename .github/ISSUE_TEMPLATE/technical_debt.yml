@@ -1,0 +1,67 @@
+name: "🔧 Technical Debt"
+description: "Рефакторинг, улучшение кода, обновление зависимостей"
+title: "[DEBT] "
+labels: ["type: tech-debt", "status: new"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Технический долг — реальная проблема. Описывай конкретно.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Текущая проблема"
+      description: "Что именно доставляет неудобства или является риском?"
+      placeholder: "Функция _fetch_meetings содержит 150 строк и не покрыта тестами..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: "Предлагаемое решение"
+      placeholder: "Разбить на 3 функции, добавить unit-тесты с mock requests..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Влияние на пользователей / систему"
+      description: "Как нерешение этой проблемы влияет на бизнес или разработку?"
+      placeholder: "Сложно добавлять новые источники данных..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected_files
+    attributes:
+      label: "Затронутые файлы"
+      placeholder: |
+        - mymeet_sync.py (функции _fetch_meetings, _build_user_config)
+        - test_smoke.py
+
+  - type: dropdown
+    id: effort
+    attributes:
+      label: "Оценка трудоёмкости"
+      options:
+        - "XS — < 1 час"
+        - "S — несколько часов"
+        - "M — 1–2 дня"
+        - "L — неделя"
+        - "XL — > недели, нужна декомпозиция"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: "Ограничения"
+      options:
+        - label: "Не меняет поведение бота для пользователя (pure refactoring)"
+        - label: "Требует изменения конфигурации деплоя"
+        - label: "Требует миграции БД"
+        - label: "Требует обновления секретов"

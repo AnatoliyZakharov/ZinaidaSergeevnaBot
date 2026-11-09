@@ -1,0 +1,164 @@
+# CLAUDE.md — Developer Guide
+
+Инструкции для разработки, тестирования и работы с репозиторием.  
+**Не менять бизнес-логику бота** без Issue + APPROVAL от Technical Lead.
+
+---
+
+## Структура проекта
+
+```
+├── main.py              # Telegram-бот: хендлеры, команды
+├── mymeet_sync.py       # Интеграция с MYmeet API + Google Sheets
+├── db.py                # SQLite: пользователи, конфиги
+├── auth.py              # Авторизация пользователей
+├── gtasks.py            # Google Tasks интеграция
+├── requirements.txt     # Python-зависимости
+├── Dockerfile           # Контейнер для Fly.io
+├── Procfile             # Команда запуска
+├── fly.toml             # Конфигурация деплоя (не менять без TL)
+├── test_smoke.py        # Smoke-тесты (запускать перед каждым PR)
+└── .github/
+    ├── workflows/
+    │   ├── deploy.yml        # CD: деплой на Fly.io
+    │   ├── smoke-tests.yml   # CI: smoke-тесты на каждый push/PR
+    │   └── secret-scan.yml   # Security: Gitleaks
+    ├── ISSUE_TEMPLATE/       # Шаблоны Issues
+    └── pull_request_template.md
+```
+
+---
+
+## Локальный запуск
+
+### Требования
+- Python 3.11+
+- Переменные окружения (см. раздел «Секреты»)
+
+### Установка зависимостей
+```bash
+pip install -r requirements.txt
+```
+
+### Запуск бота
+```bash
+python main.py
+```
+
+### Запуск smoke-тестов
+```bash
+# Обязательно перед созданием PR
+python test_smoke.py
+```
+
+Или через pytest:
+```bash
+pip install pytest
+pytest test_smoke.py -v
+```
+
+Ожидаемый вывод:
+```
+✅ Все проверки прошли
+```
+
+---
+
+## Секреты и переменные окружения
+
+### Правило: никаких секретов в коде
+
+❌ Запрещено:
+```python
+TOKEN = "mm_RealToken123..."          # прямой литерал
+TOKEN = os.environ.get("TOKEN", "mm_RealToken123...")  # default-значение
+```
+
+✅ Правильно:
+```python
+TOKEN = os.environ.get("MYMEET_TOKEN", "")
+```
+
+### Список переменных окружения
+
+| Переменная              | Описание                        | Где задаётся      |
+|-------------------------|----------------------------------|-------------------|
+| `TELEGRAM_BOT_TOKEN`    | Telegram Bot API token           | Fly Secret        |
+| `MYMEET_TOKEN`          | MYmeet API token (глобальный)    | Fly Secret        |
+| `MYMEET_WS_ID`          | MYmeet Workspace ID              | Fly Secret        |
+| `MYMEET_SPREADSHEET_ID` | Google Sheets ID                 | Fly Secret        |
+| `ORGANIZER_EMAIL`       | Email организатора               | Fly Secret        |
+| `GOOGLE_SA_KEY`         | Google Service Account JSON      | Fly Secret        |
+
+### Установка секретов (Fly.io)
+```bash
+fly secrets set VARIABLE_NAME=value -a calendar-bot-anatolii
+```
+
+Никогда не передавать значения секретов в переменных окружения CI (`.github/workflows/*.yml`).  
+В workflow допустимы только пустые значения для тестов: `MYMEET_TOKEN: ""`.
+
+---
+
+## Работа с ветками
+
+### Именование веток
+
+| Тип задачи       | Формат                          | Пример                        |
+|------------------|---------------------------------|-------------------------------|
+| Новая функция    | `feat/<issue-num>-<slug>`       | `feat/42-google-tasks-sync`   |
+| Исправление бага | `fix/<issue-num>-<slug>`        | `fix/38-latin1-token-error`   |
+| Инфраструктура   | `infra/<slug>`                  | `infra/ai-software-factory`   |
+| CI/Security      | `ci/<slug>`                     | `ci/security-review`          |
+| Технический долг | `debt/<issue-num>-<slug>`       | `debt/15-refactor-db-layer`   |
+
+### Создание ветки
+```bash
+git checkout main
+git pull origin main
+git checkout -b feat/42-google-tasks-sync
+```
+
+### Пуш и PR
+```bash
+git push origin feat/42-google-tasks-sync
+# Затем открыть PR на GitHub через веб-интерфейс
+```
+
+**Запрещено:**
+- `git push --force` в `main`
+- Прямые коммиты в `main`
+- Мерж PR без approval от Technical Lead
+
+---
+
+## Pull Request
+
+1. Заполни шаблон `.github/pull_request_template.md` полностью.
+2. Привяжи Issue: `Closes #<номер>` в описании PR.
+3. Убедись, что все CI-проверки зелёные (smoke-tests, secret-scan).
+4. Запроси Review у Technical Lead.
+5. Не мержи самостоятельно.
+
+---
+
+## Деплой
+
+Деплой происходит **автоматически** при мерже в `main` через `.github/workflows/deploy.yml`.
+
+Ручной деплой (только при необходимости):
+```bash
+fly deploy --remote-only -a calendar-bot-anatolii
+```
+
+**Не менять** `fly.toml`, `Dockerfile`, `Procfile` без согласования с Technical Lead.
+
+---
+
+## CI/CD Checklist перед PR
+
+- [ ] `python test_smoke.py` — все тесты проходят
+- [ ] Нет захардкоженных секретов (`grep -r "mm_" --include="*.py" .`)
+- [ ] Ветка актуальна относительно `main` (`git rebase origin/main`)
+- [ ] Описание PR заполнено по шаблону
+- [ ] Issue привязан к PR

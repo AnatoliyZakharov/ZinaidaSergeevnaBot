@@ -184,7 +184,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                         "values": [{"userEnteredValue": v} for v in STATUS_VALUES],
                     },
                     "showCustomUi": True,
-                    "strict": False,
+                    "strict": True,
                 }
             }
         },
@@ -208,7 +208,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
     try:
         _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
-        logger.debug("Full format batch failed: %s", e)
+        logger.warning("Sheet formatting error (batch_update): %s", e)
 
     # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
     if data_rows > 0:
@@ -224,7 +224,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 }
             }]})
         except Exception as e:
-            logger.debug("Auto-resize rows failed: %s", e)
+            logger.warning("Sheet formatting error (auto-resize rows): %s", e)
 
 
 def _task_key(row: list) -> str | None:
@@ -250,6 +250,15 @@ def _existing_keys(existing_rows: list) -> set:
             keys.add(k)
     return keys
 
+
+
+
+def _run_key(meeting_id: str, date: str, task: str, assignee: str) -> str:
+    """Intra-run deduplication key that includes meeting identity.
+    Prevents adding the same task twice within one sync run when it appears
+    in two different meetings (different meeting_id → different run_key).
+    """
+    return f"{meeting_id}|{date}|{task.lower().strip()}|{assignee.lower().strip()}"
 
 # Keep old name as alias for callers not yet updated (will be removed in a future cleanup).
 def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
@@ -562,15 +571,38 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
 
         if not append:
-            # Full overwrite: build header + all task rows, write in one call
+            # Full overwrite: preserve manually-set statuses from existing sheet.
+            # Read existing data first; build key→status map to restore manual edits.
+            try:
+                existing_full = _gs_call(ws.get_all_values)
+            except Exception:
+                existing_full = []
+            manual_statuses: dict[str, str] = {}
+            for _row in (existing_full[1:] if existing_full else []):
+                _k = _task_key(_row)
+                if _k and len(_row) >= 6 and str(_row[5]).strip():
+                    manual_statuses[_k] = str(_row[5]).strip()
+
             rows = []
             idx  = 1
+            seen_in_run: set[str] = set()
             for m in sorted(meetings, key=lambda x: x["date"]):
                 for task in m["tasks"]:
+                    rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+                    if rkey in seen_in_run:
+                        continue   # intra-run duplicate from same meeting
+                    seen_in_run.add(rkey)
+                    tkey = _task_key([
+                        None, m["date"], task["name"], task["assignee"],
+                        task["deadline"], None,
+                    ])
+                    # Restore manually-set status; fall back to MYmeet status
+                    status = manual_statuses.get(tkey) if tkey else None
+                    if not status:
+                        status = "Выполнено" if task["done"] else "Требует верификации"
                     rows.append([
                         idx, m["date"], task["name"], task["assignee"],
-                        task["deadline"],
-                        "Выполнено" if task["done"] else "Требует верификации",
+                        task["deadline"], status,
                     ])
                     idx += 1
             all_data = [HEADER_ROW] + rows
@@ -591,14 +623,19 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             start_row = (len(existing) + 1) if existing else 2
             rows = []
             idx  = last_num + 1
+            seen_in_run_app: set[str] = set()
             for m in sorted(meetings, key=lambda x: x["date"]):
                 for task in m["tasks"]:
+                    rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+                    if rkey in seen_in_run_app:
+                        continue   # intra-run duplicate
+                    seen_in_run_app.add(rkey)
                     key = _task_key([
                         None, m["date"], task["name"], task["assignee"],
                         task["deadline"], None,
                     ])
                     if key and key in ex_keys:
-                        continue   # already present — skip to preserve any manual status edits
+                        continue   # already present — preserve any manual status edits
                     rows.append([
                         idx, m["date"], task["name"], task["assignee"],
                         task["deadline"],
@@ -658,13 +695,18 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     # Build rows list; track grouper row positions (0-based relative to start_row)
     all_rows: list = []
     grouper_rel_positions: list[int] = []
+    seen_in_run_ot: set[str] = set()
 
     for m in one_time:
         if not m["tasks"]:
             continue
-        # In append mode filter tasks already present
+        # In append mode filter tasks already present; also dedup within this run
         new_tasks = []
         for task in m["tasks"]:
+            rkey = _run_key(m["id"], m["date"], task["name"], task["assignee"])
+            if rkey in seen_in_run_ot:
+                continue   # intra-run duplicate
+            seen_in_run_ot.add(rkey)
             if append and existing_ot:
                 key = _task_key([None, m["date"], task["name"], task["assignee"], None, None])
                 if key and key in ex_keys_ot:
@@ -728,7 +770,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
         except Exception as e:
-            logger.debug("Grouper batch format failed: %s", e)
+            logger.warning("Sheet formatting error (grouper rows): %s", e)
 
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"

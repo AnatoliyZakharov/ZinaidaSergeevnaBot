@@ -263,6 +263,145 @@ def test_new_task_added_on_resync():
     )
 
 
+
+# ── QA-round-2 tests ──────────────────────────────────────────────────────────
+
+def test_dropdown_strict():
+    """Выпадающий список статусов должен быть строгим (strict: True)."""
+    import ast, pathlib
+    sync_src = (pathlib.Path(__file__).parent / "mymeet_sync.py").read_text(encoding="utf-8")
+    tree = ast.parse(sync_src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and k.value == "strict"
+                        and isinstance(v, ast.Constant)):
+                    assert v.value is True, (
+                        f"Ожидался strict=True, найдено strict={v.value!r} "
+                        f"(строка {node.lineno})"
+                    )
+
+
+def test_run_key_exists():
+    """_run_key должна существовать и включать meeting_id в ключ."""
+    mod = _load_mymeet()
+    assert hasattr(mod, "_run_key"), "_run_key не найдена в mymeet_sync"
+    k1 = mod._run_key("mtg-1", "2024-01-15", "Задача", "Иванов")
+    k2 = mod._run_key("mtg-2", "2024-01-15", "Задача", "Иванов")
+    assert k1 != k2, (
+        "Одинаковое поручение из разных встреч должно давать разные _run_key"
+    )
+
+
+def test_intra_run_dedup():
+    """Одно и то же поручение из одной встречи не должно дублироваться внутри запуска."""
+    mod = _load_mymeet()
+    meetings = [
+        {
+            "id": "mtg-1",
+            "date": "2024-01-15",
+            "tasks": [
+                {"name": "Задача", "assignee": "Иванов", "deadline": "", "done": False},
+                {"name": "Задача", "assignee": "Иванов", "deadline": "", "done": False},  # дубль
+            ],
+        }
+    ]
+    seen: set = set()
+    rows = []
+    for m in meetings:
+        for t in m["tasks"]:
+            rkey = mod._run_key(m["id"], m["date"], t["name"], t["assignee"])
+            if rkey in seen:
+                continue
+            seen.add(rkey)
+            rows.append(t["name"])
+    assert len(rows) == 1, f"Ожидался 1 ряд, получено {len(rows)}: {rows}"
+
+
+def test_different_meetings_not_deduped():
+    """Одинаковое поручение из РАЗНЫХ встреч должно попасть дважды."""
+    mod = _load_mymeet()
+    meetings = [
+        {"id": "mtg-1", "date": "2024-01-15", "tasks": [
+            {"name": "Задача", "assignee": "Иванов", "deadline": "", "done": False},
+        ]},
+        {"id": "mtg-2", "date": "2024-01-15", "tasks": [
+            {"name": "Задача", "assignee": "Иванов", "deadline": "", "done": False},
+        ]},
+    ]
+    seen: set = set()
+    rows = []
+    for m in meetings:
+        for t in m["tasks"]:
+            rkey = mod._run_key(m["id"], m["date"], t["name"], t["assignee"])
+            if rkey in seen:
+                continue
+            seen.add(rkey)
+            rows.append(t["name"])
+    assert len(rows) == 2, (
+        f"Ожидалось 2 ряда (разные встречи), получено {len(rows)}: {rows}"
+    )
+
+
+def test_manual_status_preserved_on_full_overwrite():
+    """При полной перезаписи вручную изменённый статус сохраняется."""
+    mod = _load_mymeet()
+
+    # Существующий лист — пользователь поменял статус с 'Требует верификации' на 'В работе'
+    existing_full = [
+        ["#", "Дата", "Поручение", "Исполнитель", "Срок", "Статус"],
+        ["1", "2024-01-15", "Подготовить отчёт", "Иванов", "2024-01-20", "В работе"],
+    ]
+    manual_statuses: dict = {}
+    for row in existing_full[1:]:
+        k = mod._task_key(row)
+        if k and len(row) >= 6 and str(row[5]).strip():
+            manual_statuses[k] = str(row[5]).strip()
+
+    meetings = [{"id": "mtg-1", "date": "2024-01-15", "tasks": [
+        {"name": "Подготовить отчёт", "assignee": "Иванов",
+         "deadline": "2024-01-20", "done": False},
+    ]}]
+
+    seen: set = set()
+    rows = []
+    for m in meetings:
+        for t in m["tasks"]:
+            rkey = mod._run_key(m["id"], m["date"], t["name"], t["assignee"])
+            if rkey in seen:
+                continue
+            seen.add(rkey)
+            tkey = mod._task_key([None, m["date"], t["name"], t["assignee"], t["deadline"], None])
+            status = manual_statuses.get(tkey) if tkey else None
+            if not status:
+                status = "Выполнено" if t["done"] else "Требует верификации"
+            rows.append(status)
+
+    assert rows == ["В работе"], (
+        f"Ожидался сохранённый статус 'В работе', получено: {rows}"
+    )
+
+
+def test_formatting_errors_not_silent():
+    """Ошибки форматирования не маскируются под debug, а логируются как warning."""
+    import ast, pathlib
+    sync_src = (pathlib.Path(__file__).parent / "mymeet_sync.py").read_text(encoding="utf-8")
+    # Убеждаемся, что debug-вызовов для ошибок форматирования не осталось
+    bad_patterns = [
+        'logger.debug("Full format batch failed',
+        'logger.debug("Auto-resize rows failed',
+        'logger.debug("Grouper batch format failed',
+    ]
+    for pat in bad_patterns:
+        assert pat not in sync_src, (
+            f"Ошибки форматирования скрыты под logger.debug: {pat!r}"
+        )
+    # И что warning-вызовы присутствуют
+    assert 'logger.warning("Sheet formatting error' in sync_src, (
+        "Не найден logger.warning для ошибок форматирования"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
@@ -277,6 +416,12 @@ if __name__ == "__main__":
         (test_existing_keys_dedup,               "_existing_keys извлекает 3 ключа"),
         (test_no_duplicate_on_resync,            "дубликаты не добавляются при ресинке"),
         (test_new_task_added_on_resync,          "новая задача добавляется при ресинке"),
+        (test_dropdown_strict,                   "dropdown strict=True"),
+        (test_run_key_exists,                    "_run_key разделяет разные встречи"),
+        (test_intra_run_dedup,                   "дубль внутри запуска не добавляется"),
+        (test_different_meetings_not_deduped,    "одинак. задача из разных встреч — 2 ряда"),
+        (test_manual_status_preserved_on_full_overwrite, "статус сохраняется при перезаписи"),
+        (test_formatting_errors_not_silent,      "ошибки форматирования видны (warning)"),
     ]
     failed = []
     for fn, label in tests:

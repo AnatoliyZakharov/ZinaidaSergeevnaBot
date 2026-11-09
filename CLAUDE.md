@@ -5,6 +5,16 @@
 
 ---
 
+## Зависимость от PR #1
+
+> **CI-статус:** Smoke-тесты (`smoke-tests.yml`) и сканер секретов (`secret-scan.yml`)
+> появятся в ветках, основанных на `main`, **после** того, как
+> **PR #1 (`ci/security-review`)** будет смержен.  
+> До этого в PR, основанных на текущем `main`, работает `validate-docs.yml`
+> и базовый `deploy.yml` (только на push в main).
+
+---
+
 ## Структура проекта
 
 ```
@@ -17,13 +27,14 @@
 ├── Dockerfile           # Контейнер для Fly.io
 ├── Procfile             # Команда запуска
 ├── fly.toml             # Конфигурация деплоя (не менять без TL)
-├── test_smoke.py        # Smoke-тесты (запускать перед каждым PR)
+├── test_smoke.py        # Smoke-тесты (из PR #1; запускать перед каждым PR)
 └── .github/
     ├── workflows/
-    │   ├── deploy.yml        # CD: деплой на Fly.io
-    │   ├── smoke-tests.yml   # CI: smoke-тесты на каждый push/PR
-    │   └── secret-scan.yml   # Security: Gitleaks
-    ├── ISSUE_TEMPLATE/       # Шаблоны Issues
+    │   ├── deploy.yml            # CD: деплой на Fly.io (только push → main)
+    │   ├── validate-docs.yml     # CI: проверка инфра-файлов (PR #2)
+    │   ├── smoke-tests.yml       # CI: smoke-тесты (появится после мержа PR #1)
+    │   └── secret-scan.yml       # Security: Gitleaks (появится после мержа PR #1)
+    ├── ISSUE_TEMPLATE/           # Шаблоны Issues
     └── pull_request_template.md
 ```
 
@@ -47,7 +58,7 @@ python main.py
 
 ### Запуск smoke-тестов
 ```bash
-# Обязательно перед созданием PR
+# Обязательно перед созданием PR (доступно после мержа PR #1)
 python test_smoke.py
 ```
 
@@ -128,7 +139,7 @@ git push origin feat/42-google-tasks-sync
 **Запрещено:**
 - `git push --force` в `main`
 - Прямые коммиты в `main`
-- Мерж PR без approval от Technical Lead
+- Merge PR без approve Technical Lead **и** финального одобрения Product Owner
 
 ---
 
@@ -136,9 +147,11 @@ git push origin feat/42-google-tasks-sync
 
 1. Заполни шаблон `.github/pull_request_template.md` полностью.
 2. Привяжи Issue: `Closes #<номер>` в описании PR.
-3. Убедись, что все CI-проверки зелёные (smoke-tests, secret-scan).
+3. Убедись, что все CI-проверки зелёные.
 4. Запроси Review у Technical Lead.
-5. Не мержи самостоятельно.
+5. **Дождись approve TL** (технический review и рекомендация о merge).
+6. **Дождись финального одобрения Product Owner** (решение о релизе).
+7. Не мержи самостоятельно — merge выполняет TL после явного одобрения PO.
 
 ---
 
@@ -157,7 +170,7 @@ fly deploy --remote-only -a calendar-bot-anatolii
 
 ## CI/CD Checklist перед PR
 
-- [ ] `python test_smoke.py` — все тесты проходят
+- [ ] `python test_smoke.py` — все тесты проходят локально
 - [ ] Нет захардкоженных секретов (`grep -r "mm_" --include="*.py" .`)
 - [ ] Ветка актуальна относительно `main` (`git rebase origin/main`)
 - [ ] Описание PR заполнено по шаблону

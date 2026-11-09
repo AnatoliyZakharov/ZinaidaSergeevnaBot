@@ -1,0 +1,63 @@
+name: Validate docs
+
+# Проверяет инфраструктурные файлы PR #2 (infra/ai-software-factory).
+# Запускается сразу, независимо от PR #1.
+#
+# Полный CI (smoke-tests, secret-scan/gitleaks) появится в этой ветке
+# автоматически после того, как PR #1 (ci/security-review) будет смержен в main
+# и infra/ai-software-factory будет rebase/merge на обновлённый main.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-docs:
+    name: Check required infra files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify AGENTS.md exists and is non-empty
+        run: |
+          test -s AGENTS.md || (echo "❌ AGENTS.md missing or empty" && exit 1)
+          echo "✅ AGENTS.md OK ($(wc -l < AGENTS.md) lines)"
+
+      - name: Verify CLAUDE.md exists and is non-empty
+        run: |
+          test -s CLAUDE.md || (echo "❌ CLAUDE.md missing or empty" && exit 1)
+          echo "✅ CLAUDE.md OK ($(wc -l < CLAUDE.md) lines)"
+
+      - name: Verify GitHub Issue templates
+        run: |
+          for f in \
+            .github/ISSUE_TEMPLATE/feature.yml \
+            .github/ISSUE_TEMPLATE/bug.yml \
+            .github/ISSUE_TEMPLATE/technical_debt.yml; do
+            test -s "$f" || (echo "❌ $f missing or empty" && exit 1)
+            echo "✅ $f OK"
+          done
+
+      - name: Verify PR template
+        run: |
+          test -s .github/pull_request_template.md \
+            || (echo "❌ pull_request_template.md missing or empty" && exit 1)
+          echo "✅ pull_request_template.md OK"
+
+      - name: Check no secrets in new docs
+        run: |
+          # Базовая проверка — полный gitleaks появится после мержа PR #1
+          if grep -rE 'mm_[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}' \
+               AGENTS.md CLAUDE.md .github/ 2>/dev/null; then
+            echo "❌ Possible secret found in docs" && exit 1
+          fi
+          echo "✅ No obvious secrets in docs"
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "ℹ️  Note: full CI (smoke-tests, gitleaks) will activate"
+          echo "   automatically once PR #1 (ci/security-review) is merged"
+          echo "   into main and this branch is rebased on updated main."

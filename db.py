@@ -12,6 +12,9 @@ from typing import Optional
 
 import os
 import re
+
+import crypto as _crypto
+from crypto import CryptoDecryptError
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "bot.db")))
 
 # Блокировка для thread-safe операций (sqlite3 не thread-safe по умолчанию)
@@ -339,7 +342,10 @@ def save_mymeet_config(
     spreadsheet_id: str,
     organizer_email: Optional[str] = None,
 ) -> None:
-    """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done."""
+    """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done.
+    Токен шифруется перед записью в базу (Fernet/AES).
+    """
+    encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
         conn.execute("""
@@ -350,13 +356,18 @@ def save_mymeet_config(
                 mymeet_organizer_email = ?,
                 mymeet_setup_done     = 1
             WHERE telegram_id = ?
-        """, (token, ws_id, spreadsheet_id, organizer_email, telegram_id))
+        """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
         conn.commit()
         conn.close()
 
 
 def get_mymeet_users() -> list:
-    """Все пользователи с настроенным MYmeet (для ежедневного синка)."""
+    """Все пользователи с настроенным MYmeet (для ежедневного синка).
+    Токены расшифровываются перед возвратом; пользователи с нерасшифруемым
+    токеном пропускаются (требуется пересетап через /setup_mymeet).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     with _lock:
         conn = _connect()
         rows = conn.execute("""
@@ -366,7 +377,46 @@ def get_mymeet_users() -> list:
               AND is_active = 1
         """).fetchall()
         conn.close()
-    return rows
+
+    result = []
+    for row in rows:
+        raw_token = row["mymeet_token"]
+        try:
+            if _crypto.is_encrypted(raw_token):
+                decrypted = _crypto.decrypt_token(raw_token)
+            else:
+                # Старый незашифрованный токен — помечаем как устаревший и пропускаем
+                _log.warning(
+                    "get_mymeet_users: telegram_id=%s имеет незашифрованный токен — "
+                    "требуется /setup_mymeet", row["telegram_id"]
+                )
+                continue
+            # Возвращаем row с расшифрованным токеном через обёртку
+            result.append(_DecryptedRow(row, decrypted))
+        except CryptoDecryptError:
+            _log.error(
+                "get_mymeet_users: не удалось расшифровать токен для telegram_id=%s — "
+                "пропускаем (нужен /setup_mymeet)", row["telegram_id"]
+            )
+    return result
+
+
+class _DecryptedRow:
+    """Обёртка над sqlite3.Row с подменённым токеном (расшифрованным)."""
+    def __init__(self, row: sqlite3.Row, decrypted_token: str):
+        self._row = row
+        self._token = decrypted_token
+
+    def __getitem__(self, key):
+        if key == "mymeet_token":
+            return self._token
+        return self._row[key]
+
+    def keys(self):
+        return self._row.keys()
+
+    def __iter__(self):
+        return iter(self._row)
 
 
 def reset_mymeet_config(telegram_id: int) -> None:

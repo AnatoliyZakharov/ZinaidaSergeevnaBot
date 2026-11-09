@@ -1,0 +1,12 @@
+title = "ZinaidaSergeevnaBot Gitleaks Config"
+
+[extend]
+# Extend the default gitleaks ruleset
+useDefault = true
+
+[allowlist]
+description = "Skip documentation files that contain intentional anti-pattern examples"
+paths = [
+    '''(?i)(^|/)CLAUDE\.md$''',
+    '''(?i)(^|/)AGENTS\.md$''',
+]

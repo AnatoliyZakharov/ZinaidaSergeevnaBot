@@ -18,7 +18,7 @@ SECRET_PATTERNS = [
 ]
 
 # Файлы, которые не проверяем (сами тесты)
-SKIP_FILES = {"test_smoke.py"}
+SKIP_FILES = {"test_smoke.py", "test_mymeet_workspace.py", "test_integration.py"}
 
 
 def _all_string_literals(tree: ast.AST):

@@ -81,8 +81,8 @@ pytest test_smoke.py -v
 
 ❌ Запрещено:
 ```python
-TOKEN = "mm_RealToken123..."          # прямой литерал
-TOKEN = os.environ.get("TOKEN", "mm_RealToken123...")  # default-значение
+TOKEN = "mm_RealToken123..."          # прямой литерал  # gitleaks:allow
+TOKEN = os.environ.get("TOKEN", "mm_RealToken123...")  # default-значение  # gitleaks:allow
 ```
 
 ✅ Правильно:

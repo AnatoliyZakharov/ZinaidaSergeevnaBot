@@ -292,25 +292,70 @@ def _mymeet_headers(token: str | None = None) -> dict:
     return {"X-API-KEY": token or MYMEET_TOKEN}
 
 
-def fetch_workspaces(token: str) -> list:
-    """Запрашиваем список рабочих пространств MYmeet по токену."""
-    for endpoint in ("/api/workspaces", "/api/user/workspaces", "/api/workspace"):
+class MymeetTokenError(Exception):
+    """Raised when the token is rejected by the MYmeet API."""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def verify_token_and_get_workspace(token: str) -> dict:
+    """Verify the API token and return the active workspace info.
+
+    Returns a dict with keys:
+        id   — always "active" (the API uses this keyword, not a UUID)
+        name — workspace display name, or a placeholder if unavailable
+
+    Raises:
+        MymeetTokenError  — 401/403 from the API (bad key or free plan)
+        requests.RequestException — network / timeout
+    """
+    if not token or not token.strip():
+        raise MymeetTokenError(0, "Токен не может быть пустым")
+    url = f"{MYMEET_BASE}/api/workspaces/active/all-meetings"
+    try:
+        resp = requests.get(
+            url,
+            headers=_mymeet_headers(token),
+            params={"page": 0, "perPage": 1},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.warning("verify_token_and_get_workspace: network error: %s", exc)
+        raise
+    if resp.status_code == 401:
+        raise MymeetTokenError(401, "Неверный API-токен (401 Unauthorized)")
+    if resp.status_code == 403:
         try:
-            resp = requests.get(
-                f"{MYMEET_BASE}{endpoint}",
-                headers=_mymeet_headers(token),
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else (
-                    data.get("items") or data.get("workspaces") or data.get("data") or []
-                )
-                if items:
-                    return items
+            detail = resp.json().get("message") or resp.text[:120]
         except Exception:
-            pass
-    return []
+            detail = resp.text[:120]
+        raise MymeetTokenError(403, f"Доступ запрещён (403): {detail}")
+    if resp.status_code == 404:
+        raise MymeetTokenError(404, "Endpoint не найден (404) — проверь версию API")
+    if not resp.ok:
+        raise MymeetTokenError(resp.status_code,
+                               f"Ошибка API: {resp.status_code} {resp.text[:120]}")
+    ws_name = None
+    try:
+        data = resp.json()
+        ws_name = (data.get("workspaceName") or data.get("workspace_name")
+                   or data.get("name") or None)
+    except Exception:
+        pass
+    return {"id": "active", "name": ws_name or "Ваше пространство"}
+
+
+def fetch_workspaces(token: str) -> list:
+    """Compatibility shim: returns a single-element list with the active workspace.
+    Use verify_token_and_get_workspace() for new code."""
+    try:
+        ws = verify_token_and_get_workspace(token)
+        return [ws]
+    except MymeetTokenError:
+        raise
+    except Exception:
+        return []
 
 
 def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None = None) -> list:
@@ -324,7 +369,10 @@ def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None 
 
     meetings, page = [], 0
     while True:
-        url    = f"{MYMEET_BASE}/api/workspaces/{_ws_id}/all-meetings"
+        # Always use the "active" keyword — the API key already determines
+        # which workspace is active.  Stored UUIDs from an older setup are
+        # ignored; they would produce 404 on the correct API version.
+        url    = f"{MYMEET_BASE}/api/workspaces/active/all-meetings"
         params = {"page": page, "perPage": 50, "dateFrom": date_from, "dateTo": date_to}
         resp   = requests.get(url, headers=_mymeet_headers(_token), params=params, timeout=30)
         resp.raise_for_status()

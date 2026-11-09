@@ -47,7 +47,9 @@ from googleapiclient.discovery import build
 import db
 import gtasks
 import auth
-from mymeet_sync import sync_to_sheets_async, fetch_workspaces
+import crypto as _crypto
+from crypto import CryptoDecryptError
+from mymeet_sync import sync_to_sheets_async, fetch_workspaces, verify_token_and_get_workspace, MymeetTokenError
 
 # ─── Логирование ─────────────────────────────────────────────
 logging.basicConfig(
@@ -850,9 +852,10 @@ async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
         await update.message.reply_text(
             "🔧 <b>Настройка MYmeet</b>\n\n"
-            "Шаг 1 из 3: введи свой <b>MYmeet API-токен</b>.\n\n"
+            "Шаг 1 из 2: введи свой <b>MYmeet API-токен</b>.\n\n"
             "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
-            "Токен начинается с <code>mm_</code>",
+            "Токен начинается с <code>mm_</code>\n\n"
+            "⚠️ Сообщение с токеном будет удалено из чата сразу после проверки.",
             parse_mode="HTML",
         )
     except Exception as fatal:
@@ -878,84 +881,76 @@ async def _handle_mymeet_setup(
     step = setup.get("step")
     text = text.strip()
 
-    # Шаг 1: получаем токен и пробуем найти рабочие пространства
+    # Шаг 1: получаем токен и проверяем его через API
     if step == _SETUP_STEP_TOKEN:
         # Токен должен быть ASCII-только (не кириллица) и начинаться с mm_
         is_ascii = all(ord(c) < 128 for c in text)
         if not text.startswith("mm_") or not is_ascii:
             await update.message.reply_text(
                 "❌ Похоже, это не MYmeet API-токен.\n\n"
-                "• Токен должен начинаться с `mm_`\n"
-                "• Только латинские буквы и цифры\n\n"
+                "Токен должен начинаться с <code>mm_</code> и содержать только латинские символы.\n\n"
                 "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
                 "Попробуй ещё раз или введи /cancel чтобы отменить.",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             return True
+
+        # Пытаемся удалить сообщение с токеном из чата (безопасность)
+        try:
+            await update.message.delete()
+        except Exception as del_exc:
+            logger.warning("Не удалось удалить сообщение с токеном: %s", del_exc)
+            # Предупреждаем пользователя, но не блокируем процесс
+            await update.message.reply_text(
+                "⚠️ Не удалось автоматически удалить сообщение с токеном.\n"
+                "Пожалуйста, удали его вручную для безопасности.",
+                parse_mode="HTML",
+            )
 
         msg = await update.message.reply_text("⏳ Проверяю токен...")
         try:
-            workspaces = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: fetch_workspaces(text)
+            ws = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: verify_token_and_get_workspace(text)
             )
-        except Exception:
-            workspaces = []
-
-        if workspaces:
-            if len(workspaces) == 1:
-                # Единственное пространство — берём автоматически
-                ws = workspaces[0]
-                ws_id = ws.get("id") or ws.get("workspaceId") or ws.get("workspace_id") or ""
-                ws_name = ws.get("name") or ws.get("title") or ws_id
-                setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
-                context.user_data["mymeet_setup"] = setup
-                await msg.edit_text(
-                    f"✅ Токен принят! Рабочее пространство: *{ws_name}*\n\n"
-                    f"Шаг 2 из 3: введи *ID Google Таблицы*.\n\n"
-                    f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
-                    f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`\n\n"
-                    f"Не забудь открыть доступ к таблице сервисному аккаунту!",
-                    parse_mode="Markdown",
+        except MymeetTokenError as mte:
+            if mte.status_code == 401:
+                err_text = (
+                    "❌ <b>Неверный API-токен.</b>\n\n"
+                    "Проверь токен в mymeet.ai → Профиль → API-ключ и попробуй ещё раз."
+                )
+            elif mte.status_code == 403:
+                err_text = (
+                    "❌ <b>Доступ к API запрещён (403).</b>\n\n"
+                    "Возможно, у тебя бесплатный тарифный план MYmeet, "
+                    "который не включает API-доступ. Обратись в поддержку mymeet.ai."
                 )
             else:
-                # Несколько — показываем кнопки
-                setup.update({"step": _SETUP_STEP_WS, "token": text})
-                context.user_data["mymeet_setup"] = setup
-                keyboard = []
-                for ws in workspaces[:8]:  # Telegram limit: max ~8 кнопок читаемо
-                    ws_id   = ws.get("id") or ws.get("workspaceId") or ""
-                    ws_name = (ws.get("name") or ws.get("title") or ws_id)[:60]
-                    keyboard.append([InlineKeyboardButton(ws_name, callback_data=f"mymeet_ws:{ws_id}")])
-                await msg.edit_text(
-                    "✅ Токен принят! Выбери рабочее пространство:",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
-        else:
-            # Не смогли загрузить воркспейсы — спрашиваем вручную
-            setup.update({"step": _SETUP_STEP_WS, "token": text})
-            context.user_data["mymeet_setup"] = setup
-            await msg.edit_text(
-                "✅ Токен принят!\n\n"
-                "Шаг 2 из 3: введи *ID рабочего пространства MYmeet*.\n\n"
-                "Где взять: mymeet.ai → URL после `/workspaces/`\n"
-                "Формат: `4e9bb2c4-7382-4c86-903f-…`",
-                parse_mode="Markdown",
-            )
-        return True
-
-    # Шаг 2: рабочее пространство (если вводится вручную)
-    if step == _SETUP_STEP_WS:
-        if len(text) < 5:
-            await update.message.reply_text("❌ Похоже, это не ID рабочего пространства. Попробуй ещё раз.")
+                err_text = f"❌ Ошибка API: {mte}"
+            await msg.edit_text(err_text, parse_mode="HTML")
+            context.user_data.pop("mymeet_setup", None)
             return True
-        setup.update({"step": _SETUP_STEP_SHEET, "ws_id": text})
+        except Exception as net_exc:
+            logger.warning("MYmeet API недоступен при проверке токена: %s", net_exc)
+            await msg.edit_text(
+                "❌ <b>MYmeet API недоступен.</b>\n\n"
+                "Возможно, временные проблемы на стороне сервера. "
+                "Попробуй ещё раз через несколько минут.",
+                parse_mode="HTML",
+            )
+            return True
+
+        # Токен верный — рабочее пространство определяется API-ключом автоматически
+        ws_id = ws.get("id", "active")
+        ws_name = ws.get("name", "Ваше пространство")
+        setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
         context.user_data["mymeet_setup"] = setup
-        await update.message.reply_text(
-            f"✅ Пространство сохранено: `{text}`\n\n"
-            f"Шаг 3 из 3: введи *ID Google Таблицы*.\n\n"
+        await msg.edit_text(
+            f"✅ <b>Токен принят!</b> Рабочее пространство: <b>{ws_name}</b>\n\n"
+            f"Шаг 2 из 2: введи <b>ID Google Таблицы</b>.\n\n"
             f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
-            f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`",
-            parse_mode="Markdown",
+            f"<code>docs.google.com/spreadsheets/d/</code><b>ВОТ_ЭТО</b><code>/edit</code>\n\n"
+            f"Не забудь открыть доступ к таблице сервисному аккаунту!",
+            parse_mode="HTML",
         )
         return True
 
@@ -1010,7 +1005,7 @@ async def _handle_mymeet_ws_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     await query.edit_message_text(
         f"✅ Пространство выбрано: `{ws_id}`\n\n"
-        f"Шаг 3 из 3: введи *ID Google Таблицы*.\n\n"
+        f"Шаг 2 из 2: введи *ID Google Таблицы*.\n\n"
         f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
         f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`",
         parse_mode="Markdown",
@@ -1021,10 +1016,36 @@ async def _handle_mymeet_ws_callback(update: Update, context: ContextTypes.DEFAU
 # ─── MYmeet sync ─────────────────────────────────────────────
 
 def _user_row_to_mymeet_config(user) -> dict | None:
-    """Преобразует строку users в user_config для sync_to_sheets_async."""
+    """Преобразует строку users в user_config для sync_to_sheets_async.
+
+    Расшифровывает mymeet_token перед возвратом.
+    Если токен не удаётся расшифровать — возвращает None и логирует
+    предупреждение (без раскрытия токена).
+    """
     if not user or not user["mymeet_setup_done"]:
         return None
-    return dict(user)  # sqlite3.Row → dict
+    raw_token = user["mymeet_token"]
+    if not raw_token:
+        return None
+    try:
+        if _crypto.is_encrypted(raw_token):
+            token = _crypto.decrypt_token(raw_token)
+        else:
+            # Незашифрованный токен (устаревшие данные) — пропускаем
+            logger.warning(
+                "_user_row_to_mymeet_config: незашифрованный токен для "
+                "telegram_id=%s — требуется /setup_mymeet", user["telegram_id"]
+            )
+            return None
+    except CryptoDecryptError:
+        logger.error(
+            "_user_row_to_mymeet_config: не удалось расшифровать токен для "
+            "telegram_id=%s — требуется /setup_mymeet", user["telegram_id"]
+        )
+        return None
+    cfg = dict(user)
+    cfg["mymeet_token"] = token
+    return cfg
 
 
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -1,0 +1,69 @@
+name: "✨ Feature Request"
+description: "Новая функциональность или улучшение"
+title: "[FEAT] "
+labels: ["type: feature", "status: new"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Заполни все обязательные поля. Неполные Issues будут возвращены на доработку.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Краткое описание"
+      description: "Что нужно сделать и зачем (1–3 предложения)"
+      placeholder: "Пользователь должен мочь..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: "Мотивация / Проблема"
+      description: "Какую проблему решает эта функция?"
+      placeholder: "Сейчас бот не умеет... из-за чего пользователь вынужден..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: "Критерии приёмки (Acceptance Criteria)"
+      description: "Когда задача считается выполненной? Используй формат Given/When/Then или чеклист."
+      placeholder: |
+        - [ ] Команда /example работает
+        - [ ] Ответ приходит за < 3 сек
+        - [ ] Ошибка обрабатывается gracefully
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: "Вне рамок (Out of scope)"
+      description: "Что явно НЕ входит в эту задачу"
+      placeholder: "Не включает интеграцию с X..."
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: "Приоритет"
+      options:
+        - "🔴 Critical"
+        - "🟠 High"
+        - "🟡 Medium"
+        - "🟢 Low"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "Чеклист перед созданием"
+      options:
+        - label: "Issue не дублирует существующий"
+          required: true
+        - label: "Критерии приёмки заполнены"
+          required: true

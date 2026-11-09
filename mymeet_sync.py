@@ -206,13 +206,13 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
             }
         })
 
-    # Column G (mtg_id) — narrow internal column
+    # Column G (mtg_id) — hidden internal column
     requests.append({
         "updateDimensionProperties": {
             "range": {"sheetId": sid, "dimension": "COLUMNS",
                        "startIndex": 6, "endIndex": 7},
-            "properties": {"pixelSize": MTG_ID_COL_PX},
-            "fields": "pixelSize",
+            "properties": {"pixelSize": MTG_ID_COL_PX, "hiddenByUser": True},
+            "fields": "pixelSize,hiddenByUser",
         }
     })
     fmt_warnings: list[str] = []
@@ -284,10 +284,6 @@ def _run_key(meeting_id: str, date: str, task: str, assignee: str) -> str:
     in two different meetings (different meeting_id → different run_key).
     """
     return f"{meeting_id}|{date}|{task.lower().strip()}|{assignee.lower().strip()}"
-
-# Keep old name as alias for callers not yet updated (will be removed in a future cleanup).
-def _batch_format_freeze(spreadsheet, ws, num_cols: int = 6) -> None:
-    all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=0))
 
 
 # ── MYmeet API ────────────────────────────────────────────────────────────────
@@ -592,17 +588,18 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             ws = spreadsheet.worksheet(sheet_name)
             if not append:
+                # Read existing data BEFORE clearing so we can restore manual statuses.
+                try:
+                    existing_full: list = _gs_call(ws.get_all_values)
+                except Exception:
+                    existing_full = []
                 _gs_call(ws.clear)
         except gspread.WorksheetNotFound:
             ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
+            existing_full = []
 
         if not append:
             # Full overwrite: preserve manually-set statuses from existing sheet.
-            # Read existing data first; build key→status map to restore manual edits.
-            try:
-                existing_full = _gs_call(ws.get_all_values)
-            except Exception:
-                existing_full = []
             manual_statuses: dict[str, str] = {}
             for _row in (existing_full[1:] if existing_full else []):
                 _k = _task_key(_row)
@@ -658,7 +655,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     seen_in_run_app.add(rkey)
                     key = _task_key([
                         None, m["date"], task["name"], task["assignee"],
-                        task["deadline"], None,
+                        task["deadline"], None, m["id"],
                     ])
                     if key and key in ex_keys:
                         continue   # already present — preserve any manual status edits
@@ -689,17 +686,32 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     try:
         ws = spreadsheet.worksheet(ot_name)
         if not append:
+            # Read BEFORE clear to preserve manually-set statuses.
+            try:
+                existing_ot_before: list = _gs_call(ws.get_all_values)
+            except Exception:
+                existing_ot_before = []
             _gs_call(ws.clear)
+        else:
+            existing_ot_before = []
     except gspread.WorksheetNotFound:
         ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
+        existing_ot_before = []
 
     if not append:
         start_idx = 1
         start_row = 2
         new_sheet  = True
         existing_ot: list = []
+        # Restore manual statuses from before-clear snapshot
+        manual_statuses_ot: dict[str, str] = {}
+        for _row in (existing_ot_before[1:] if existing_ot_before else []):
+            _k = _task_key(_row)
+            if _k and len(_row) >= 6 and str(_row[5]).strip():
+                manual_statuses_ot[_k] = str(_row[5]).strip()
     else:
         existing_ot = _gs_call(ws.get_all_values)
+        manual_statuses_ot = {}
         if not existing_ot:
             start_idx = 1
             start_row = 2
@@ -735,7 +747,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                 continue   # intra-run duplicate
             seen_in_run_ot.add(rkey)
             if append and existing_ot:
-                key = _task_key([None, m["date"], task["name"], task["assignee"], None, None])
+                key = _task_key([None, m["date"], task["name"], task["assignee"], None, None, m["id"]])
                 if key and key in ex_keys_ot:
                     continue  # skip — already in sheet, status may have been edited manually
             new_tasks.append(task)
@@ -747,13 +759,18 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         grouper_rel_positions.append(len(all_rows))
         all_rows.append([label, "", "", "", "", "", ""])
         for task in new_tasks:
+            tkey_ot = _task_key([None, m["date"], task["name"], task["assignee"],
+                                  task["deadline"], None, m["id"]])
+            status_ot = (manual_statuses_ot.get(tkey_ot) if not append else None) or (
+                "Выполнено" if task["done"] else "Требует верификации"
+            )
             all_rows.append([
                 idx,
                 m["date"],
                 task["name"],
                 task["assignee"],
                 task["deadline"],
-                "Выполнено" if task["done"] else "Требует верификации",
+                status_ot,
                 m["id"],
             ])
             idx += 1
@@ -761,7 +778,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     if new_sheet:
         write_data = [HEADER_ROW] + all_rows
         if write_data:
-            _gs_call(ws.update, f"A1:F{len(write_data)}", write_data)
+            _gs_call(ws.update, f"A1:G{len(write_data)}", write_data)
         all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(all_rows)))
     elif all_rows:
         _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(all_rows)}", all_rows)

@@ -118,7 +118,7 @@ NEW → ANALYSIS → ARCHITECTURE → APPROVAL → READY → DEVELOPMENT → QA 
 | Провести Code Review              | I   | A/R | I   | C   | I   | C   |
 | Провести QA / Security check      | I   | C   | I   | I   | I   | A/R |
 | Принять задачу (DONE)             | A/R | C   | I   | I   | I   | C   |
-| **Смержить PR (финальное решение)**| **A/R** | **R (рекомендует)** | I | I | I | I |
+| **Смержить PR (финальное решение)**| **A** | **R** | I | I | I | I |
 
 > **A** = Accountable (отвечает), **R** = Responsible (выполняет), **C** = Consulted, **I** = Informed
 >

@@ -549,7 +549,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎙 «Добавь ссылки на телемост»\n\n"
             "Ссылки Телемост добавляются автоматически каждые 3 часа.\n\n"
             "/settings — настройки  |  /disconnect — отключить Google\n"
-            "/setname Имя Фамилия — ФИО для листа «Мои задачи» в таблице MYmeet",
+            "/setname Имя Фамилия — ФИО для листа «Мои задачи — Имя Фамилия» в таблице MYmeet",
             parse_mode="Markdown",
         )
     else:
@@ -594,11 +594,11 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕐 Рабочее время: {_work_start(user)}:00 — {_work_end(user)}:00\n"
         f"🌍 Часовой пояс: {user['timezone'] or DEFAULT_TZ}\n"
         f"📅 Календарь: {user['calendar_id'] or 'primary'}\n"
-        f"👤 ФИО для «Мои задачи»: {_user_full_name(user) or 'не указано'}\n\n"
+        f"👤 ФИО для листа «Мои задачи — ФИО»: {_user_full_name(user) or 'не указано'}\n\n"
         f"Команды:\n"
         f"`/settz Europe/Saratov` — изменить часовой пояс\n"
         f"`/sethours 9 18` — изменить рабочие часы\n"
-        f"`/setname Имя Фамилия` — ФИО для листа «Мои задачи»",
+        f"`/setname Имя Фамилия` — ФИО для листа «Мои задачи — Имя Фамилия»",
         parse_mode="Markdown",
     )
 
@@ -638,9 +638,11 @@ async def cmd_setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     db.upsert_user(telegram_id, update.effective_user.username)
     hint = (
-        "Лист «Мои задачи» в вашей таблице MYmeet собирает задачи, где "
+        "Лист «Мои задачи — <ваше ФИО>» (например, «Мои задачи — Иван Петров») "
+        "в вашей таблице MYmeet собирает задачи, где "
         "«Ответственный» совпадает с этим ФИО (без учёта регистра и пробелов; "
         "только имя или только фамилия не подходят).\n"
+        "У каждого пользователя общей таблицы — свой лист. "
         "Лист обновляется при каждой синхронизации и только для чтения: "
         "статус задачи меняйте в листе протокола встречи."
     )

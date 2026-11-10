@@ -793,7 +793,7 @@ def test_sync_without_full_name_no_my_tasks_sheet():
         res = mod.sync_to_sheets(days=1, append=append,
                                  user_config={"gcal_organizer_data": _GCAL,
                                               "mymeet_spreadsheet_id": "x"})
-        assert "Мои задачи" not in created, created
+        assert not any(t.startswith("Мои задачи") for t in created), created
         assert "/setname" in res, res
         # не читаем данные листов целиком без ФИО
         for c in ss.values_batch_get.call_args_list:
@@ -831,8 +831,8 @@ def test_sync_with_full_name_writes_my_tasks():
                              user_config={"gcal_organizer_data": _GCAL,
                                           "mymeet_spreadsheet_id": "x",
                                           "mymeet_full_name": "иван петров"})
-    assert "Мои задачи" in created, created
-    ws = created["Мои задачи"]
+    assert "Мои задачи — иван петров" in created, created
+    ws = created["Мои задачи — иван петров"]
     upd = ws.update.call_args
     data = upd.kwargs["values"]
     assert data[0] == ["№", "Дата", "Совещание", "Задача", "Ответственный",
@@ -856,13 +856,13 @@ def test_sync_with_full_name_writes_my_tasks():
     targets = {(g["sheetId"], g["startColumnIndex"]) for g in colors}
     assert targets == {(1, 5), (ws.id, 6)}, targets   # «Заметки» не трогаем
     assert len(colors) == 10
-    assert "Мои задачи: 1 задач" in res, res
+    assert "«Мои задачи — иван петров»: 1 задач" in res, res
 
 
 def test_sync_my_tasks_name_collision_skipped():
-    """Если «Мои задачи» — протокол встречи с таким названием, шаг пропускается."""
+    """Если «Мои задачи — ФИО» — протокол встречи с таким названием, шаг пропускается."""
     mod = _load_mymeet()
-    meta = {"sheets": [{"properties": {"sheetId": 3, "title": "Мои задачи"}}]}
+    meta = {"sheets": [{"properties": {"sheetId": 3, "title": "Мои задачи — Иван Петров"}}]}
     values = [{"values": [_PROTO_HDR,
                           ["1", "10.01.2024", "X", "Иван Петров", "", "В работе", "m1"]]}]
     ss, created = _mock_sync_env(mod, meta=meta, values=values)
@@ -874,8 +874,10 @@ def test_sync_my_tasks_name_collision_skipped():
                                           "mymeet_spreadsheet_id": "x",
                                           "mymeet_full_name": "Иван Петров"})
     assert "занят протоколом" in res, res
-    assert not any(c.args and c.args[0] == "Мои задачи"
+    assert not any(c.args and c.args[0] == "Мои задачи — Иван Петров"
                    for c in ss.worksheet.call_args_list), ss.worksheet.call_args_list
+    assert not any(c.kwargs.get("title", "").startswith("Мои задачи")
+                   for c in ss.add_worksheet.call_args_list)
 
 
 def _load_db(tmpdir):
@@ -937,6 +939,265 @@ def test_validate_full_name():
     assert v("Иван " + "П" * 100)[0] is None
 
 
+# ── Review fixes (#15): open-ended colour ranges, safe write, per-user sheets, dedup ──
+
+def test_status_color_rules_open_ended_and_legacy_removed():
+    """Нет endRowIndex в add-правилах; startRowIndex=1 и колонка статуса;
+    старое правило с endRowIndex=10000 распознаётся как наше и удаляется."""
+    mod = _load_mymeet()
+    assert not hasattr(mod, "STATUS_COLOR_RULES_END_ROW")
+    legacy = _our_rule(mod, 7, 5, "В работе")
+    assert legacy["ranges"][0]["endRowIndex"] == 10000
+    assert mod._is_our_status_rule(legacy, 7, 5)
+    meta = {"sheets": [{"properties": {"sheetId": 7, "title": "Планёрка"},
+                        "conditionalFormats": [legacy]}]}
+    reqs = mod._status_color_requests(meta, {7: 5, 9: 6})
+    assert reqs[0] == {"deleteConditionalFormatRule": {"sheetId": 7, "index": 0}}
+    adds = [r["addConditionalFormatRule"]["rule"] for r in reqs
+            if "addConditionalFormatRule" in r]
+    assert len(adds) == 10
+    for a in adds:
+        g = a["ranges"][0]
+        assert "endRowIndex" not in g, g
+        assert g["startRowIndex"] == 1
+        assert g["endColumnIndex"] == g["startColumnIndex"] + 1
+    assert {(a["ranges"][0]["sheetId"], a["ranges"][0]["startColumnIndex"]) for a in adds} \
+        == {(7, 5), (9, 6)}
+    # Новые правила тоже распознаются как наши (повторный прогон их удалит)
+    assert all(mod._is_our_status_rule(a, a["ranges"][0]["sheetId"],
+                                       a["ranges"][0]["startColumnIndex"]) for a in adds)
+    state = {7: [legacy]}
+    _apply_cf_requests(state, reqs)
+    assert legacy not in state[7] and len(state[7]) == 5
+
+
+def _fake_ws(title, rows=1000, cols=10, sid=0):
+    from unittest.mock import MagicMock
+    w = MagicMock()
+    w.id = sid
+    w.title = title
+    w.row_count = rows
+    w.col_count = cols
+    return w
+
+
+def test_write_my_tasks_update_failure_keeps_old_data():
+    """(a) Ошибка ws.update: clear/batch_clear не вызываются, sync не падает → warning."""
+    from unittest.mock import MagicMock
+    mod = _load_mymeet()
+    title = "Мои задачи — Иван Петров"
+    ss = MagicMock()
+    ws = _fake_ws(title, sid=11)
+    ws.update.side_effect = RuntimeError("quota-boom")
+    ss.worksheet.return_value = ws
+    ss.fetch_sheet_metadata.return_value = {"sheets": [
+        {"properties": {"sheetId": 1, "title": "Планёрка"}},
+        {"properties": {"sheetId": 11, "title": title}},
+    ]}
+    ss.values_batch_get.return_value = {"valueRanges": [
+        {"values": [_PROTO_HDR, ["1", "10.01.2024", "Отчёт", "Иван Петров", "", "В работе", "m1"]]},
+        {"values": [mod.MY_TASKS_HEADER_ROW[:7], ["1", "01.01.2024", "Совещ", "Стар", "Иван Петров"]]},
+    ]}
+    warnings, count, my_title = mod._sync_my_tasks_and_colors(ss, "Иван Петров")
+    assert my_title == title
+    assert count is None
+    assert ws.update.called
+    assert not ws.clear.called
+    assert not ws.batch_clear.called
+    assert any("quota-boom" in w for w in warnings), warnings
+
+
+def test_write_my_tasks_update_before_tail_clear():
+    """(b) update раньше очистки хвоста; хвост начинается со строки n+1.
+    (c) повторный прогон с меньшим числом строк чистит хвост, без дублей."""
+    from unittest.mock import MagicMock
+    mod = _load_mymeet()
+    title = "Мои задачи — Иван Петров"
+    ss = MagicMock()
+    ws = _fake_ws(title, rows=1000, sid=11)
+    order = []
+    ws.update.side_effect = lambda **kw: order.append(("update", kw["range_name"]))
+    ws.batch_clear.side_effect = lambda ranges: order.append(("batch_clear", list(ranges)))
+    ss.worksheet.return_value = ws
+    rows3 = [[None, "10.01.2024", "П", f"Задача {i}", "Иван Петров", "", "В работе", f"m{i}"]
+             for i in range(3)]
+    w = []
+    mod._write_my_tasks_sheet(ss, title, True, [list(r) for r in rows3], w)
+    assert order[0] == ("update", "A1:H4"), order
+    assert order[1] == ("batch_clear", ["A5:H1000"]), order
+    assert not ws.clear.called
+    # (c) повтор с 1 строкой
+    order.clear()
+    mod._write_my_tasks_sheet(ss, title, True, [list(rows3[0])], w)
+    assert order == [("update", "A1:H2"), ("batch_clear", ["A3:H1000"])], order
+    data = ws.update.call_args.kwargs["values"]
+    assert len(data) == 2 and data[1][3] == "Задача 0"
+    # Ошибка очистки хвоста — только предупреждение, данные уже записаны
+    ws.batch_clear.side_effect = RuntimeError("clear-boom")
+    w2 = []
+    mod._write_my_tasks_sheet(ss, title, True, [list(rows3[0])], w2)
+    assert any("clear-boom" in x for x in w2), w2
+    # Лист, где строк ровно n: хвост не чистится (нет выхода за пределы сетки)
+    ws_small = _fake_ws(title, rows=2, sid=12)
+    ss.worksheet.return_value = ws_small
+    mod._write_my_tasks_sheet(ss, title, True, [list(rows3[0])], [])
+    assert ws_small.update.called and not ws_small.batch_clear.called
+
+
+class _FakeBook:
+    """Stateful MagicMock-based spreadsheet: metadata/values reflect writes."""
+
+    def __init__(self, sheets):
+        from unittest.mock import MagicMock
+        self.data = {}           # title -> rows
+        self.ws = {}             # title -> MagicMock worksheet
+        self.ss = MagicMock()
+        for i, (t, rows) in enumerate(sheets.items(), 1):
+            self._new(t, i, rows)
+        self.ss.fetch_sheet_metadata.side_effect = lambda params=None: {"sheets": [
+            {"properties": {"sheetId": w.id, "title": t}} for t, w in self.ws.items()]}
+        self.ss.values_batch_get.side_effect = self._batch_get
+        self.ss.worksheet.side_effect = lambda t: self.ws[t]
+        self.ss.add_worksheet.side_effect = (
+            lambda title, rows, cols: self._new(title, 100 + len(self.ws), []))
+
+    def _new(self, title, sid, rows):
+        w = _fake_ws(title, sid=sid)
+        self.data[title] = [list(r) for r in rows]
+
+        def _upd(values, range_name):
+            self.data[title] = [list(r) for r in values]
+        w.update.side_effect = _upd
+        self.ws[title] = w
+        return w
+
+    def _batch_get(self, ranges):
+        out = []
+        for r in ranges:
+            t = r.rsplit("!", 1)[0][1:-1].replace("''", "'")
+            out.append({"values": [row[:7] for row in self.data[t]]})
+        return {"valueRanges": out}
+
+
+def test_my_tasks_two_users_shared_spreadsheet():
+    """Два пользователя на одной таблице: у каждого свой лист, чужой не трогается."""
+    mod = _load_mymeet()
+    book = _FakeBook({
+        "Планёрка": [
+            _PROTO_HDR,
+            ["1", "10.01.2024", "Отчёт", "Иван Петров", "", "В работе", "m1"],
+            ["2", "10.01.2024", "Бюджет", "Анна Смирнова", "", "В работе", "m1"],
+        ],
+        "Разовые встречи": [
+            _PROTO_HDR,
+            ["Стратсессия  (12.01.2024)"],
+            ["1", "12.01.2024", "План", "анна смирнова", "", "Просрочено", "m2"],
+        ],
+    })
+    a_title, b_title = "Мои задачи — Иван Петров", "Мои задачи — Анна Смирнова"
+    w, cnt, t = mod._sync_my_tasks_and_colors(book.ss, "Иван Петров")
+    assert t == a_title and cnt == 1, (t, cnt, w)
+    assert set(book.ws) == {"Планёрка", "Разовые встречи", a_title}
+    ws_a = book.ws[a_title]
+    assert [r[3] for r in book.data[a_title][1:]] == ["Отчёт"]
+    upd_a, clr_a, bclr_a = (ws_a.update.call_count, ws_a.clear.call_count,
+                            ws_a.batch_clear.call_count)
+
+    w, cnt, t = mod._sync_my_tasks_and_colors(book.ss, "Анна Смирнова")
+    assert t == b_title and cnt == 2, (t, cnt, w)
+    assert set(book.ws) == {"Планёрка", "Разовые встречи", a_title, b_title}
+    # лист A не перезаписан и не очищен
+    assert ws_a.update.call_count == upd_a
+    assert ws_a.clear.call_count == clr_a and ws_a.batch_clear.call_count == bclr_a
+    assert not any(c.args and c.args[0] == a_title for c in book.ss.worksheet.call_args_list)
+    assert [r[3] for r in book.data[a_title][1:]] == ["Отчёт"]
+    assert sorted(r[3] for r in book.data[b_title][1:]) == ["Бюджет", "План"]
+    assert all(mod._norm_person(r[4]) == mod._norm_person("Анна Смирнова")
+               for r in book.data[b_title][1:])
+    # цвета ставятся и на чужой лист «Мои задачи — …» (колонка G), и на протоколы
+    reqs = book.ss.batch_update.call_args_list[-1].args[0]["requests"]
+    targets = {(r["addConditionalFormatRule"]["rule"]["ranges"][0]["sheetId"],
+                r["addConditionalFormatRule"]["rule"]["ranges"][0]["startColumnIndex"])
+               for r in reqs if "addConditionalFormatRule" in r}
+    assert targets == {(book.ws["Планёрка"].id, 5), (book.ws["Разовые встречи"].id, 5),
+                       (ws_a.id, 6), (book.ws[b_title].id, 6)}, targets
+    # Повторная синхронизация A пишет только лист A
+    ws_b = book.ws[b_title]
+    upd_b, clr_b, bclr_b = ws_b.update.call_count, ws_b.clear.call_count, \
+        ws_b.batch_clear.call_count
+    mod._sync_my_tasks_and_colors(book.ss, "Иван Петров")
+    assert ws_b.update.call_count == upd_b
+    assert ws_b.clear.call_count == clr_b and ws_b.batch_clear.call_count == bclr_b
+    assert [r[3] for r in book.data[a_title][1:]] == ["Отчёт"]
+
+
+def test_my_tasks_same_name_different_case_reuses_sheet():
+    """Одно ФИО в разном регистре/пробелах → один и тот же лист."""
+    mod = _load_mymeet()
+    book = _FakeBook({"Планёрка": [
+        _PROTO_HDR, ["1", "10.01.2024", "Отчёт", "Иван Петров", "", "В работе", "m1"]]})
+    _, _, t1 = mod._sync_my_tasks_and_colors(book.ss, "Иван Петров")
+    _, cnt, t2 = mod._sync_my_tasks_and_colors(book.ss, "  иван   ПЕТРОВ ")
+    assert t1 == t2 == "Мои задачи — Иван Петров", (t1, t2)
+    assert cnt == 1
+    assert sum(1 for t in book.ws if t.startswith("Мои задачи")) == 1, list(book.ws)
+    assert book.ss.add_worksheet.call_count == 1
+    # Нормализация имени: пробелы схлопнуты, регистр как ввёл пользователь
+    assert mod._my_tasks_sheet_title("  иван   ПЕТРОВ ") == "Мои задачи — иван ПЕТРОВ"
+    # Выбор среди существующих детерминирован
+    r = mod._resolve_my_tasks_title(["Мои задачи — иван петров", "Мои задачи — ИВАН ПЕТРОВ"],
+                                    "Иван Петров")
+    assert r == "Мои задачи — ИВАН ПЕТРОВ"
+    assert mod._resolve_my_tasks_title(["Мои задачи — Иван Петров", "Мои задачи — иван петров"],
+                                       "иван петров") == "Мои задачи — иван петров"
+    # Другое ФИО не переиспользует чужой лист
+    assert mod._resolve_my_tasks_title(["Мои задачи — Иван Петров"], "Иван Петрович") \
+        == "Мои задачи — Иван Петрович"
+
+
+def test_my_tasks_long_name_title_limit():
+    """Длинное ФИО → имя листа ≤100 символов, детерминированно."""
+    mod = _load_mymeet()
+    name = "Анна-Мария " + "Салтыкова-Щедрина " * 6
+    t = mod._my_tasks_sheet_title(name)
+    assert len(t) <= 100, len(t)
+    assert t.startswith("Мои задачи — Анна-Мария")
+    assert t == mod._my_tasks_sheet_title(name) == mod._my_tasks_sheet_title("  " + name)
+    assert t == t.strip()
+
+
+def test_build_my_tasks_rows_one_time_dedup_without_mtg_id():
+    """Без mtg_id: две разные разовые встречи одного дня → 2 строки; реальный дубль → 1."""
+    mod = _load_mymeet()
+    sheets = {"Разовые встречи": [
+        _PROTO_HDR,
+        ["Стратсессия  (12.01.2024)"],
+        ["1", "12.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+        ["Ретро  (12.01.2024)", "", "", "", "", "", ""],
+        ["1", "12.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+    ]}
+    rows = mod._build_my_tasks_rows(sheets, "Иван Петров")
+    assert len(rows) == 2, rows
+    assert sorted(r[2] for r in rows) == ["Ретро", "Стратсессия"], rows
+    # Дубль внутри одного группировщика
+    dup = {"Разовые встречи": [
+        _PROTO_HDR,
+        ["Стратсессия  (12.01.2024)"],
+        ["1", "12.01.2024", "Сделать X", "Иван Петров", "", "Требует верификации", ""],
+        ["2", "12.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+    ]}
+    rows = mod._build_my_tasks_rows(dup, "Иван Петров")
+    assert len(rows) == 1 and rows[0][2] == "Стратсессия" and rows[0][6] == "В работе", rows
+    # Лист повторяющейся встречи без mtg_id: одна дата = одна встреча → 1 строка
+    rec = {"Планёрка": [
+        _PROTO_HDR,
+        ["1", "10.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+        ["2", "10.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+        ["3", "17.01.2024", "Сделать X", "Иван Петров", "", "В работе", ""],
+    ]}
+    assert len(mod._build_my_tasks_rows(rec, "Иван Петров")) == 2
+
+
 if __name__ == "__main__":
     tests = [
         (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
@@ -972,6 +1233,13 @@ if __name__ == "__main__":
         (test_sync_my_tasks_name_collision_skipped, "коллизия имени листа — пропуск"),
         (test_db_full_name_migration_and_reset,   "db: миграция ФИО, reset не стирает"),
         (test_validate_full_name,                 "/setname: валидация ФИО"),
+        (test_status_color_rules_open_ended_and_legacy_removed, "цвета: без endRowIndex, старые удаляются"),
+        (test_write_my_tasks_update_failure_keeps_old_data, "ошибка update — старые данные целы"),
+        (test_write_my_tasks_update_before_tail_clear, "update до очистки хвоста, без дублей"),
+        (test_my_tasks_two_users_shared_spreadsheet, "два пользователя — разные листы"),
+        (test_my_tasks_same_name_different_case_reuses_sheet, "ФИО в другом регистре — тот же лист"),
+        (test_my_tasks_long_name_title_limit,     "длинное ФИО — имя листа ≤100"),
+        (test_build_my_tasks_rows_one_time_dedup_without_mtg_id, "дедуп без mtg_id по встрече"),
     ]
     failed = []
     for fn, label in tests:

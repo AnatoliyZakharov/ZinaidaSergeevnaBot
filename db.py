@@ -362,7 +362,12 @@ def save_mymeet_config(
             WHERE telegram_id = ?
         """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
         if cur.rowcount == 0:
-            # Пользователь не найден — вставляем (гонка или первый вход без upsert_user)
+            # Страховка: UPDATE не нашёл строку (редкий edge-case — гонка или
+            # cmd_setup_mymeet не вызвал upsert_user перед этим).
+            # INSERT ... ON CONFLICT DO UPDATE задаёт ТОЛЬКО mymeet_*-поля
+            # и никогда не трогает google_*, telemost_token и другие данные
+            # пользователя. Если строка существует (гонка) — сработает
+            # ON CONFLICT DO UPDATE и затронет только mymeet_* колонки.
             conn.execute("""
                 INSERT INTO users (
                     telegram_id, mymeet_token, mymeet_ws_id,

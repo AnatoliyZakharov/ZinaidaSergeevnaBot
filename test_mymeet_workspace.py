@@ -638,10 +638,13 @@ class TestMymeetSetupTwoStep:
             )
 
         assert result is True
-        # Пользователь получил сообщение об ошибке
+        # Пользователь получил понятное сообщение — без внутренних деталей
         reply_text = str(mock_message.reply_text.call_args)
         assert "❌" in reply_text
-        assert "RuntimeError" in reply_text or "Ошибка" in reply_text
+        assert "Не удалось сохранить" in reply_text or "setup_mymeet" in reply_text
+        # Технические детали (тип исключения) НЕ должны попасть пользователю
+        assert "RuntimeError" not in reply_text
+        assert "Traceback" not in reply_text
 
     # ------------------------------------------------------------------ шаг 2 — устаревшая сессия
 
@@ -703,6 +706,49 @@ class TestMymeetSetupTwoStep:
             assert len(sid) < 20, f"Тест неправильный: {sid!r} длиннее 20"
 
     # ------------------------------------------------------------------ проверка saved = 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_save_does_not_wipe_google_tokens(self, tmp_path, monkeypatch):
+        """Повторный /setup_mymeet не затирает Google-токены пользователя."""
+        import sys, sqlite3
+        db_path = tmp_path / "resave_test.db"
+        monkeypatch.setenv("DB_PATH", str(db_path))
+        if "db" in sys.modules:
+            del sys.modules["db"]
+        import db as db_mod2
+        db_mod2.init_db()
+        db_mod2.upsert_user(44332211, "resaveuser")
+        # Имитируем подключённый Google-аккаунт (записываем напрямую)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE users SET google_access_token=?, google_refresh_token=? WHERE telegram_id=?",
+            ("access_tok_xyz", "refresh_tok_xyz", 44332211)
+        )
+        conn.commit(); conn.close()
+
+        # Первое сохранение MYmeet-конфига
+        db_mod2.save_mymeet_config(
+            telegram_id=44332211,
+            token=_mk_tok("first_token_12345678901"),
+            ws_id="active",
+            spreadsheet_id="X" * 44,
+        )
+        # Повторное сохранение (пересетап — другой токен и таблица)
+        db_mod2.save_mymeet_config(
+            telegram_id=44332211,
+            token=_mk_tok("second_token_123456789"),
+            ws_id="active",
+            spreadsheet_id="Y" * 44,
+        )
+
+        user = db_mod2.get_user(44332211)
+        # Google-токены сохранились
+        assert user["google_access_token"] == "access_tok_xyz", "Google access token затёрт!"
+        assert user["google_refresh_token"] == "refresh_tok_xyz", "Google refresh token затёрт!"
+        # MYmeet-конфиг обновился на новый
+        assert user["mymeet_setup_done"] == 1
+        import crypto
+        assert crypto.is_encrypted(user["mymeet_token"])
 
     @pytest.mark.asyncio
     async def test_step2_setup_done_flag_set_in_db(self, db_mod):

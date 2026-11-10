@@ -987,10 +987,15 @@ async def _handle_mymeet_setup(
                 organizer_email=None,  # определяется через organizer.self в Google Calendar
             )
         except Exception as _save_exc:
-            logger.error("save_mymeet_config failed: %s", _save_exc, exc_info=True)
+            # Логируем технические детали (без токена и ключей) — пользователю не показываем
+            logger.error(
+                "save_mymeet_config failed for telegram_id=%s: %s",
+                telegram_id, _save_exc, exc_info=True,
+            )
             await update.message.reply_text(
-                f"❌ Ошибка при сохранении настроек:\n<code>{type(_save_exc).__name__}: {_save_exc}</code>\n\nСообщи разработчику.",
-                parse_mode="HTML",
+                "❌ Не удалось сохранить настройки MYmeet.\n\n"
+                "Попробуй ещё раз: /setup_mymeet\n"
+                "Если ошибка повторяется — обратись к разработчику."
             )
             return True
         context.user_data.pop("mymeet_setup", None)

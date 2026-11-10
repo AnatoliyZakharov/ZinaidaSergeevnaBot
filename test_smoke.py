@@ -1198,6 +1198,295 @@ def test_build_my_tasks_rows_one_time_dedup_without_mtg_id():
     assert len(mod._build_my_tasks_rows(rec, "Иван Петров")) == 2
 
 
+# ── Blocker fix (#15): «Мои задачи» из всех встреч, не только организаторских ──
+
+class _SyncBook(_FakeBook):
+    """_FakeBook для полного sync_to_sheets: get_all_values/clear/update по
+    диапазону, batch_clear хвоста, чтение A:G / A:H / A1:G1, WorksheetNotFound."""
+
+    def __init__(self, sheets):
+        super().__init__(sheets)
+        import gspread
+
+        def _get(t):
+            if t not in self.ws:
+                raise gspread.WorksheetNotFound(t)
+            return self.ws[t]
+        self.ss.worksheet.side_effect = _get
+
+    def _new(self, title, sid, rows):
+        import re
+        w = _fake_ws(title, sid=sid)
+        self.data[title] = [list(r) for r in rows]
+
+        def _upd(*args, **kw):
+            if kw:
+                values, rng = kw["values"], kw["range_name"]
+            else:
+                rng, values = args
+            start = int(re.match(r"[A-Z]+(\d+)", rng).group(1)) - 1
+            d = self.data[title]
+            while len(d) < start:
+                d.append([])
+            for i, row in enumerate(values):
+                if start + i < len(d):
+                    d[start + i] = list(row)
+                else:
+                    d.append(list(row))
+
+        def _bclear(ranges):
+            start = int(re.match(r"[A-Z]+(\d+)", ranges[0]).group(1)) - 1
+            del self.data[title][start:]
+
+        def _clear():
+            self.data[title] = []
+        w.update.side_effect = _upd
+        w.batch_clear.side_effect = _bclear
+        w.clear.side_effect = _clear
+        w.get_all_values.side_effect = lambda: [list(r) for r in self.data[title]]
+        self.ws[title] = w
+        return w
+
+    def _batch_get(self, ranges):
+        out = []
+        for r in ranges:
+            t, rng = r.rsplit("!", 1)
+            t = t[1:-1].replace("''", "'")
+            rows = self.data[t]
+            if rng == "A1:G1":
+                rows = rows[:1]
+            width = 8 if rng.endswith("H") else 7
+            out.append({"values": [list(row[:width]) for row in rows]})
+        return {"valueRanges": out}
+
+
+_ME = "Иван Петров"
+_MY_SHEET = "Мои задачи — Иван Петров"
+
+
+def _proto(*tasks):
+    return {"followup_v2": {"templates": [{"entities": [{
+        "name": "tasks",
+        "html_text": [{"task": t, "assignee": {"speaker": a}, "deadline": d, "done": done}
+                      for t, a, d, done in tasks],
+    }]}]}}
+
+
+def _two_meetings():
+    from datetime import datetime, timedelta, timezone
+    start = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m_org = {"id": "m_org", "name": "Стратсессия", "startTime": start,
+             "calendarEventId": "ev1"}
+    m_other = {"id": "m_other", "name": "Планёрка отдела", "startTime": start,
+               "calendarEventId": "ev_foreign"}
+    return m_org, m_other
+
+
+def _run_full_sync(mod, book, meetings, protocols, full_name=_ME, append=False):
+    """sync_to_sheets на моках; protocols: {mid: dict | Exception}."""
+    from unittest.mock import MagicMock
+
+    def _fp(mid, token=None):
+        p = protocols.get(mid)
+        if isinstance(p, Exception):
+            raise p
+        return p
+    mod._fetch_meetings = lambda **kw: list(meetings)
+    mod._fetch_protocol = MagicMock(side_effect=_fp)
+    mod._throttle = lambda: None      # моки: лимитер записи Sheets не нужен (без sleep)
+    gc = MagicMock()
+    gc.open_by_key.return_value = book.ss
+    mod._gs_client = lambda: gc
+    cfg = {"gcal_organizer_data": {"ids": {"ev1"}, "times": set()},
+           "mymeet_spreadsheet_id": "x"}
+    if full_name:
+        cfg["mymeet_full_name"] = full_name
+    return mod.sync_to_sheets(days=1, append=append, user_config=cfg)
+
+
+def _my_rows(book):
+    return [r for r in book.data.get(_MY_SHEET, [])[1:] if any(str(c) for c in r)]
+
+
+def _default_protocols():
+    return {
+        "m_org": _proto(("Отчёт", _ME, "20.01.2024", False)),
+        "m_other": _proto(("Смета", "иван  ПЕТРОВ", "25.01.2024", False),
+                          ("Чужое", "Анна Смирнова", "", False)),
+    }
+
+
+def test_my_tasks_include_non_organizer_meeting():
+    """П.6: исполнитель на чужой встрече — задача в «Моих задачах», протокол
+    этой встречи не создаётся, add_worksheet/update для неё не вызываются,
+    протокол организаторской встречи пишется так же, как без чужой встречи."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    book = _SyncBook({})
+    res = _run_full_sync(mod, book, [m_org, m_other], _default_protocols())
+
+    rows = _my_rows(book)
+    by_task = {r[3]: r for r in rows}
+    assert set(by_task) == {"Отчёт", "Смета"}, rows
+    assert by_task["Отчёт"][2] == "Стратсессия" and by_task["Отчёт"][7] == "m_org"
+    sm = by_task["Смета"]
+    assert sm[2] == "Планёрка отдела" and sm[7] == "m_other", sm
+    assert sm[5] == "25.01.2024" and sm[6] == "Требует верификации", sm
+    assert "из них с чужих встреч: 1" in res, res
+    assert "организатор 1" in res, res
+
+    # Протокол чужой встречи не создан ни отдельным листом, ни в «Разовых встречах»
+    added = [c.kwargs.get("title") for c in book.ss.add_worksheet.call_args_list]
+    assert "Планёрка отдела" not in added, added
+    assert set(book.ws) == {"Разовые встречи", _MY_SHEET}, list(book.ws)
+    for title, w in book.ws.items():
+        if title == _MY_SHEET:
+            continue
+        for c in w.update.call_args_list:
+            flat = repr(c)
+            assert "m_other" not in flat and "Планёрка отдела" not in flat \
+                and "Смета" not in flat, (title, c)
+    assert not any("m_other" in repr(r) or "Планёрка отдела" in repr(r)
+                   for r in book.data["Разовые встречи"])
+
+    # Протокол организаторской встречи — тот же, что без чужой встречи
+    ref = _SyncBook({})
+    _run_full_sync(mod, ref, [m_org], _default_protocols())
+    assert book.data["Разовые встречи"] == ref.data["Разовые встречи"], \
+        (book.data["Разовые встречи"], ref.data["Разовые встречи"])
+    ot = book.data["Разовые встречи"]
+    assert ot[1][0].startswith("Стратсессия") and ot[2][2] == "Отчёт" and ot[2][6] == "m_org", ot
+
+
+def test_my_tasks_non_organizer_other_assignee_excluded():
+    """На чужой встрече задача на другое ФИО (и частичное совпадение) не попадает."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    protocols = {
+        "m_org": _proto(),
+        "m_other": _proto(("Чужое", "Анна Смирнова", "", False),
+                          ("Частичное", "Петров", "", False),
+                          ("Отчество", "Иван Петрович", "", False)),
+    }
+    book = _SyncBook({})
+    res = _run_full_sync(mod, book, [m_org, m_other], protocols)
+    assert _my_rows(book) == [], book.data.get(_MY_SHEET)
+    assert "«Мои задачи — Иван Петров»: 0 задач" in res, res
+    assert "чужих встреч" not in res
+
+
+def test_my_tasks_no_full_name_no_foreign_protocol_fetch():
+    """Без ФИО протоколы чужих встреч не запрашиваются (оба режима)."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    for append in (False, True):
+        book = _SyncBook({})
+        _run_full_sync(mod, book, [m_org, m_other], _default_protocols(),
+                       full_name="", append=append)
+        called = [c.args[0] for c in mod._fetch_protocol.call_args_list]
+        assert called == ["m_org"], called
+        assert not any(t.startswith("Мои задачи") for t in book.ws)
+    # С ФИО — запрашиваются обе
+    book = _SyncBook({})
+    _run_full_sync(mod, book, [m_org, m_other], _default_protocols())
+    assert sorted(c.args[0] for c in mod._fetch_protocol.call_args_list) == ["m_org", "m_other"]
+
+
+def test_my_tasks_foreign_history_and_statuses():
+    """Накопление: строка чужой встречи вне окна (m_old) сохраняется, строка без
+    mtg_id не переносится; ручной статус задачи чужой встречи переживает sync;
+    done из MYmeet переводит «Требует верификации» в «Выполнено»."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    hdr = list(mod.MY_TASKS_HEADER_ROW)
+    book = _SyncBook({_MY_SHEET: [
+        hdr,
+        [1, "01.12.2023", "Старая встреча", "Архив", _ME, "", "В работе", "m_old"],
+        [2, "01.12.2023", "Без id", "Потерянная", _ME, "", "В работе", ""],
+    ]})
+    protocols = _default_protocols()
+    protocols["m_other"] = _proto(("Смета", _ME, "25.01.2024", False),
+                                  ("Звонок", _ME, "", True))
+    for append in (False, True):
+        _run_full_sync(mod, book, [m_org, m_other], protocols, append=append)
+        by_task = {r[3]: r for r in _my_rows(book)}
+        assert set(by_task) == {"Отчёт", "Смета", "Звонок", "Архив"}, by_task
+        assert by_task["Архив"][2:] == ["Старая встреча", "Архив", _ME, "", "В работе", "m_old"]
+        assert by_task["Звонок"][6] == "Выполнено"
+
+    # Пользователь вручную поставил статус на личном листе
+    for r in book.data[_MY_SHEET]:
+        if len(r) > 3 and r[3] == "Смета":
+            r[6] = "В работе"
+        if len(r) > 3 and r[3] == "Звонок":
+            r[6] = "Требует верификации"       # done в MYmeet → снова «Выполнено»
+    for append in (False, True):
+        _run_full_sync(mod, book, [m_org, m_other], protocols, append=append)
+        by_task = {r[3]: r for r in _my_rows(book)}
+        assert by_task["Смета"][6] == "В работе", by_task["Смета"]
+        assert by_task["Звонок"][6] == "Выполнено", by_task["Звонок"]
+        assert "Архив" in by_task and "Потерянная" not in by_task
+
+    # Ручной «Отменено» не перетирается даже при done
+    for r in book.data[_MY_SHEET]:
+        if len(r) > 3 and r[3] == "Звонок":
+            r[6] = "Отменено"
+    _run_full_sync(mod, book, [m_org, m_other], protocols)
+    assert {r[3]: r for r in _my_rows(book)}["Звонок"][6] == "Отменено"
+
+    # Ежедневный sync без встреч в окне: история чужих встреч не пропадает
+    _run_full_sync(mod, book, [], {}, append=True)
+    assert {r[3] for r in _my_rows(book)} >= {"Смета", "Звонок", "Архив"}
+
+
+def test_my_tasks_foreign_fetch_error_isolated():
+    """Ошибка загрузки протокола чужой встречи не роняет sync; протокол
+    организатора записан; старые строки этой встречи на личном листе сохранены."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    hdr = list(mod.MY_TASKS_HEADER_ROW)
+    book = _SyncBook({_MY_SHEET: [
+        hdr, [1, "01.01.2024", "Планёрка отдела", "Смета", _ME, "", "В работе", "m_other"]]})
+    ref = _SyncBook({})
+    _run_full_sync(mod, ref, [m_org], _default_protocols(), full_name="")
+    for exc in (RuntimeError("mymeet-boom"), None):      # исключение и 404/None
+        protocols = _default_protocols()
+        protocols["m_other"] = exc
+        res = _run_full_sync(mod, book, [m_org, m_other], protocols)
+        assert "Синхронизировано: 1 задач" in res, res
+        assert book.data["Разовые встречи"] == ref.data["Разовые встречи"]
+        rows = {r[3]: r for r in _my_rows(book)}
+        assert set(rows) == {"Отчёт", "Смета"}, rows
+        assert rows["Смета"][6] == "В работе"
+
+
+def test_my_tasks_foreign_resync_no_duplicates():
+    """Повторный sync (полный и ежедневный) не создаёт дублей; протокол
+    встречи организатора побеждает, если тот же mtg_id есть и среди чужих."""
+    mod = _load_mymeet()
+    m_org, m_other = _two_meetings()
+    book = _SyncBook({})
+    for append in (False, False, True, True, False):
+        _run_full_sync(mod, book, [m_org, m_other], _default_protocols(), append=append)
+        rows = _my_rows(book)
+        keys = [(r[7], r[1], r[3], r[4]) for r in rows]
+        assert len(keys) == len(set(keys)) == 2, rows
+        assert [r[0] for r in rows] == [1, 2]
+        assert sum(1 for r in book.data["Разовые встречи"] if len(r) > 2 and r[2] == "Отчёт") == 1
+    # Дедуп «протокол побеждает» на уровне чистых функций
+    proto_sheets = {"Разовые встречи": [
+        _PROTO_HDR, ["Стратсессия  (12.01.2024)"],
+        ["1", "12.01.2024", "Отчёт", _ME, "", "В работе", "m_org"]]}
+    extra = mod._merge_other_meeting_rows(
+        [], [[None, "12.01.2024", "X", "Отчёт", _ME, "", "Требует верификации", "m_org"]],
+        {"m_org"}, {"m_org"})
+    assert extra == []
+    rows = mod._build_my_tasks_rows(
+        proto_sheets, _ME,
+        extra_rows=[[None, "12.01.2024", "X", "Отчёт", _ME, "", "Выполнено", "m_org"]])
+    assert len(rows) == 1 and rows[0][2] == "Стратсессия" and rows[0][6] == "В работе", rows
+
+
 if __name__ == "__main__":
     tests = [
         (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
@@ -1240,6 +1529,12 @@ if __name__ == "__main__":
         (test_my_tasks_same_name_different_case_reuses_sheet, "ФИО в другом регистре — тот же лист"),
         (test_my_tasks_long_name_title_limit,     "длинное ФИО — имя листа ≤100"),
         (test_build_my_tasks_rows_one_time_dedup_without_mtg_id, "дедуп без mtg_id по встрече"),
+        (test_my_tasks_include_non_organizer_meeting, "чужая встреча: задача есть, протокола нет"),
+        (test_my_tasks_non_organizer_other_assignee_excluded, "чужая встреча: другое ФИО не попадает"),
+        (test_my_tasks_no_full_name_no_foreign_protocol_fetch, "без ФИО чужие протоколы не грузятся"),
+        (test_my_tasks_foreign_history_and_statuses, "чужие встречи: история и статусы"),
+        (test_my_tasks_foreign_fetch_error_isolated, "ошибка протокола чужой встречи изолирована"),
+        (test_my_tasks_foreign_resync_no_duplicates, "чужие встречи: повторный sync без дублей"),
     ]
     failed = []
     for fn, label in tests:

@@ -33,6 +33,7 @@ MYMEET_WS_ID      = os.environ.get("MYMEET_WS_ID", "")
 MYMEET_BASE       = "https://backend.mymeet.ai"
 SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "")
 ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
+DEFAULT_TIMEZONE  = os.environ.get("TIMEZONE", "Europe/Moscow")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -358,12 +359,19 @@ def fetch_workspaces(token: str) -> list:
         return []
 
 
-def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None = None) -> list:
-    """Return list of raw meeting objects for the past N days."""
-    _token = token or MYMEET_TOKEN
-    _ws_id = ws_id or MYMEET_WS_ID
+def _fetch_meetings(
+    days: int = 30,
+    token: str | None = None,
+    ws_id: str | None = None,
+    tz_name: str | None = None,
+) -> list:
+    """Return list of raw meeting objects for the past N days (user timezone)."""
+    from zoneinfo import ZoneInfo
+    _token  = token or MYMEET_TOKEN
+    _ws_id  = ws_id or MYMEET_WS_ID
+    _tz     = ZoneInfo(tz_name or DEFAULT_TIMEZONE)
 
-    now       = datetime.now(timezone.utc)
+    now       = datetime.now(_tz)
     date_to   = int(now.timestamp() * 1000)
     date_from = int((now - timedelta(days=days)).timestamp() * 1000)
 
@@ -390,6 +398,19 @@ def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None 
         if len(items) < 50:
             break
         page += 1
+
+    # Client-side date filter: discard any meetings the API returned outside
+    # the requested window (the API may not honour dateFrom/dateTo strictly).
+    before = len(meetings)
+    meetings = [
+        m for m in meetings
+        if (ts := _meeting_ts_ms(m)) is None or date_from <= ts <= date_to
+    ]
+    if len(meetings) != before:
+        logger.debug(
+            "_fetch_meetings: dropped %d out-of-range meetings (kept %d)",
+            before - len(meetings), len(meetings),
+        )
 
     return meetings
 
@@ -476,6 +497,35 @@ def _safe_sheet_name(name: str) -> str:
     return s[:100].strip()
 
 
+def _meeting_ts_ms(m: dict) -> int | None:
+    """Return the meeting start timestamp in milliseconds, or None if unavailable."""
+    for key in ("startTime", "date", "createdAt"):
+        val = m.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (int, float)):
+            ts = int(val)
+            return ts if ts >= 1_000_000_000_000 else ts * 1000
+        s = str(val).strip()
+        for fmt in (
+            "%a, %d %b %Y %H:%M:%S GMT",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                dt = datetime.strptime(s.replace(" GMT", ""), fmt.replace(" GMT", ""))
+                return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except ValueError:
+                pass
+        try:
+            ts = int(s)
+            return ts if ts >= 1_000_000_000_000 else ts * 1000
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
     """Return True if the current user is the organizer of this meeting.
 
@@ -525,10 +575,10 @@ def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
     if role in ("attendee", "guest", "participant"):
         return False
 
-    # Can't determine — include the meeting and log for later inspection
+    # Can't determine — exclude the meeting (safe default: don't include non-chaired meetings)
     logger.debug("_is_organizer: could not determine for %s, keys=%s",
                  m.get("id", "?"), list(m.keys()))
-    return True
+    return False
 
 
 def _build_user_config(user_config: dict | None) -> dict:
@@ -538,6 +588,7 @@ def _build_user_config(user_config: dict | None) -> dict:
     ws_id    = cfg.get("mymeet_ws_id")          or MYMEET_WS_ID
     sheet_id = cfg.get("mymeet_spreadsheet_id") or SPREADSHEET_ID
     email    = cfg.get("mymeet_organizer_email") or ORGANIZER_EMAIL
+    tz_name  = cfg.get("timezone")              or DEFAULT_TIMEZONE
 
     # HTTP headers must be latin-1 encodable. Catch bad token early with
     # a human-readable message instead of a cryptic UnicodeEncodeError.
@@ -555,6 +606,7 @@ def _build_user_config(user_config: dict | None) -> dict:
         "ws_id":    ws_id,
         "sheet_id": sheet_id,
         "email":    email,
+        "tz_name":  tz_name,
     }
 
 
@@ -578,7 +630,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     cfg = _build_user_config(user_config)
     logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
 
-    raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
+    raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"], tz_name=cfg["tz_name"])
     logger.info("Fetched %d raw meetings", len(raw_meetings))
 
     raw_meetings = [m for m in raw_meetings if _is_organizer(m, cfg["email"])]

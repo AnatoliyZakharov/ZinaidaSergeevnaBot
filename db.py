@@ -95,6 +95,8 @@ def _migrate_mymeet(conn: sqlite3.Connection) -> None:
         # Временные данные шага 1 (зашифрованный токен + ws_id) — для восстановления визарда
         ("mymeet_pending_token", "TEXT"),
         ("mymeet_pending_ws_id",  "TEXT"),
+        # ФИО пользователя для личного листа «Мои задачи» (не сбрасывается /reset_mymeet)
+        ("mymeet_full_name",      "TEXT"),
     ]
     for col, ddl in mymeet_cols:
         try:
@@ -476,6 +478,19 @@ def reset_mymeet_config(telegram_id: int) -> None:
                 mymeet_pending_ws_id     = NULL
             WHERE telegram_id = ?
         """, (telegram_id,))
+        conn.commit()
+        conn.close()
+
+
+def set_full_name(telegram_id: int, name: str) -> None:
+    """Сохраняем ФИО для листа «Мои задачи» (пробелы схлопываются)."""
+    value = " ".join(str(name or "").split())
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET mymeet_full_name = ? WHERE telegram_id = ?",
+            (value, telegram_id),
+        )
         conn.commit()
         conn.close()
 

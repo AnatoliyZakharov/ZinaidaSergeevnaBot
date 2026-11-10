@@ -980,6 +980,10 @@ async def _handle_mymeet_setup(
         # Токен верный — рабочее пространство определяется API-ключом автоматически
         ws_id = ws.get("id", "active")
         ws_name = ws.get("name", "Ваше пространство")
+        logger.error(
+            "DIAG _handle_mymeet_setup: before save_mymeet_pending telegram_id=%s type=%s bool_ws_id=%s",
+            telegram_id, type(telegram_id).__name__, bool(ws_id),
+        )
         # Сохраняем pending-данные в БД, чтобы wizard пережил перезапуск бота
         # между шагом 1 (токен) и шагом 2 (ID таблицы).
         try:

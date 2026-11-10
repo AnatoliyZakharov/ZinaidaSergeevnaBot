@@ -512,16 +512,23 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
         crypto.CryptoError — шифрование не удалось.
         RuntimeError — данные не подтвердились после коммита (диск, БД).
     """
+    import logging as _diag_log
+    _diag = _diag_log.getLogger(__name__)
+    _diag.error(
+        "DIAG save_mymeet_pending: telegram_id=%s type=%s bool_ws_id=%s bool_token=%s db_path=%s",
+        telegram_id, type(telegram_id).__name__, bool(ws_id), bool(token), str(DB_PATH),
+    )
     encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
-        conn.execute(
+        cur = conn.execute(
             "UPDATE users "
             "SET mymeet_pending_token = ?, mymeet_pending_ws_id = ?, "
             "mymeet_setup_in_progress = 1 "
             "WHERE telegram_id = ?",
             (encrypted_token, ws_id, telegram_id),
         )
+        rowcount = cur.rowcount
         conn.commit()
         verify = conn.execute(
             "SELECT mymeet_pending_token, mymeet_pending_ws_id, mymeet_setup_in_progress "
@@ -529,6 +536,14 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
             (telegram_id,),
         ).fetchone()
         conn.close()
+    _diag.error(
+        "DIAG save_mymeet_pending: rowcount=%s verify_none=%s v0_bool=%s v1_bool=%s v2_bool=%s",
+        rowcount,
+        verify is None,
+        bool(verify[0]) if verify is not None else "N/A",
+        bool(verify[1]) if verify is not None else "N/A",
+        bool(verify[2]) if verify is not None else "N/A",
+    )
     if not verify or not verify[0] or not verify[1] or not verify[2]:
         raise RuntimeError(
             "save_mymeet_pending: данные не подтвердились после записи "

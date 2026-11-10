@@ -22,7 +22,7 @@ import os
 import json
 import logging
 import re
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 
 import pytz
@@ -1101,6 +1101,50 @@ async def _handle_mymeet_ws_callback(update: Update, context: ContextTypes.DEFAU
 
 # ─── MYmeet sync ─────────────────────────────────────────────
 
+
+def _get_gcal_organizer_times(telegram_id: int, days: int) -> set:
+    """Fetch GCal events and return set of minute-rounded UTC timestamps (ms)
+    for events where organizer.self == True.
+    Returns empty set on any error (sync falls back to including all meetings).
+    """
+    try:
+        service = get_calendar_service(telegram_id)
+        user = db.get_user(telegram_id)
+        cal_id = _get_calendar_id(user)
+        now = datetime.now(timezone.utc)
+        time_min = (now - timedelta(days=days)).isoformat()
+        time_max = now.isoformat()
+        result = service.events().list(
+            calendarId=cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            maxResults=2500,
+        ).execute()
+        organizer_times: set[int] = set()
+        for event in result.get("items", []):
+            if event.get("organizer", {}).get("self"):
+                start = event.get("start", {})
+                dt_str = start.get("dateTime") or start.get("date")
+                if not dt_str:
+                    continue
+                try:
+                    if "T" in dt_str:
+                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    else:
+                        dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+                    # Round to minute (ms)
+                    organizer_times.add(int(dt.timestamp() / 60) * 60 * 1000)
+                except Exception:
+                    pass
+        logger.info("_get_gcal_organizer_times: %d organizer events for user %s",
+                    len(organizer_times), telegram_id)
+        return organizer_times
+    except Exception as exc:
+        logger.warning("_get_gcal_organizer_times failed for user %s: %s", telegram_id, exc)
+        return set()
+
+
 def _user_row_to_mymeet_config(user) -> dict | None:
     """Преобразует строку users в user_config для sync_to_sheets_async.
 
@@ -1151,6 +1195,11 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Fetch GCal events where organizer.self for accurate organizer filtering
+        gcal_times_1d = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _get_gcal_organizer_times(telegram_id, 1)
+        )
+        user_config["gcal_organizer_times"] = gcal_times_1d
         msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
         try:
             result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
@@ -1199,6 +1248,11 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
         msg = await update.message.reply_text(
             f"⏳ Полная синхронизация MYmeet за {days} дней (перезапись таблицы)..."
         )
+        # Fetch GCal events where organizer.self for accurate organizer filtering
+        gcal_times = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _get_gcal_organizer_times(telegram_id, days)
+        )
+        user_config["gcal_organizer_times"] = gcal_times
         try:
             result = await sync_to_sheets_async(days=days, append=False, user_config=user_config)
             await msg.edit_text(result)

@@ -560,20 +560,69 @@ def _meeting_ts_ms(m: dict) -> int | None:
     return None
 
 
-def _is_organizer_by_gcal(m: dict, gcal_times: set) -> bool:
-    """Return True when meeting start matches a GCal event where organizer.self == True.
+def _extract_gcal_event_id(m: dict) -> str | None:
+    """Try to extract a Google Calendar event ID from a MYmeet meeting object.
 
-    gcal_times: set of int -- UTC minute-rounded timestamps in ms, built in main.py.
-    Falls back to True (include all) when gcal_times is empty (GCal unavailable).
-    Unknown-date meetings are excluded (return False) per spec.
+    Checks field paths MYmeet is known to embed based on existing API patterns
+    (same paths used in _is_organizer for organizer look-ups).
+    Returns None when no GCal event ID is found -- do not invent field names.
     """
-    if not gcal_times:
-        return True  # no GCal data -- include all to avoid false negatives
+    for field in ("calendarEventId", "googleEventId", "gcalEventId",
+                  "calendar_event_id", "google_event_id", "eventId"):
+        v = m.get(field)
+        if v and isinstance(v, str):
+            return v
+    for path in (
+        ("calendarEvent", "id"),
+        ("event", "id"),
+        ("calendar", "id"),
+        ("meetingData", "eventId"),
+        ("meetingData", "id"),
+    ):
+        obj = m
+        for key in path:
+            obj = obj.get(key) if isinstance(obj, dict) else None
+        if obj and isinstance(obj, str):
+            return obj
+    return None
+
+
+def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
+    """Return True when this meeting is confirmed as self-organized via Google Calendar.
+
+    gcal_data: {"ids": set[str], "times": set[int]} built in main.py.
+      ids:   GCal event IDs where organizer.self == True
+      times: same events start times, UTC, minute-rounded, in ms
+
+    Matching strategy (most reliable first):
+      1. GCal event ID found in m AND in gcal_data["ids"] -> organizer
+         GCal event ID found in m but NOT in ids -> not organizer
+      2. No GCal ID in m -> time-based fallback (+-1 min); logged as approximate.
+    Unknown-date meetings always excluded.
+    """
+    gcal_ids   = gcal_data.get("ids", set())
+    gcal_times = gcal_data.get("times", set())
+
+    # 1. ID-based match (reliable)
+    event_id = _extract_gcal_event_id(m)
+    if event_id is not None:
+        result = event_id in gcal_ids
+        logger.debug("_is_organizer_by_gcal: id=%s gcal_match=%s meeting=%s",
+                     event_id, result, m.get("id", "?"))
+        return result
+
+    # 2. Time-based fallback (approximate -- may mis-match concurrent meetings)
     ts = _meeting_ts_ms(m)
     if ts is None:
         return False  # unknown date -> exclude per spec
-    ts_min = int(ts / 60_000) * 60_000  # round to minute, in ms
-    return any(ts_min + delta in gcal_times for delta in (0, 60_000, -60_000))
+    ts_min = int(ts / 60_000) * 60_000
+    matched = any(ts_min + delta in gcal_times for delta in (0, 60_000, -60_000))
+    logger.debug(
+        "_is_organizer_by_gcal: no GCal event ID found in MYmeet meeting %s; "
+        "time fallback ts_min=%d matched=%s",
+        m.get("id", "?"), ts_min, matched,
+    )
+    return matched
 
 
 def _deadline_sort_key(deadline_str: str) -> tuple:
@@ -614,7 +663,7 @@ def _build_user_config(user_config: dict | None) -> dict:
         "ws_id":    ws_id,
         "sheet_id": sheet_id,
         "email":    email,
-        "gcal_organizer_times": cfg.get("gcal_organizer_times") or set(),
+        "gcal_organizer_data": cfg.get("gcal_organizer_data"),  # dict{"ids","times"} or None
     }
 
 
@@ -651,11 +700,17 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     logger.info("After date filter (%d days): %d meetings", days, _after_date_count)
 
     # Organizer filter: use Google Calendar organizer.self (passed via user_config)
-    _gcal_times = cfg.get("gcal_organizer_times") or set()
-    raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_times)]
+    _gcal_data = cfg.get("gcal_organizer_data")
+    if _gcal_data is None:
+        raise RuntimeError(
+            "☹️ Не удалось получить данные Google Calendar для "
+            "проверки организатора. "
+            "Синхронизация отменена — Google Sheets не изменён."
+        )
+    raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
     _after_org_count = len(raw_meetings)
-    logger.info("After organizer filter (GCal %d events): %d meetings",
-                len(_gcal_times), _after_org_count)
+    logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
+                len(_gcal_data.get("ids", set())), len(_gcal_data.get("times", set())), _after_org_count)
 
     # ── Параллельная загрузка протоколов ──────────────────────────────────────
     def _fetch_one(m: dict) -> dict:

@@ -531,6 +531,114 @@ def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
     return True
 
 
+def _meeting_ts_ms(m: dict) -> int | None:
+    """Return meeting start time in UTC milliseconds.
+    Priority: startTime -> date -> createdAt -> None.
+    Returns None when no parseable date found (meeting excluded from sync)."""
+    for field in ("startTime", "date", "createdAt"):
+        v = m.get(field)
+        if not v:
+            continue
+        if isinstance(v, (int, float)) and v > 1e10:
+            return int(v)
+        if isinstance(v, str):
+            try:
+                ts = int(v)
+                if ts > 1e10:
+                    return ts
+            except ValueError:
+                pass
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S", "%a, %d %b %Y %H:%M:%S GMT", "%Y-%m-%d",
+            ):
+                try:
+                    dt = datetime.strptime(v.replace(" GMT", ""), fmt.replace(" GMT", ""))
+                    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                except ValueError:
+                    pass
+    return None
+
+
+def _extract_gcal_event_id(m: dict) -> str | None:
+    """Try to extract a Google Calendar event ID from a MYmeet meeting object.
+
+    Checks field paths MYmeet is known to embed based on existing API patterns
+    (same paths used in _is_organizer for organizer look-ups).
+    Returns None when no GCal event ID is found -- do not invent field names.
+    """
+    for field in ("calendarEventId", "googleEventId", "gcalEventId",
+                  "calendar_event_id", "google_event_id", "eventId"):
+        v = m.get(field)
+        if v and isinstance(v, str):
+            return v
+    for path in (
+        ("calendarEvent", "id"),
+        ("event", "id"),
+        ("calendar", "id"),
+        ("meetingData", "eventId"),
+        ("meetingData", "id"),
+    ):
+        obj = m
+        for key in path:
+            obj = obj.get(key) if isinstance(obj, dict) else None
+        if obj and isinstance(obj, str):
+            return obj
+    return None
+
+
+def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
+    """Return True when this meeting is confirmed as self-organized via Google Calendar.
+
+    gcal_data: {"ids": set[str], "times": set[int]} built in main.py.
+      ids:   GCal event IDs where organizer.self == True
+      times: same events start times, UTC, minute-rounded, in ms
+
+    Matching strategy (most reliable first):
+      1. GCal event ID found in m AND in gcal_data["ids"] -> organizer
+         GCal event ID found in m but NOT in ids -> not organizer
+      2. No GCal ID in m -> time-based fallback (+-1 min); logged as approximate.
+    Unknown-date meetings always excluded.
+    """
+    gcal_ids   = gcal_data.get("ids", set())
+    gcal_times = gcal_data.get("times", set())
+
+    # 1. ID-based match (reliable)
+    event_id = _extract_gcal_event_id(m)
+    if event_id is not None:
+        result = event_id in gcal_ids
+        logger.debug("_is_organizer_by_gcal: id=%s gcal_match=%s meeting=%s",
+                     event_id, result, m.get("id", "?"))
+        return result
+
+    # 2. Time-based fallback (approximate -- may mis-match concurrent meetings)
+    ts = _meeting_ts_ms(m)
+    if ts is None:
+        return False  # unknown date -> exclude per spec
+    ts_min = int(ts / 60_000) * 60_000
+    matched = any(ts_min + delta in gcal_times for delta in (0, 60_000, -60_000))
+    logger.debug(
+        "_is_organizer_by_gcal: no GCal event ID found in MYmeet meeting %s; "
+        "time fallback ts_min=%d matched=%s",
+        m.get("id", "?"), ts_min, matched,
+    )
+    return matched
+
+
+def _deadline_sort_key(deadline_str: str) -> tuple:
+    """Sort key: (0, datetime) for valid deadline, (1, max) for missing/invalid.
+    Keeps tasks without deadlines at the bottom of the sheet."""
+    dl = (deadline_str or "").strip()
+    if not dl:
+        return (1, datetime.max)
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y"):
+        try:
+            return (0, datetime.strptime(dl, fmt))
+        except ValueError:
+            pass
+    return (1, datetime.max)
+
+
 def _build_user_config(user_config: dict | None) -> dict:
     """Merge user_config with module-level defaults."""
     cfg = user_config or {}
@@ -555,6 +663,7 @@ def _build_user_config(user_config: dict | None) -> dict:
         "ws_id":    ws_id,
         "sheet_id": sheet_id,
         "email":    email,
+        "gcal_organizer_data": cfg.get("gcal_organizer_data"),  # dict{"ids","times"} or None
     }
 
 
@@ -579,10 +688,29 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
 
     raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
-    logger.info("Fetched %d raw meetings", len(raw_meetings))
+    _fetched_count = len(raw_meetings)
+    logger.info("Fetched %d raw meetings from API", _fetched_count)
 
-    raw_meetings = [m for m in raw_meetings if _is_organizer(m, cfg["email"])]
-    logger.info("After organizer filter: %d meetings", len(raw_meetings))
+    # Date filter: use startTime as priority source; exclude meetings with unknown date
+    _now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    _from_ms = _now_ms - days * 24 * 3600 * 1000
+    raw_meetings = [m for m in raw_meetings
+                    if (ts := _meeting_ts_ms(m)) is not None and _from_ms <= ts <= _now_ms]
+    _after_date_count = len(raw_meetings)
+    logger.info("After date filter (%d days): %d meetings", days, _after_date_count)
+
+    # Organizer filter: use Google Calendar organizer.self (passed via user_config)
+    _gcal_data = cfg.get("gcal_organizer_data")
+    if _gcal_data is None:
+        raise RuntimeError(
+            "☹️ Не удалось получить данные Google Calendar для "
+            "проверки организатора. "
+            "Синхронизация отменена — Google Sheets не изменён."
+        )
+    raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
+    _after_org_count = len(raw_meetings)
+    logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
+                len(_gcal_data.get("ids", set())), len(_gcal_data.get("times", set())), _after_org_count)
 
     # ── Параллельная загрузка протоколов ──────────────────────────────────────
     def _fetch_one(m: dict) -> dict:
@@ -676,6 +804,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         task["deadline"], status, m["id"],
                     ])
                     idx += 1
+            # Sort by deadline: earliest first, no-deadline at bottom
+            rows.sort(key=lambda r: _deadline_sort_key(str(r[4]) if len(r) > 4 else ""))
+            for _i, _r in enumerate(rows, 1):
+                _r[0] = _i  # re-number after sort
             all_data = [HEADER_ROW] + rows
             _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
             all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(rows)))
@@ -803,6 +935,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         if not new_tasks:
             continue   # all tasks for this meeting already exist
 
+        # Sort tasks by deadline: earliest first, no-deadline at bottom
+        new_tasks.sort(key=lambda t: _deadline_sort_key(t.get("deadline", "")))
         label = f"{m['name']}  ({m['date']})" if m["date"] else m["name"]
         grouper_rel_positions.append(len(all_rows))
         all_rows.append([label, "", "", "", "", "", ""])
@@ -870,10 +1004,14 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         + "\n".join(f"  • {w}" for w in all_fmt_warnings)
         if all_fmt_warnings else ""
     )
+    _diag_now = datetime.now(timezone.utc)
+    _diag_from = _diag_now - timedelta(days=days)
     result = (
         f"✅ Синхронизировано: {total_tasks} задач\n"
         f"📋 {sheets_written} листов по регулярным встречам\n"
-        f"📝 Разовые встречи: {len(one_time)} встреч"
+        f"📝 Разовые встречи: {len(one_time)} встреч\n"
+        f"📅 Период: {_diag_from.strftime('%d.%m.%Y')} — {_diag_now.strftime('%d.%m.%Y')}\n"
+        f"🔍 API {_fetched_count} → дата {_after_date_count} → организатор {_after_org_count}"
         + fmt_warn_text
     )
     logger.info("MYmeet sync done: %s", result.replace('\n', ' | '))

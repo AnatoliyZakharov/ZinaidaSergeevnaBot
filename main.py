@@ -970,13 +970,21 @@ async def _handle_mymeet_setup(
 
         token = setup.get("token")
         ws_id = setup.get("ws_id")
-        db.save_mymeet_config(
-            telegram_id,
-            token=token,
-            ws_id=ws_id,
-            spreadsheet_id=sheet_id,
-            organizer_email=None,  # определяется через organizer.self в Google Calendar
-        )
+        try:
+            db.save_mymeet_config(
+                telegram_id,
+                token=token,
+                ws_id=ws_id,
+                spreadsheet_id=sheet_id,
+                organizer_email=None,  # определяется через organizer.self в Google Calendar
+            )
+        except Exception as _save_exc:
+            logger.error("save_mymeet_config failed: %s", _save_exc, exc_info=True)
+            await update.message.reply_text(
+                f"❌ Ошибка при сохранении настроек:\n<code>{type(_save_exc).__name__}: {_save_exc}</code>\n\nСообщи разработчику.",
+                parse_mode="HTML",
+            )
+            return True
         context.user_data.pop("mymeet_setup", None)
         await update.message.reply_text(
             "🎉 *MYmeet настроен!*\n\n"

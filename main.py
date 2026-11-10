@@ -879,16 +879,41 @@ async def _handle_mymeet_setup(
     if not setup:
         # Проверяем: был ли пользователь в середине wizard'а до перезапуска бота?
         # DB-флаг переживает перезапуск, context.user_data — нет.
-        # Перехватываем ТОЛЬКО тех, кто был в wizard (in_progress=1), не произвольные сообщения.
         user_row = db.get_user(telegram_id)
-        if user_row and user_row["mymeet_setup_in_progress"]:
-            db.set_mymeet_setup_in_progress(telegram_id, False)
-            await update.message.reply_text(
-                "⚠️ Сессия настройки MYmeet устарела — бот перезапускался.\n\n"
-                "Запусти /setup_mymeet снова.",
-            )
-            return True
-        return False
+        in_progress = user_row and user_row["mymeet_setup_in_progress"]
+        if in_progress:
+            # Пробуем восстановить состояние из DB (pending_token + ws_id).
+            # Если данные сохранены — wizard продолжается бесшовно на шаге 2.
+            pending = db.get_mymeet_pending(telegram_id)
+            if pending:
+                decrypted_token, ws_id = pending
+                setup = {
+                    "step": _SETUP_STEP_SHEET,
+                    "token": decrypted_token,
+                    "ws_id": ws_id,
+                }
+                context.user_data["mymeet_setup"] = setup
+                # Fall through to step processing below
+            else:
+                # Pending-данных нет — сессия действительно устарела
+                db.set_mymeet_setup_in_progress(telegram_id, False)
+                await update.message.reply_text(
+                    "⚠️ Сессия настройки MYmeet устарела — бот перезапускался.\n\n"
+                    "Запусти /setup_mymeet снова.",
+                )
+                return True
+        else:
+            # Safety net: ловим ссылку на Google Таблицу когда wizard не активен.
+            # Покрывает пользователей, запустивших /setup_mymeet со старым кодом
+            # (до PR #6), когда in_progress-флаг ещё не выставлялся.
+            if re.search(r"docs\.google\.com/spreadsheets", text, re.IGNORECASE):
+                await update.message.reply_text(
+                    "📊 Похоже, это ссылка на Google Таблицу.\n\n"
+                    "Если ты настраивал MYmeet — сессия не найдена (бот перезапускался). "
+                    "Запусти /setup_mymeet снова."
+                )
+                return True
+            return False
 
     step = setup.get("step")
     text = text.strip()
@@ -955,6 +980,13 @@ async def _handle_mymeet_setup(
         # Токен верный — рабочее пространство определяется API-ключом автоматически
         ws_id = ws.get("id", "active")
         ws_name = ws.get("name", "Ваше пространство")
+        # Сохраняем pending-данные в БД, чтобы wizard пережил перезапуск бота
+        # между шагом 1 (токен) и шагом 2 (ID таблицы).
+        try:
+            db.save_mymeet_pending(telegram_id, text, ws_id)
+        except Exception as _pend_exc:
+            logger.warning("save_mymeet_pending не удалось: %s", _pend_exc)
+            # Не блокируем wizard — просто не переживёт рестарт
         setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
         context.user_data["mymeet_setup"] = setup
         await msg.edit_text(

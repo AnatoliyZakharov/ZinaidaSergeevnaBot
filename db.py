@@ -92,6 +92,9 @@ def _migrate_mymeet(conn: sqlite3.Connection) -> None:
         ("mymeet_setup_done",     "INTEGER DEFAULT 0"),
         # Флаг "wizard запущен, но ещё не завершён" — сохраняется при перезапуске бота
         ("mymeet_setup_in_progress", "INTEGER DEFAULT 0"),
+        # Временные данные шага 1 (зашифрованный токен + ws_id) — для восстановления визарда
+        ("mymeet_pending_token", "TEXT"),
+        ("mymeet_pending_ws_id",  "TEXT"),
     ]
     for col, ddl in mymeet_cols:
         try:
@@ -361,7 +364,9 @@ def save_mymeet_config(
                 mymeet_spreadsheet_id  = ?,
                 mymeet_organizer_email = ?,
                 mymeet_setup_done          = 1,
-                mymeet_setup_in_progress   = 0
+                mymeet_setup_in_progress   = 0,
+                mymeet_pending_token       = NULL,
+                mymeet_pending_ws_id       = NULL
             WHERE telegram_id = ?
         """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
         if cur.rowcount == 0:
@@ -381,7 +386,9 @@ def save_mymeet_config(
                     mymeet_ws_id           = excluded.mymeet_ws_id,
                     mymeet_spreadsheet_id  = excluded.mymeet_spreadsheet_id,
                     mymeet_organizer_email = excluded.mymeet_organizer_email,
-                    mymeet_setup_done      = 1
+                    mymeet_setup_done      = 1,
+                    mymeet_pending_token   = NULL,
+                    mymeet_pending_ws_id   = NULL
             """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email))
         conn.commit()
         # Верифицируем: читаем обратно и убеждаемся, что setup_done = 1
@@ -464,7 +471,9 @@ def reset_mymeet_config(telegram_id: int) -> None:
                 mymeet_spreadsheet_id = NULL,
                 mymeet_organizer_email = NULL,
                 mymeet_setup_done        = 0,
-                mymeet_setup_in_progress = 0
+                mymeet_setup_in_progress = 0,
+                mymeet_pending_token     = NULL,
+                mymeet_pending_ws_id     = NULL
             WHERE telegram_id = ?
         """, (telegram_id,))
         conn.commit()
@@ -473,16 +482,75 @@ def reset_mymeet_config(telegram_id: int) -> None:
 
 def set_mymeet_setup_in_progress(telegram_id: int, active: bool) -> None:
     """Помечаем пользователя как «wizard запущен» (active=True) или «завершён/отменён» (False).
+    При active=False очищаем также pending-поля (временные данные шага 1).
     Персистируется в БД — переживает перезапуск бота."""
     with _lock:
         conn = _connect()
+        if active:
+            conn.execute(
+                "UPDATE users SET mymeet_setup_in_progress = 1 WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET mymeet_setup_in_progress = 0, "
+                "mymeet_pending_token = NULL, mymeet_pending_ws_id = NULL "
+                "WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+        conn.commit()
+        conn.close()
+
+
+def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
+    """Сохраняем pending-состояние визарда (зашифрованный токен + ws_id) в БД.
+    Данные переживают перезапуск бота и позволяют восстановить шаг 2 без повторного
+    ввода токена пользователем.
+
+    Raises:
+        crypto.CryptoError — шифрование не удалось.
+    """
+    encrypted_token = _crypto.encrypt_token(token)
+    with _lock:
+        conn = _connect()
         conn.execute(
-            "UPDATE users SET mymeet_setup_in_progress = ? WHERE telegram_id = ?",
-            (1 if active else 0, telegram_id),
+            "UPDATE users SET mymeet_pending_token = ?, mymeet_pending_ws_id = ? "
+            "WHERE telegram_id = ?",
+            (encrypted_token, ws_id, telegram_id),
         )
         conn.commit()
         conn.close()
 
+
+def get_mymeet_pending(telegram_id: int) -> Optional[tuple]:
+    """Возвращает (decrypted_token, ws_id) если есть pending-данные шага 1, иначе None.
+    Пропускает нерасшифруемые токены — они будут пропущены при логировании.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    user = get_user(telegram_id)
+    if not user:
+        return None
+    raw_token = user["mymeet_pending_token"]
+    ws_id = user["mymeet_pending_ws_id"]
+    if not raw_token or not ws_id:
+        return None
+    try:
+        if _crypto.is_encrypted(raw_token):
+            decrypted = _crypto.decrypt_token(raw_token)
+        else:
+            _log.warning(
+                "get_mymeet_pending: незашифрованный pending-токен для telegram_id=%s",
+                telegram_id,
+            )
+            return None
+        return (decrypted, ws_id)
+    except CryptoDecryptError:
+        _log.error(
+            "get_mymeet_pending: не удалось расшифровать pending-токен для telegram_id=%s",
+            telegram_id,
+        )
+        return None
 
 # ─── Метрики событий ─────────────────────────────────────────
 

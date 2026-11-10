@@ -877,3 +877,155 @@ class TestMymeetSetupTwoStep:
             text = call[0][0]
             assert "устарела" not in text, f"Wizard неожиданно перехватил: {text!r}"
 
+
+    # ── P1 regression: Google Sheets URL routing ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_p1_sheets_url_reconstructs_wizard_via_pending(self, db_mod, monkeypatch):
+        """
+        P1 regression: бот перезапустился после шага 1 (токен принят, pending сохранён).
+        Пользователь присылает ссылку на Google Таблицу.
+        Ожидаем: wizard восстанавливается из DB, save_mymeet_config вызывается успешно.
+        """
+        # Выставляем состояние: wizard в прогрессе, pending-данные в DB
+        db_mod.set_mymeet_setup_in_progress(55667788, True)
+        db_mod.save_mymeet_pending(55667788, _mk_tok("valid_pending_tok_xyz"), "ws-active")
+
+        user_before = db_mod.get_user(55667788)
+        assert user_before["mymeet_setup_in_progress"] == 1
+        assert user_before["mymeet_pending_token"] is not None
+
+        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
+
+        mock_message = AsyncMock()
+        reply_calls = []
+        mock_message.reply_text = AsyncMock(
+            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
+        )
+        mock_message.text = SHEET_URL
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+
+        # context.user_data пусто — имитирует потерю при перезапуске бота
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+
+        # Захватываем реальную функцию ДО патча, чтобы избежать рекурсии
+        _real_save = db_mod.save_mymeet_config
+        save_calls = []
+
+        def fake_save_mymeet_config(telegram_id, token, ws_id, spreadsheet_id, **kw):
+            save_calls.append(dict(
+                telegram_id=telegram_id, token=token,
+                ws_id=ws_id, spreadsheet_id=spreadsheet_id,
+            ))
+            # Вызываем реальную функцию (не патч) для сброса pending/in_progress
+            _real_save(telegram_id, token, ws_id, spreadsheet_id, **kw)
+
+        with patch("db.get_user", side_effect=db_mod.get_user), \
+             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
+             patch("db.set_mymeet_setup_in_progress",
+                   side_effect=db_mod.set_mymeet_setup_in_progress), \
+             patch("db.save_mymeet_config", side_effect=fake_save_mymeet_config):
+            import main as m
+            await m.handle_text(mock_update, mock_context)
+
+        # save_mymeet_config должен быть вызван с правильным spreadsheet_id
+        assert len(save_calls) == 1, (
+            f"save_mymeet_config должен быть вызван 1 раз, вызвано {len(save_calls)}\n"
+            f"reply_calls: {reply_calls}"
+        )
+        assert save_calls[0]["ws_id"] == "ws-active"
+        expected_sheet_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+        assert save_calls[0]["spreadsheet_id"] == expected_sheet_id, (
+            f"spreadsheet_id={save_calls[0]['spreadsheet_id']!r}"
+        )
+
+        # Ответ пользователю — успех, НЕ "Не понял дату"
+        assert reply_calls, "Ожидался ответ пользователю"
+        reply_text = reply_calls[-1][0][0]
+        assert "Не понял дату" not in reply_text, f"P1 regression: дата-парсер ответил: {reply_text!r}"
+        assert "MYmeet" in reply_text or "настроен" in reply_text.lower(), (
+            f"Ожидалось подтверждение настройки, получено: {reply_text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_p1_sheets_url_no_wizard_shows_helpful_message(self, db_mod, monkeypatch):
+        """
+        P1 safety net: пользователь присылает ссылку на Google Таблицу,
+        но in_progress=0 (старый код до PR #6 не выставил флаг).
+        Ожидаем: НЕ «Не понял дату», а подсказку запустить /setup_mymeet.
+        """
+        # in_progress=0 — не выставляли (имитируем старый код)
+        user_row = db_mod.get_user(55667788)
+        assert user_row["mymeet_setup_in_progress"] == 0
+
+        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
+
+        mock_message = AsyncMock()
+        reply_calls = []
+        mock_message.reply_text = AsyncMock(
+            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
+        )
+        mock_message.text = SHEET_URL
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+
+        with patch("db.get_user", side_effect=db_mod.get_user), \
+             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
+             patch("main._require_google", new=AsyncMock(return_value=False)):
+            import main as m
+            await m.handle_text(mock_update, mock_context)
+
+        # НЕ «Не понял дату» — safety net перехватила
+        assert reply_calls, "Ожидался ответ пользователю"
+        reply_text = reply_calls[-1][0][0]
+        assert "Не понял дату" not in reply_text, (
+            f"P1 regression: дата-парсер ответил вместо safety net: {reply_text!r}"
+        )
+        assert "setup_mymeet" in reply_text or "MYmeet" in reply_text, (
+            f"Ожидалась подсказка /setup_mymeet, получено: {reply_text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_p1_restart_no_pending_shows_expired(self, db_mod, monkeypatch):
+        """
+        P1 regression (граничный случай): in_progress=1 но pending-данных нет.
+        Пользователь получает «сессия устарела», НЕ «Не понял дату».
+        """
+        db_mod.set_mymeet_setup_in_progress(55667788, True)
+        # НЕ сохраняем pending — имитируем ситуацию когда pending был очищен или не сохранён
+
+        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
+
+        mock_message = AsyncMock()
+        reply_calls = []
+        mock_message.reply_text = AsyncMock(
+            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
+        )
+        mock_message.text = SHEET_URL
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+
+        with patch("db.get_user", side_effect=db_mod.get_user), \
+             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
+             patch("db.set_mymeet_setup_in_progress",
+                   side_effect=db_mod.set_mymeet_setup_in_progress):
+            import main as m
+            await m.handle_text(mock_update, mock_context)
+
+        assert reply_calls, "Ожидался ответ пользователю"
+        reply_text = reply_calls[-1][0][0]
+        assert "Не понял дату" not in reply_text, f"P1 regression: дата-парсер ответил: {reply_text!r}"
+        assert "устарела" in reply_text or "перезапуск" in reply_text.lower() or "setup_mymeet" in reply_text, (
+            f"Ожидалось сообщение об устаревшей сессии, получено: {reply_text!r}"
+        )

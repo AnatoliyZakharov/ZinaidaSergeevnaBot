@@ -548,7 +548,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎙 «Поставь встречу с командой в пятницу в 15:00»\n"
             "🎙 «Добавь ссылки на телемост»\n\n"
             "Ссылки Телемост добавляются автоматически каждые 3 часа.\n\n"
-            "/settings — настройки  |  /disconnect — отключить Google",
+            "/settings — настройки  |  /disconnect — отключить Google\n"
+            "/setname Имя Фамилия — ФИО для листа «Мои задачи — Имя Фамилия» в таблице MYmeet",
             parse_mode="Markdown",
         )
     else:
@@ -592,11 +593,78 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ *Настройки*\n\n"
         f"🕐 Рабочее время: {_work_start(user)}:00 — {_work_end(user)}:00\n"
         f"🌍 Часовой пояс: {user['timezone'] or DEFAULT_TZ}\n"
-        f"📅 Календарь: {user['calendar_id'] or 'primary'}\n\n"
+        f"📅 Календарь: {user['calendar_id'] or 'primary'}\n"
+        f"👤 ФИО для листа «Мои задачи — ФИО»: {_user_full_name(user) or 'не указано'}\n\n"
         f"Команды:\n"
         f"`/settz Europe/Saratov` — изменить часовой пояс\n"
-        f"`/sethours 9 18` — изменить рабочие часы",
+        f"`/sethours 9 18` — изменить рабочие часы\n"
+        f"`/setname Имя Фамилия` — ФИО для листа «Мои задачи — Имя Фамилия»",
         parse_mode="Markdown",
+    )
+
+
+_FULL_NAME_MAX_LEN = 100
+
+
+def _user_full_name(user) -> str:
+    """ФИО из строки users (колонка может отсутствовать до миграции)."""
+    try:
+        return (user["mymeet_full_name"] or "").strip()
+    except (IndexError, KeyError):
+        return ""
+
+
+def _validate_full_name(raw: str):
+    """Проверяет ФИО для «Мои задачи».
+
+    Возвращает (normalized, None) при успехе или (None, error_text).
+    Правила: не меньше 2 слов, длина ≤ 100, только буквы, дефис и пробел.
+    Пробелы схлопываются.
+    """
+    words = str(raw or "").split()
+    if len(words) < 2:
+        return None, "Укажите имя и фамилию полностью (минимум 2 слова)."
+    name = " ".join(words)
+    if len(name) > _FULL_NAME_MAX_LEN:
+        return None, f"Слишком длинное ФИО (максимум {_FULL_NAME_MAX_LEN} символов)."
+    for w in words:
+        if not any(ch.isalpha() for ch in w) or not all(ch.isalpha() or ch == "-" for ch in w):
+            return None, "ФИО может содержать только буквы, дефис и пробелы."
+    return name, None
+
+
+async def cmd_setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setname Имя Фамилия — ФИО для личного листа «Мои задачи»."""
+    telegram_id = update.effective_user.id
+    db.upsert_user(telegram_id, update.effective_user.username)
+    hint = (
+        "Лист «Мои задачи — <ваше ФИО>» (например, «Мои задачи — Иван Петров») "
+        "в вашей таблице MYmeet собирает задачи, где "
+        "«Ответственный» совпадает с этим ФИО (без учёта регистра и пробелов; "
+        "только имя или только фамилия не подходят).\n"
+        "У каждого пользователя общей таблицы — свой лист. "
+        "Лист обновляется при каждой синхронизации и только для чтения: "
+        "статус задачи меняйте в листе протокола встречи."
+    )
+    if not context.args:
+        user = db.get_user(telegram_id)
+        current = _user_full_name(user) if user else ""
+        await update.message.reply_text(
+            f"👤 Текущее ФИО: {current or 'не указано'}\n\n"
+            f"Использование: /setname Имя Фамилия\n"
+            f"Пример: /setname Иван Петров\n\n{hint}"
+        )
+        return
+    name, err = _validate_full_name(" ".join(context.args))
+    if err:
+        await update.message.reply_text(
+            f"⚠️ {err}\nПример: /setname Иван Петров"
+        )
+        return
+    db.set_full_name(telegram_id, name)
+    await update.message.reply_text(
+        f"✅ ФИО сохранено: {name}\n\n{hint}\n\n"
+        "Лист появится после следующей синхронизации (/sync_mymeet)."
     )
 
 
@@ -1503,6 +1571,7 @@ async def run_bot():
     app.add_handler(CommandHandler("settings",     cmd_settings))
     app.add_handler(CommandHandler("settz",        cmd_settz))
     app.add_handler(CommandHandler("sethours",     cmd_sethours))
+    app.add_handler(CommandHandler("setname",      cmd_setname))
     app.add_handler(CommandHandler("contacts",     cmd_contacts))
     app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",  cmd_del_contact))

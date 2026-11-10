@@ -43,6 +43,33 @@ STATUS_VALUES = [
 COL_WIDTHS_PX = [50, 110, 420, 180, 120, 190]  # A B C D E F (pixels)
 MTG_ID_COL_PX = 60                             # G — internal meeting-id column
 
+# Protocol sheets (recurring meetings + «Разовые встречи») share this header.
+PROTOCOL_HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус", "mtg_id"]
+ONE_TIME_SHEET_NAME = "Разовые встречи"
+
+# Personal «Мои задачи» sheet (read-only aggregate of the protocol sheets).
+MY_TASKS_SHEET_NAME = "Мои задачи"
+# Per-user sheet title: "Мои задачи — {ФИО}" (one shared spreadsheet may serve
+# several users, each gets its own sheet).
+MY_TASKS_SHEET_PREFIX = f"{MY_TASKS_SHEET_NAME} — "
+MY_TASKS_HEADER_ROW = [
+    "№", "Дата", "Совещание", "Задача", "Ответственный", "Срок", "Статус", "mtg_id",
+]
+MY_TASKS_COL_WIDTHS_PX = [50, 110, 220, 420, 180, 120, 190]  # A–G
+MY_TASKS_STATUS_COL = 6                                      # G (0-based)
+MY_TASKS_MTG_ID_COL = 7                                      # H — hidden
+MY_TASKS_HIDDEN_STATUSES = ["Выполнено", "Отменено"]         # hidden by filter
+
+# Conditional-format colours for the status column (light tints).
+STATUS_COLORS = {
+    "Требует верификации": {"backgroundColor": {"red": 1.0,   "green": 0.949, "blue": 0.8}},
+    "В работе":            {"backgroundColor": {"red": 0.812, "green": 0.886, "blue": 0.953}},
+    "Выполнено":           {"backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827}},
+    "Просрочено":          {"backgroundColor": {"red": 0.957, "green": 0.8,   "blue": 0.8}},
+    "Отменено":            {"backgroundColor": {"red": 0.851, "green": 0.851, "blue": 0.851},
+                            "textFormat": {"strikethrough": True}},
+}
+
 
 HEADER_FORMAT = {
     "textFormat": {"bold": True, "fontSize": 10},
@@ -113,12 +140,27 @@ def _gs_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
+def _apply_full_format(
+    spreadsheet, ws, data_rows: int = 0, *,
+    ncols: int = 6,
+    status_col: int | None = 5,
+    col_widths: list | None = None,
+    hidden_col: int | None = 6,
+) -> None:
     """Apply unified sheet formatting in one batch_update call:
     header style + freeze, column widths A-F, text wrap, row auto-resize,
     dropdown validation for column F (Статус).
+
+    Defaults reproduce the protocol-sheet layout (A–F visible, F = status,
+    G = hidden mtg_id).  Other layouts (e.g. «Мои задачи») pass:
+      ncols      — number of visible columns (header style + widths)
+      status_col — 0-based status column for the dropdown; None = no dropdown
+      col_widths — pixel widths for the visible columns
+      hidden_col — 0-based hidden internal column (mtg_id); None = none
     """
     sid = ws.id
+    widths = COL_WIDTHS_PX if col_widths is None else col_widths
+    wrap_end = max(ncols, hidden_col + 1) if hidden_col is not None else ncols
     # Validation covers up to 10 000 rows so new rows also get the dropdown
     VAL_END = 10_000
 
@@ -129,7 +171,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 "range": {
                     "sheetId": sid,
                     "startRowIndex": 0, "endRowIndex": 1,
-                    "startColumnIndex": 0, "endColumnIndex": 6,
+                    "startColumnIndex": 0, "endColumnIndex": ncols,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -160,7 +202,7 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 "range": {
                     "sheetId": sid,
                     "startRowIndex": 1,
-                    "startColumnIndex": 0, "endColumnIndex": 7,
+                    "startColumnIndex": 0, "endColumnIndex": wrap_end,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -171,13 +213,15 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                 "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
             }
         },
-        # 3. Dropdown validation for column F (index 5)
-        {
+    ]
+    # 3. Dropdown validation for the status column (default: F, index 5)
+    if status_col is not None:
+        requests.append({
             "setDataValidation": {
                 "range": {
                     "sheetId": sid,
                     "startRowIndex": 1,
-                    "startColumnIndex": 5, "endColumnIndex": 6,
+                    "startColumnIndex": status_col, "endColumnIndex": status_col + 1,
                 },
                 "rule": {
                     "condition": {
@@ -188,11 +232,10 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
                     "strict": True,
                 }
             }
-        },
-    ]
+        })
 
     # 4. Column widths A–F
-    for col_idx, px in enumerate(COL_WIDTHS_PX):
+    for col_idx, px in enumerate(widths):
         requests.append({
             "updateDimensionProperties": {
                 "range": {
@@ -207,14 +250,15 @@ def _apply_full_format(spreadsheet, ws, data_rows: int = 0) -> None:
         })
 
     # Column G (mtg_id) — hidden internal column
-    requests.append({
-        "updateDimensionProperties": {
-            "range": {"sheetId": sid, "dimension": "COLUMNS",
-                       "startIndex": 6, "endIndex": 7},
-            "properties": {"pixelSize": MTG_ID_COL_PX, "hiddenByUser": True},
-            "fields": "pixelSize,hiddenByUser",
-        }
-    })
+    if hidden_col is not None:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS",
+                           "startIndex": hidden_col, "endIndex": hidden_col + 1},
+                "properties": {"pixelSize": MTG_ID_COL_PX, "hiddenByUser": True},
+                "fields": "pixelSize,hiddenByUser",
+            }
+        })
     fmt_warnings: list[str] = []
     try:
         _gs_call(spreadsheet.batch_update, {"requests": requests})
@@ -664,6 +708,7 @@ def _build_user_config(user_config: dict | None) -> dict:
         "sheet_id": sheet_id,
         "email":    email,
         "gcal_organizer_data": cfg.get("gcal_organizer_data"),  # dict{"ids","times"} or None
+        "full_name": cfg.get("mymeet_full_name") or "",          # ФИО for «Мои задачи»
     }
 
 
@@ -671,6 +716,370 @@ GROUPER_FORMAT = {
     "textFormat": {"bold": True, "fontSize": 10},
     "backgroundColor": {"red": 0.878, "green": 0.878, "blue": 0.878},
 }
+
+
+# ── «Мои задачи» + status colours ─────────────────────────────────────────────
+
+_GROUPER_DATE_TAIL_RE = re.compile(r"\s+\(\d{2}\.\d{2}\.\d{4}\)$")
+_UNVERIFIED_STATUS = "Требует верификации"
+
+
+def _norm_person(s) -> str:
+    """Normalise a person name for comparison: case-insensitive, all
+    whitespace (incl. NBSP) removed.  'Иван  Петров' == 'иван петров'."""
+    return "".join(str(s or "").casefold().split())
+
+
+def _quote_sheet_title(title: str) -> str:
+    """A1-notation sheet reference: wrap in single quotes, double inner quotes."""
+    return "'" + str(title).replace("'", "''") + "'"
+
+
+def _is_protocol_header(row) -> bool:
+    """True when a sheet's first row is exactly the protocol header."""
+    if not row:
+        return False
+    cells = [str(c).strip() for c in row]
+    while cells and not cells[-1]:
+        cells.pop()
+    return cells == PROTOCOL_HEADER_ROW
+
+
+def _my_tasks_sheet_title(full_name: str) -> str:
+    """Deterministic per-user sheet title «Мои задачи — {ФИО}» (≤100 chars).
+    Whitespace in ФИО is collapsed, case is kept as entered."""
+    name = " ".join(str(full_name or "").split())
+    return _safe_sheet_name(f"{MY_TASKS_SHEET_PREFIX}{name}")
+
+
+def _is_my_tasks_title(title: str) -> bool:
+    """True for the legacy «Мои задачи» and any «Мои задачи — …» sheet title."""
+    t = str(title or "")
+    return t == MY_TASKS_SHEET_NAME or t.startswith(MY_TASKS_SHEET_PREFIX)
+
+
+def _is_my_tasks_header(row) -> bool:
+    """True when the first row (read as A:G or wider) is the «Мои задачи» header."""
+    if not row:
+        return False
+    cells = [str(c).strip() for c in row]
+    while cells and not cells[-1]:
+        cells.pop()
+    n = len(cells)
+    return n >= len(MY_TASKS_HEADER_ROW) - 1 and cells == MY_TASKS_HEADER_ROW[:n]
+
+
+def _resolve_my_tasks_title(titles, full_name: str) -> str:
+    """Pick the sheet title for this user's «Мои задачи».
+
+    An existing «Мои задачи — …» sheet whose title equals the desired one after
+    _norm_person() (case/whitespace-insensitive) is reused, so the same person
+    typed in a different case gets the same sheet.  Exact match wins; among
+    several case-variants the lexicographically smallest is taken
+    (deterministic).  Otherwise the desired title is returned (to be created).
+    """
+    desired = _my_tasks_sheet_title(full_name)
+    titles = list(titles or [])
+    if desired in titles:
+        return desired
+    want = _norm_person(desired)
+    same = sorted(t for t in titles
+                  if str(t).startswith(MY_TASKS_SHEET_PREFIX) and _norm_person(t) == want)
+    return same[0] if same else desired
+
+
+def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
+    """Build «Мои задачи» data rows from protocol sheets.
+
+    sheets    — {sheet_title: rows} as read from the spreadsheet (A:G)
+    full_name — user's ФИО; only rows whose Ответственный matches it exactly
+                after _norm_person() are taken (no partial/first-name match).
+
+    Returns rows: [№, Дата, Совещание, Задача, Ответственный, Срок, Статус, mtg_id]
+    sorted by deadline (no deadline at the bottom).  Rows with any status are
+    kept (Выполнено/Отменено are hidden by the sheet filter, not dropped).
+
+    Dedup key: mtg_id|date|task|assignee.  When mtg_id is empty the meeting
+    identity is used instead: on «Разовые встречи» — the row index of the
+    current grouper row plus its title (two one-time meetings on the same day
+    stay separate); on recurring-meeting sheets — the sheet title (one date =
+    one meeting there).
+    Among duplicates a row with a manually set status (≠ «Требует верификации»)
+    wins, otherwise the first one seen.
+    """
+    target = _norm_person(full_name)
+    if not target:
+        return []
+
+    picked: dict[str, list] = {}
+    for title, rows in sheets.items():
+        if _is_my_tasks_title(title):
+            continue
+        if not rows or not _is_protocol_header(rows[0]):
+            continue
+        is_one_time = title == ONE_TIME_SHEET_NAME
+        current_meeting = "" if is_one_time else title
+        grouper_idx = 0                       # row index of the current grouper
+        for row_idx, raw in enumerate(rows[1:], 1):
+            cells = [str(c) if c is not None else "" for c in (raw or [])]
+            cells += [""] * (7 - len(cells))
+            cells = [c.strip() for c in cells[:7]]
+            if is_one_time and cells[0] and not any(cells[1:7]):
+                # Grouper row "{name}  ({dd.mm.yyyy})"
+                current_meeting = _GROUPER_DATE_TAIL_RE.sub("", cells[0]).strip()
+                grouper_idx = row_idx
+                continue
+            _num, date, task, assignee, deadline, status, mid = cells
+            if not date or not task:
+                continue
+            if _norm_person(assignee) != target:
+                continue
+            if mid:
+                base = mid
+            elif is_one_time:
+                base = f"{title}#{grouper_idx}|{current_meeting.lower()}"
+            else:
+                base = title
+            key = f"{base}|{date}|{task.lower()}|{assignee.lower()}"
+            row = [None, date, current_meeting, task, assignee, deadline, status, mid]
+            prev = picked.get(key)
+            if prev is None:
+                picked[key] = row
+            elif (prev[6] in ("", _UNVERIFIED_STATUS)
+                  and status not in ("", _UNVERIFIED_STATUS)):
+                picked[key] = row
+
+    result = list(picked.values())
+    result.sort(key=lambda r: _deadline_sort_key(r[5]))
+    for i, r in enumerate(result, 1):
+        r[0] = i
+    return result
+
+
+def _is_our_status_rule(rule: dict, sheet_id: int, status_col: int) -> bool:
+    """True for a conditional-format rule created by _status_color_requests():
+    booleanRule TEXT_EQ with a STATUS_VALUES value on exactly the status column."""
+    br = rule.get("booleanRule")
+    if not isinstance(br, dict):
+        return False
+    cond = br.get("condition") or {}
+    if cond.get("type") != "TEXT_EQ":
+        return False
+    vals = cond.get("values") or []
+    if len(vals) != 1 or vals[0].get("userEnteredValue") not in STATUS_VALUES:
+        return False
+    ranges = rule.get("ranges") or []
+    if len(ranges) != 1:
+        return False
+    r = ranges[0]
+    return (r.get("sheetId", 0) == sheet_id
+            and r.get("startColumnIndex", 0) == status_col
+            and r.get("endColumnIndex") == status_col + 1)
+
+
+def _status_color_requests(metadata: dict, targets: dict) -> list:
+    """Build batch_update requests that (re)install status colour rules.
+
+    metadata — spreadsheet metadata with sheets[].properties.sheetId and
+               sheets[].conditionalFormats
+    targets  — {sheetId: status_col (0-based)}
+
+    Only our own rules (see _is_our_status_rule) are deleted, by index in
+    descending order; foreign rules are left untouched.  Then one rule per
+    status is added.  Running it twice yields the same final rule set.
+    """
+    existing: dict[int, list] = {}
+    for sh in (metadata or {}).get("sheets") or []:
+        props = sh.get("properties") or {}
+        existing[props.get("sheetId", 0)] = sh.get("conditionalFormats") or []
+
+    reqs: list = []
+    for sid, col in targets.items():
+        rules = existing.get(sid, [])
+        ours = [i for i, rule in enumerate(rules) if _is_our_status_rule(rule, sid, col)]
+        for i in sorted(ours, reverse=True):
+            reqs.append({"deleteConditionalFormatRule": {"sheetId": sid, "index": i}})
+        for i, status in enumerate(STATUS_VALUES):
+            reqs.append({
+                "addConditionalFormatRule": {
+                    "index": i,
+                    "rule": {
+                        "ranges": [{
+                            "sheetId": sid,
+                            "startRowIndex": 1,          # open-ended downwards
+                            "startColumnIndex": col,
+                            "endColumnIndex": col + 1,
+                        }],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "TEXT_EQ",
+                                "values": [{"userEnteredValue": status}],
+                            },
+                            "format": STATUS_COLORS[status],
+                        },
+                    },
+                }
+            })
+    return reqs
+
+
+def _ensure_status_colors(spreadsheet, metadata: dict, targets: dict) -> None:
+    """Install status colour rules on all target sheets in ONE batch_update."""
+    reqs = _status_color_requests(metadata, targets)
+    if reqs:
+        _gs_call(spreadsheet.batch_update, {"requests": reqs})
+
+
+def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
+                          warnings: list):
+    """Get-or-add the user's «Мои задачи — ФИО» sheet, overwrite its data,
+    format it, set the filter.  Returns the worksheet.
+
+    The sheet is never cleared before writing: data is written first
+    (A1:H{n}), and only after a successful update the tail of old rows below
+    is cleared.  If update fails, the old content stays and the exception
+    propagates (caller turns it into a warning).
+    """
+    if exists:
+        ws = _gs_call(spreadsheet.worksheet, title)
+    else:
+        ws = _gs_call(spreadsheet.add_worksheet, title=title, rows=1000, cols=10)
+        # One-time soft protection: the sheet is regenerated on every sync.
+        try:
+            _gs_call(spreadsheet.batch_update, {"requests": [{
+                "addProtectedRange": {
+                    "protectedRange": {
+                        "range": {"sheetId": ws.id},
+                        "description": "Генерируется ботом при синхронизации. "
+                                       "Статус меняйте в листе протокола.",
+                        "warningOnly": True,
+                    }
+                }
+            }]})
+        except Exception as e:
+            msg = f"{title} (защита листа): {e}"
+            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            warnings.append(msg)
+
+    all_data = [MY_TASKS_HEADER_ROW] + rows
+    need_rows = len(all_data)
+    need_cols = len(MY_TASKS_HEADER_ROW)
+    try:
+        cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
+    except Exception:
+        cur_rows, cur_cols = 1000, 10
+    if need_rows > cur_rows or need_cols > cur_cols:
+        _gs_call(ws.resize, rows=max(need_rows, cur_rows), cols=max(need_cols, cur_cols))
+    _gs_call(ws.update, values=all_data, range_name=f"A1:H{need_rows}")
+    # Clear leftovers of a previous (longer) run only after a successful write.
+    if cur_rows > need_rows:
+        try:
+            _gs_call(ws.batch_clear, [f"A{need_rows + 1}:H{cur_rows}"])
+        except Exception as e:
+            msg = f"{title} (очистка старых строк): {e}"
+            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            warnings.append(msg)
+
+    warnings.extend(_apply_full_format(
+        spreadsheet, ws, data_rows=len(rows),
+        ncols=len(MY_TASKS_COL_WIDTHS_PX),
+        status_col=None,                    # read-only sheet — no dropdown
+        col_widths=MY_TASKS_COL_WIDTHS_PX,
+        hidden_col=MY_TASKS_MTG_ID_COL,
+    ))
+
+    try:
+        _gs_call(spreadsheet.batch_update, {"requests": [{
+            "setBasicFilter": {
+                "filter": {
+                    "range": {"sheetId": ws.id},
+                    "filterSpecs": [{
+                        "columnIndex": MY_TASKS_STATUS_COL,
+                        "filterCriteria": {"hiddenValues": list(MY_TASKS_HIDDEN_STATUSES)},
+                    }],
+                }
+            }
+        }]})
+    except Exception as e:
+        msg = f"{title} (фильтр): {e}"
+        logger.warning("Sheet formatting error (%s): %s", title, msg)
+        warnings.append(msg)
+    return ws
+
+
+def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
+    """Post-sync step: status colours on protocol sheets and on every
+    «Мои задачи — …» sheet; when full_name is set, the user's personal
+    «Мои задачи — {ФИО}» sheet is (re)written.  Other users' sheets are never
+    written or cleared (only our colour rules on them are refreshed).
+
+    Returns (warnings: list[str], my_tasks_count: int | None, my_title: str | None).
+    my_tasks_count is None when the sheet was not written.
+    Never raises for sheet-level problems — they are returned as warnings.
+    """
+    warnings: list[str] = []
+    full_name = (full_name or "").strip()
+
+    meta = _gs_call(spreadsheet.fetch_sheet_metadata, params={
+        "fields": "sheets(properties(sheetId,title),conditionalFormats,basicFilter)",
+    })
+    if not isinstance(meta, dict):
+        meta = {}
+    sheet_ids: dict[str, int] = {}
+    for sh in meta.get("sheets") or []:
+        props = sh.get("properties") or {}
+        if "title" in props:
+            sheet_ids[props["title"]] = props.get("sheetId", 0)
+    titles = list(sheet_ids)
+
+    values: dict[str, list] = {}
+    if titles:
+        suffix = "!A:G" if full_name else "!A1:G1"
+        resp = _gs_call(spreadsheet.values_batch_get,
+                        [_quote_sheet_title(t) + suffix for t in titles])
+        vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+        for t, vr in zip(titles, vranges):
+            values[t] = (vr or {}).get("values") or []
+
+    protocol_titles = [t for t in titles
+                       if values.get(t) and _is_protocol_header(values[t][0])]
+    color_targets = {sheet_ids[t]: 5 for t in protocol_titles}
+    # Existing «Мои задачи — …» sheets of any user: colours only, no data writes.
+    for t in titles:
+        if (_is_my_tasks_title(t) and t not in protocol_titles
+                and values.get(t) and _is_my_tasks_header(values[t][0])):
+            color_targets[sheet_ids[t]] = MY_TASKS_STATUS_COL
+
+    my_count = None
+    my_title = None
+    if full_name:
+        my_title = _resolve_my_tasks_title(titles, full_name)
+        if my_title in protocol_titles:
+            msg = (f"Лист «{my_title}» занят протоколом встречи с таким "
+                   f"же названием — личный лист не обновлён")
+            logger.warning("My tasks: %s", msg)
+            warnings.append(msg)
+        else:
+            try:
+                rows = _build_my_tasks_rows(
+                    {t: values[t] for t in protocol_titles}, full_name)
+                ws = _write_my_tasks_sheet(
+                    spreadsheet, my_title, my_title in sheet_ids, rows, warnings)
+                color_targets[ws.id] = MY_TASKS_STATUS_COL
+                my_count = len(rows)
+            except Exception as e:
+                msg = f"{my_title}: {e}"
+                logger.warning("Sheet formatting error (%s): %s", my_title, msg)
+                warnings.append(msg)
+
+    if color_targets:
+        try:
+            _ensure_status_colors(spreadsheet, meta, color_targets)
+        except Exception as e:
+            msg = f"цвета статусов: {e}"
+            logger.warning("Sheet formatting error (status colors): %s", msg)
+            warnings.append(msg)
+    return warnings, my_count, my_title
 
 
 # ── Core sync ─────────────────────────────────────────────────────────────────
@@ -756,7 +1165,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     sheets_written = 0
     all_fmt_warnings: list[str] = []
 
-    HEADER_ROW = ["№", "Дата", "Задача", "Ответственный", "Срок", "Статус", "mtg_id"]
+    HEADER_ROW = list(PROTOCOL_HEADER_ROW)
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
@@ -862,7 +1271,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     # ── One-time meetings ─────────────────────────────────────────────────────
     # Format: № | Дата | Задача | Ответственный | Срок | Статус
     # Bold grouper row with meeting name before each meeting's tasks.
-    ot_name = "Разовые встречи"
+    ot_name = ONE_TIME_SHEET_NAME
     try:
         ws = spreadsheet.worksheet(ot_name)
         if not append:
@@ -999,6 +1408,26 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         except Exception as e:
             logger.warning("Sheet formatting error (grouper rows): %s", e)
 
+    # ── Status colours + personal «Мои задачи» sheet ──────────────────────────
+    # Must never break the main sync: any failure becomes a warning.
+    full_name = (cfg.get("full_name") or "").strip()
+    my_tasks_count = None
+    my_tasks_title = None
+    try:
+        _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
+            spreadsheet, full_name)
+        all_fmt_warnings.extend(_mt_warnings)
+    except Exception as e:
+        logger.warning("Sheet formatting error (Мои задачи / цвета): %s", e)
+        all_fmt_warnings.append(f"Мои задачи / цвета статусов: {e}")
+    if not full_name:
+        my_tasks_line = (f"\n👤 Лист «{MY_TASKS_SHEET_PREFIX}ФИО» не создан. "
+                         f"Укажите ФИО: /setname Имя Фамилия")
+    elif my_tasks_count is not None:
+        my_tasks_line = f"\n👤 Лист «{my_tasks_title}»: {my_tasks_count} задач"
+    else:
+        my_tasks_line = ""
+
     fmt_warn_text = (
         f"\n⚠️ Ошибки форматирования ({len(all_fmt_warnings)}):\n"
         + "\n".join(f"  • {w}" for w in all_fmt_warnings)
@@ -1012,6 +1441,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         f"📝 Разовые встречи: {len(one_time)} встреч\n"
         f"📅 Период: {_diag_from.strftime('%d.%m.%Y')} — {_diag_now.strftime('%d.%m.%Y')}\n"
         f"🔍 API {_fetched_count} → дата {_after_date_count} → организатор {_after_org_count}"
+        + my_tasks_line
         + fmt_warn_text
     )
     logger.info("MYmeet sync done: %s", result.replace('\n', ' | '))

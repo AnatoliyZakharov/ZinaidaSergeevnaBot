@@ -344,21 +344,47 @@ def save_mymeet_config(
 ) -> None:
     """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done.
     Токен шифруется перед записью в базу (Fernet/AES).
+
+    Raises:
+        crypto.CryptoError  — шифрование токена не удалось.
+        RuntimeError        — строка пользователя не обновилась (внутренняя ошибка БД).
     """
     encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
-        conn.execute("""
+        cur = conn.execute("""
             UPDATE users SET
-                mymeet_token          = ?,
-                mymeet_ws_id          = ?,
-                mymeet_spreadsheet_id = ?,
+                mymeet_token           = ?,
+                mymeet_ws_id           = ?,
+                mymeet_spreadsheet_id  = ?,
                 mymeet_organizer_email = ?,
-                mymeet_setup_done     = 1
+                mymeet_setup_done      = 1
             WHERE telegram_id = ?
         """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
+        if cur.rowcount == 0:
+            # Пользователь не найден — вставляем (гонка или первый вход без upsert_user)
+            conn.execute("""
+                INSERT INTO users (
+                    telegram_id, mymeet_token, mymeet_ws_id,
+                    mymeet_spreadsheet_id, mymeet_organizer_email, mymeet_setup_done
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    mymeet_token           = excluded.mymeet_token,
+                    mymeet_ws_id           = excluded.mymeet_ws_id,
+                    mymeet_spreadsheet_id  = excluded.mymeet_spreadsheet_id,
+                    mymeet_organizer_email = excluded.mymeet_organizer_email,
+                    mymeet_setup_done      = 1
+            """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email))
         conn.commit()
+        # Верифицируем: читаем обратно и убеждаемся, что setup_done = 1
+        verify = conn.execute(
+            "SELECT mymeet_setup_done FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
         conn.close()
+    if not verify or not verify[0]:
+        raise RuntimeError(
+            f"save_mymeet_config: данные не сохранены для telegram_id={telegram_id}"
+        )
 
 
 def get_mymeet_users() -> list:

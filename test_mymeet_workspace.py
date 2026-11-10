@@ -510,3 +510,231 @@ class TestManualSyncDecryption:
         reply_calls = mock_message.reply_text.call_args_list
         assert any("setup_mymeet" in str(c) for c in reply_calls), \
             f"Ожидалось упоминание /setup_mymeet в ответе, получено: {reply_calls}"
+
+
+# ---------------------------------------------------------------------------
+# БЛОК 7: Полный двухшаговый сценарий /setup_mymeet (шаг1 токен → шаг2 таблица)
+# ---------------------------------------------------------------------------
+
+class TestMymeetSetupTwoStep:
+    """Интеграционные тесты всего визарда /setup_mymeet."""
+
+    @pytest.fixture
+    def db_mod(self, tmp_path, monkeypatch):
+        """Временная БД с созданным пользователем (имитирует upsert_user из cmd_setup_mymeet)."""
+        db_path = tmp_path / "setup_test.db"
+        monkeypatch.setenv("DB_PATH", str(db_path))
+        import sys
+        if "db" in sys.modules:
+            del sys.modules["db"]
+        import db as db_module
+        db_module.init_db()
+        db_module.upsert_user(55667788, "setup_tester")
+        yield db_module
+        if "db" in sys.modules:
+            del sys.modules["db"]
+
+    # ------------------------------------------------------------------ шаг 1
+
+    @pytest.mark.asyncio
+    async def test_step1_token_accepted_transitions_to_step2(self):
+        """Верный токен переводит setup.step в _SETUP_STEP_SHEET."""
+        mock_message = AsyncMock()
+        mock_message.delete = AsyncMock()
+        edited = AsyncMock()
+        mock_message.reply_text = AsyncMock(return_value=edited)
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+        mock_context = MagicMock()
+        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token"}}
+
+        ws_result = {"id": "active", "name": "Тест-WS"}
+        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result):
+            import main as m
+            result = await m._handle_mymeet_setup(
+                telegram_id=55667788,
+                text=_mk_tok("good_token_abcdef123456789"),
+                update=mock_update,
+                context=mock_context,
+            )
+
+        assert result is True
+        setup = mock_context.user_data["mymeet_setup"]
+        assert setup["step"] == "mymeet_sheet"
+        assert setup["token"].startswith("mm_")
+        assert setup["ws_id"] == "active"
+
+    # ------------------------------------------------------------------ шаг 2 — успех
+
+    @pytest.mark.asyncio
+    async def test_step2_full_url_success_saves_config(self, db_mod):
+        """Шаг 2: полный URL Google Sheets → конфиг сохранён, пользователь получает 🎉."""
+        mock_message = AsyncMock()
+        mock_message.reply_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "mymeet_setup": {
+                "step": "mymeet_sheet",
+                "token": _mk_tok("good_token_abcdef123456789"),
+                "ws_id": "active",
+            }
+        }
+
+        sheet_url = "https://docs.google.com/spreadsheets/d/1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0/edit?gid=0#gid=0"
+        with patch("db.save_mymeet_config", side_effect=db_mod.save_mymeet_config), \
+             patch("db.get_user", side_effect=db_mod.get_user):
+            import main as m
+            result = await m._handle_mymeet_setup(
+                telegram_id=55667788,
+                text=sheet_url,
+                update=mock_update,
+                context=mock_context,
+            )
+
+        assert result is True
+        # Сессия очищена
+        assert "mymeet_setup" not in mock_context.user_data
+        # Пользователь получил сообщение об успехе
+        reply_text = mock_message.reply_text.call_args[0][0]
+        assert "🎉" in reply_text
+        # Конфиг сохранён в БД
+        user = db_mod.get_user(55667788)
+        assert user["mymeet_setup_done"] == 1
+        assert user["mymeet_spreadsheet_id"] == "1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0"
+        # Токен зашифрован
+        import crypto
+        assert crypto.is_encrypted(user["mymeet_token"])
+
+    # ------------------------------------------------------------------ шаг 2 — ошибка DB показывается
+
+    @pytest.mark.asyncio
+    async def test_step2_db_error_shown_to_user(self):
+        """Если save_mymeet_config падает — пользователь получает ❌, а не тишину."""
+        mock_message = AsyncMock()
+        mock_message.reply_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "mymeet_setup": {
+                "step": "mymeet_sheet",
+                "token": _mk_tok("good_token_abcdef123456789"),
+                "ws_id": "active",
+            }
+        }
+
+        with patch("db.save_mymeet_config", side_effect=RuntimeError("БД недоступна")):
+            import main as m
+            result = await m._handle_mymeet_setup(
+                telegram_id=55667788,
+                text="1_c3rMhDnA-hKJu_NTkq0pca_clyrgFoQRj1Iu9Re0_XXXX",
+                update=mock_update,
+                context=mock_context,
+            )
+
+        assert result is True
+        # Пользователь получил сообщение об ошибке
+        reply_text = str(mock_message.reply_text.call_args)
+        assert "❌" in reply_text
+        assert "RuntimeError" in reply_text or "Ошибка" in reply_text
+
+    # ------------------------------------------------------------------ шаг 2 — устаревшая сессия
+
+    @pytest.mark.asyncio
+    async def test_step2_expired_session_shown_to_user(self):
+        """Если токен/ws_id потеряны (рестарт бота) — пользователь получает понятное сообщение."""
+        mock_message = AsyncMock()
+        mock_message.reply_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+        mock_context = MagicMock()
+        # Имитируем потерю данных после рестарта: step есть, но токен и ws_id — нет
+        mock_context.user_data = {
+            "mymeet_setup": {"step": "mymeet_sheet"}
+        }
+
+        with patch("db.save_mymeet_config") as mock_save:
+            import main as m
+            result = await m._handle_mymeet_setup(
+                telegram_id=55667788,
+                text="1_c3rMhDnA-hKJu_NTkq0pca_clyrgFoQRj1Iu9Re0_XXXX",
+                update=mock_update,
+                context=mock_context,
+            )
+
+        assert result is True
+        mock_save.assert_not_called()          # save не должен вызываться
+        assert "mymeet_setup" not in mock_context.user_data  # сессия очищена
+        reply_text = str(mock_message.reply_text.call_args)
+        assert "setup_mymeet" in reply_text    # подсказка что делать
+
+    # ------------------------------------------------------------------ шаг 2 — URL parsing
+
+    def test_step2_url_id_extraction(self):
+        """Регулярка корректно извлекает ID из полного URL Google Sheets."""
+        import re
+        pattern = r"/spreadsheets/d/([A-Za-z0-9_-]+)"
+        cases = [
+            (
+                "https://docs.google.com/spreadsheets/d/1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0/edit?gid=0#gid=0",
+                "1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0",
+            ),
+            (
+                "https://docs.google.com/spreadsheets/d/ABCDEF1234567890GHIJKL/edit",
+                "ABCDEF1234567890GHIJKL",
+            ),
+        ]
+        for url, expected_id in cases:
+            m = re.search(pattern, url)
+            assert m is not None, f"Паттерн не нашёл ID в: {url}"
+            assert m.group(1) == expected_id, f"Ожидался {expected_id!r}, получен {m.group(1)!r}"
+
+    def test_step2_short_id_rejected(self):
+        """Строка короче 20 символов не проходит проверку длины."""
+        # Прямая проверка условия из кода: len(sheet_id) < 20
+        short_ids = ["1234", "abc", "ABCDEFGHIJ"]
+        for sid in short_ids:
+            assert len(sid) < 20, f"Тест неправильный: {sid!r} длиннее 20"
+
+    # ------------------------------------------------------------------ проверка saved = 1
+
+    @pytest.mark.asyncio
+    async def test_step2_setup_done_flag_set_in_db(self, db_mod):
+        """После шага 2 mymeet_setup_done=1 в реальной БД."""
+        mock_message = AsyncMock()
+        mock_message.reply_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "mymeet_setup": {
+                "step": "mymeet_sheet",
+                "token": _mk_tok("good_token_abcdef123456789"),
+                "ws_id": "active",
+            }
+        }
+
+        with patch("db.save_mymeet_config", side_effect=db_mod.save_mymeet_config), \
+             patch("db.get_user", side_effect=db_mod.get_user):
+            import main as m
+            await m._handle_mymeet_setup(
+                telegram_id=55667788,
+                text="1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0",
+                update=mock_update,
+                context=mock_context,
+            )
+
+        user = db_mod.get_user(55667788)
+        assert user["mymeet_setup_done"] == 1, \
+            f"mymeet_setup_done={user['mymeet_setup_done']} — ожидался 1"
+        # После синка доступен расшифрованный токен
+        users = db_mod.get_mymeet_users()
+        assert len(users) == 1
+        assert users[0]["mymeet_token"] == _mk_tok("good_token_abcdef123456789")

@@ -970,6 +970,14 @@ async def _handle_mymeet_setup(
 
         token = setup.get("token")
         ws_id = setup.get("ws_id")
+        # Защита от рестарта бота: если токен/ws_id потеряны — сессия устарела
+        if not token or not ws_id:
+            context.user_data.pop("mymeet_setup", None)
+            await update.message.reply_text(
+                "⚠️ Сессия настройки устарела (бот перезапускался). "
+                "Запусти /setup_mymeet снова."
+            )
+            return True
         try:
             db.save_mymeet_config(
                 telegram_id,

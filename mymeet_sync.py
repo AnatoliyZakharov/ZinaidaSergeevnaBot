@@ -788,7 +788,8 @@ def _resolve_my_tasks_title(titles, full_name: str) -> str:
     return same[0] if same else desired
 
 
-def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
+def _build_my_tasks_rows(sheets: dict, full_name: str,
+                         extra_rows: list | None = None) -> list:
     """Build «Мои задачи» data rows from protocol sheets.
 
     sheets    — {sheet_title: rows} as read from the spreadsheet (A:G)
@@ -806,6 +807,12 @@ def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
     one meeting there).
     Among duplicates a row with a manually set status (≠ «Требует верификации»)
     wins, otherwise the first one seen.
+
+    extra_rows — rows of meetings where the user is NOT the organizer (they
+    have no protocol sheet), already in the output layout
+    [№, Дата, Совещание, Задача, Ответственный, Срок, Статус, mtg_id], see
+    _merge_other_meeting_rows().  They are filtered by the same ФИО rule and
+    keyed by mtg_id|date|task|assignee; a protocol row with the same key wins.
     """
     target = _norm_person(full_name)
     if not target:
@@ -849,11 +856,127 @@ def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
                   and status not in ("", _UNVERIFIED_STATUS)):
                 picked[key] = row
 
+    protocol_keys = set(picked)
+    for raw in extra_rows or []:
+        cells = [str(c) if c is not None else "" for c in (raw or [])]
+        cells += [""] * (8 - len(cells))
+        cells = [c.strip() for c in cells[:8]]
+        _num, date, meeting, task, assignee, deadline, status, mid = cells
+        if not date or not task or not mid:
+            continue
+        if _norm_person(assignee) != target:
+            continue
+        key = f"{mid}|{date}|{task.lower()}|{assignee.lower()}"
+        if key in protocol_keys:
+            continue                        # protocol row wins
+        row = [None, date, meeting, task, assignee, deadline, status, mid]
+        prev = picked.get(key)
+        if prev is None:
+            picked[key] = row
+        elif (prev[6] in ("", _UNVERIFIED_STATUS)
+              and status not in ("", _UNVERIFIED_STATUS)):
+            picked[key] = row
+
     result = list(picked.values())
     result.sort(key=lambda r: _deadline_sort_key(r[5]))
     for i, r in enumerate(result, 1):
         r[0] = i
     return result
+
+
+def _other_meeting_rows(meetings: list, full_name: str) -> tuple:
+    """Rows for «Мои задачи» from meetings where the user is NOT the organizer.
+
+    meetings  — results of sync_to_sheets()._fetch_one() for those meetings
+                ({"id", "name", "date", "tasks", "loaded"}).
+    full_name — only tasks whose assignee equals it after _norm_person().
+
+    Returns (rows, loaded_mids):
+      rows        — [None, date, meeting_name, task, assignee, deadline,
+                     status, mtg_id]; status «Выполнено» if MYmeet says done,
+                     otherwise «Требует верификации» (same as protocols);
+                     deadline as-is, exactly as written to protocol sheets.
+      loaded_mids — ids of meetings whose protocol was actually received.
+                     Only for them the old rows on the personal sheet are
+                     replaced; for meetings with a failed/absent protocol the
+                     old rows are kept (no data loss on API errors).
+    """
+    target = _norm_person(full_name)
+    rows: list = []
+    loaded: set = set()
+    if not target:
+        return rows, loaded
+    seen: set = set()
+    for m in meetings or []:
+        mid = str(m.get("id") or "").strip()
+        if not mid or not m.get("loaded"):
+            continue
+        loaded.add(mid)
+        for task in m.get("tasks") or []:
+            if _norm_person(task.get("assignee")) != target:
+                continue
+            rkey = _run_key(mid, m.get("date", ""), task.get("name", ""),
+                            task.get("assignee", ""))
+            if rkey in seen:
+                continue
+            seen.add(rkey)
+            rows.append([
+                None, m.get("date", ""), m.get("name", ""), task.get("name", ""),
+                task.get("assignee", ""), task.get("deadline", ""),
+                "Выполнено" if task.get("done") else _UNVERIFIED_STATUS,
+                mid,
+            ])
+    return rows, loaded
+
+
+def _merge_other_meeting_rows(personal_rows: list, fresh_rows: list,
+                              fresh_mids: set, protocol_mids: set) -> list:
+    """Combine fresh rows of non-organizer meetings with history kept on the
+    user's personal «Мои задачи» sheet.
+
+    personal_rows — current data rows of the personal sheet (A:H, no header)
+    fresh_rows    — _other_meeting_rows() output for the current sync window
+    fresh_mids    — meetings whose protocol was loaded in this sync
+    protocol_mids — mtg_ids present in protocol sheets (those always win)
+
+    * Fresh row: status taken from the personal sheet row with the same key
+      (mtg_id|date|task|assignee) when it is set manually (not empty and not
+      «Требует верификации»); otherwise the MYmeet status (done → «Выполнено»).
+    * History: personal-sheet rows with a non-empty mtg_id that is neither in
+      protocol sheets nor among fresh meetings are carried over unchanged —
+      tasks of non-organizer meetings outside the current window.
+    * Rows without mtg_id are not carried over (they come from protocols).
+    """
+    def _cells(raw):
+        c = [str(x) if x is not None else "" for x in (raw or [])]
+        c += [""] * (8 - len(c))
+        return [x.strip() for x in c[:8]]
+
+    manual: dict[str, str] = {}
+    carried: list = []
+    for raw in personal_rows or []:
+        _n, date, meeting, task, assignee, deadline, status, mid = _cells(raw)
+        if not mid or not date or not task:
+            continue
+        key = f"{mid}|{date}|{task.lower()}|{assignee.lower()}"
+        if status and status != _UNVERIFIED_STATUS:
+            manual.setdefault(key, status)
+        if mid in protocol_mids or mid in fresh_mids:
+            continue
+        carried.append([None, date, meeting, task, assignee, deadline, status, mid])
+
+    result: list = []
+    for raw in fresh_rows or []:
+        row = _cells(raw)
+        row[0] = None
+        _n, date, _mt, task, assignee, _dl, _st, mid = row
+        if not mid or mid in protocol_mids:
+            continue
+        key = f"{mid}|{date}|{task.lower()}|{assignee.lower()}"
+        if key in manual:
+            row[6] = manual[key]
+        result.append(row)
+    return result + carried
 
 
 def _is_our_status_rule(rule: dict, sheet_id: int, status_col: int) -> bool:
@@ -951,7 +1074,9 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
                     "protectedRange": {
                         "range": {"sheetId": ws.id},
                         "description": "Генерируется ботом при синхронизации. "
-                                       "Статус меняйте в листе протокола.",
+                                       "Статус задач своих встреч меняйте в "
+                                       "листе протокола, задач чужих встреч — "
+                                       "на этом листе.",
                         "warningOnly": True,
                     }
                 }
@@ -1007,11 +1132,21 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     return ws
 
 
-def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
+def _sync_my_tasks_and_colors(spreadsheet, full_name: str,
+                              other_rows: list | None = None,
+                              other_mids: set | None = None,
+                              stats: dict | None = None) -> tuple:
     """Post-sync step: status colours on protocol sheets and on every
     «Мои задачи — …» sheet; when full_name is set, the user's personal
     «Мои задачи — {ФИО}» sheet is (re)written.  Other users' sheets are never
     written or cleared (only our colour rules on them are refreshed).
+
+    other_rows / other_mids — fresh rows and loaded meeting ids of meetings
+    where the user is not the organizer (see _other_meeting_rows()).  History
+    of such meetings from earlier syncs is read back from the personal sheet
+    (A:H, mtg_id in H) and kept, see _merge_other_meeting_rows().
+    stats — optional dict; on success stats["other"] = number of rows from
+    non-organizer meetings on the personal sheet.
 
     Returns (warnings: list[str], my_tasks_count: int | None, my_title: str | None).
     my_tasks_count is None when the sheet was not written.
@@ -1032,11 +1167,16 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             sheet_ids[props["title"]] = props.get("sheetId", 0)
     titles = list(sheet_ids)
 
+    my_title = _resolve_my_tasks_title(titles, full_name) if full_name else None
+
     values: dict[str, list] = {}
     if titles:
         suffix = "!A:G" if full_name else "!A1:G1"
+        # Personal sheet is read up to H to get mtg_id (history of
+        # non-organizer meetings); all other sheets stay A:G.
         resp = _gs_call(spreadsheet.values_batch_get,
-                        [_quote_sheet_title(t) + suffix for t in titles])
+                        [_quote_sheet_title(t) + ("!A:H" if t == my_title else suffix)
+                         for t in titles])
         vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
         for t, vr in zip(titles, vranges):
             values[t] = (vr or {}).get("values") or []
@@ -1051,9 +1191,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             color_targets[sheet_ids[t]] = MY_TASKS_STATUS_COL
 
     my_count = None
-    my_title = None
     if full_name:
-        my_title = _resolve_my_tasks_title(titles, full_name)
         if my_title in protocol_titles:
             msg = (f"Лист «{my_title}» занят протоколом встречи с таким "
                    f"же названием — личный лист не обновлён")
@@ -1061,12 +1199,25 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             warnings.append(msg)
         else:
             try:
+                protocol_mids: set = set()
+                for t in protocol_titles:
+                    for r in values[t][1:]:
+                        if len(r) > 6 and str(r[6] or "").strip():
+                            protocol_mids.add(str(r[6]).strip())
+                personal = values.get(my_title) or []
+                if not (personal and _is_my_tasks_header(personal[0])):
+                    personal = []
+                extra = _merge_other_meeting_rows(
+                    personal[1:], other_rows or [], set(other_mids or ()), protocol_mids)
                 rows = _build_my_tasks_rows(
-                    {t: values[t] for t in protocol_titles}, full_name)
+                    {t: values[t] for t in protocol_titles}, full_name, extra_rows=extra)
                 ws = _write_my_tasks_sheet(
                     spreadsheet, my_title, my_title in sheet_ids, rows, warnings)
                 color_targets[ws.id] = MY_TASKS_STATUS_COL
                 my_count = len(rows)
+                if stats is not None:
+                    stats["other"] = sum(1 for r in rows
+                                         if r[7] and r[7] not in protocol_mids)
             except Exception as e:
                 msg = f"{my_title}: {e}"
                 logger.warning("Sheet formatting error (%s): %s", my_title, msg)
@@ -1116,7 +1267,25 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             "проверки организатора. "
             "Синхронизация отменена — Google Sheets не изменён."
         )
-    raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
+    # Split, not drop: protocols are written ONLY for meetings where the user
+    # is the organizer (org_meetings, unchanged pipeline below).  The other
+    # meetings are used solely for the personal «Мои задачи» sheet.
+    #
+    # MYmeet API limits (confirmed by this module, nothing else is used):
+    #   GET {MYMEET_BASE}/api/workspaces/active/all-meetings
+    #       page/perPage/dateFrom/dateTo — meetings of the token's active
+    #       workspace in the sync window;
+    #   GET {MYMEET_BASE}/api/storage/download?meeting_id=…&format=json
+    #       — protocol (404 → None).
+    # "All meetings available to the user" therefore means: what all-meetings
+    # returns for the user's token within the `days` window.  Meetings outside
+    # the window are not reachable; their tasks survive only as history on
+    # the personal sheet (see _merge_other_meeting_rows).
+    org_meetings: list = []
+    other_meetings: list = []
+    for m in raw_meetings:
+        (org_meetings if _is_organizer_by_gcal(m, _gcal_data) else other_meetings).append(m)
+    raw_meetings = org_meetings
     _after_org_count = len(raw_meetings)
     logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
                 len(_gcal_data.get("ids", set())), len(_gcal_data.get("times", set())), _after_org_count)
@@ -1132,16 +1301,37 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             "name":  name,
             "date":  _fmt_date(date),
             "tasks": _extract_tasks(protocol),
+            "loaded": protocol is not None,
         }
 
+    # Protocols of non-organizer meetings are needed only for «Мои задачи»:
+    # without ФИО they are not requested at all (no extra API calls).
+    full_name = (cfg.get("full_name") or "").strip()
+    other_to_fetch = other_meetings if full_name else []
+
     all_meetings = []
+    other_fetched: list = []
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
+        futures = {pool.submit(_fetch_one, m): False for m in raw_meetings}
+        futures.update({pool.submit(_fetch_one, m): True for m in other_to_fetch})
         for fut in as_completed(futures):
             try:
-                all_meetings.append(fut.result())
+                res = fut.result()
             except Exception as e:
                 logger.debug("Protocol fetch error: %s", e)
+                continue
+            (other_fetched if futures[fut] else all_meetings).append(res)
+
+    other_rows: list = []
+    other_mids: set = set()
+    if full_name:
+        try:
+            other_rows, other_mids = _other_meeting_rows(other_fetched, full_name)
+        except Exception as e:
+            logger.warning("My tasks: non-organizer meetings skipped: %s", e)
+            other_rows, other_mids = [], set()
+        logger.info("Non-organizer meetings: %d in window, %d protocols loaded, %d my tasks",
+                    len(other_meetings), len(other_mids), len(other_rows))
 
     total_tasks = sum(len(m["tasks"]) for m in all_meetings)
     logger.info("Total tasks: %d", total_tasks)
@@ -1410,12 +1600,13 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     # ── Status colours + personal «Мои задачи» sheet ──────────────────────────
     # Must never break the main sync: any failure becomes a warning.
-    full_name = (cfg.get("full_name") or "").strip()
     my_tasks_count = None
     my_tasks_title = None
+    _mt_stats: dict = {}
     try:
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name)
+            spreadsheet, full_name, other_rows=other_rows, other_mids=other_mids,
+            stats=_mt_stats)
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error (Мои задачи / цвета): %s", e)
@@ -1425,6 +1616,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                          f"Укажите ФИО: /setname Имя Фамилия")
     elif my_tasks_count is not None:
         my_tasks_line = f"\n👤 Лист «{my_tasks_title}»: {my_tasks_count} задач"
+        if _mt_stats.get("other"):
+            my_tasks_line += f" (из них с чужих встреч: {_mt_stats['other']})"
     else:
         my_tasks_line = ""
 

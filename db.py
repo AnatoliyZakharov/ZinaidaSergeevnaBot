@@ -503,23 +503,37 @@ def set_mymeet_setup_in_progress(telegram_id: int, active: bool) -> None:
 
 
 def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
-    """Сохраняем pending-состояние визарда (зашифрованный токен + ws_id) в БД.
+    """Атомарно сохраняем pending-состояние визарда: зашифрованный токен, ws_id и
+    mymeet_setup_in_progress=1 в одной транзакции с верификацией успешной записи.
     Данные переживают перезапуск бота и позволяют восстановить шаг 2 без повторного
     ввода токена пользователем.
 
     Raises:
         crypto.CryptoError — шифрование не удалось.
+        RuntimeError — данные не подтвердились после коммита (диск, БД).
     """
     encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
         conn.execute(
-            "UPDATE users SET mymeet_pending_token = ?, mymeet_pending_ws_id = ? "
+            "UPDATE users "
+            "SET mymeet_pending_token = ?, mymeet_pending_ws_id = ?, "
+            "mymeet_setup_in_progress = 1 "
             "WHERE telegram_id = ?",
             (encrypted_token, ws_id, telegram_id),
         )
         conn.commit()
+        verify = conn.execute(
+            "SELECT mymeet_pending_token, mymeet_pending_ws_id, mymeet_setup_in_progress "
+            "FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
         conn.close()
+    if not verify or not verify[0] or not verify[1] or not verify[2]:
+        raise RuntimeError(
+            "save_mymeet_pending: данные не подтвердились после записи "
+            f"(telegram_id={telegram_id})"
+        )
 
 
 def get_mymeet_pending(telegram_id: int) -> Optional[tuple]:

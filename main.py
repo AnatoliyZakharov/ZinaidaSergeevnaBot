@@ -985,8 +985,21 @@ async def _handle_mymeet_setup(
         try:
             db.save_mymeet_pending(telegram_id, text, ws_id)
         except Exception as _pend_exc:
-            logger.warning("save_mymeet_pending не удалось: %s", _pend_exc)
-            # Не блокируем wizard — просто не переживёт рестарт
+            # Логируем только тип исключения — не строку, которая может содержать данные
+            logger.error(
+                "save_mymeet_pending: ошибка записи для telegram_id=%s (тип: %s)",
+                telegram_id, type(_pend_exc).__name__,
+            )
+            # Нельзя продолжать: данные не сохранены, wizard не переживёт рестарт
+            context.user_data.pop("mymeet_setup", None)
+            await msg.edit_text(
+                "❌ <b>Не удалось сохранить данные настройки.</b>\n\n"
+                "Попробуй ещё раз: /setup_mymeet\n"
+                "Если ошибка повторяется — обратись к разработчику.",
+                parse_mode="HTML",
+            )
+            return True
+        # Pending-состояние успешно сохранено — продолжаем wizard
         setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
         context.user_data["mymeet_setup"] = setup
         await msg.edit_text(

@@ -849,6 +849,7 @@ async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         telegram_id = update.effective_user.id
         db.upsert_user(telegram_id, update.effective_user.username)
         db.reset_mymeet_config(telegram_id)
+        db.set_mymeet_setup_in_progress(telegram_id, True)
         context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
         await update.message.reply_text(
             "🔧 <b>Настройка MYmeet</b>\n\n"
@@ -876,6 +877,17 @@ async def _handle_mymeet_setup(
     Возвращает True если сообщение было обработано."""
     setup = context.user_data.get("mymeet_setup")
     if not setup:
+        # Проверяем: был ли пользователь в середине wizard'а до перезапуска бота?
+        # DB-флаг переживает перезапуск, context.user_data — нет.
+        # Перехватываем ТОЛЬКО тех, кто был в wizard (in_progress=1), не произвольные сообщения.
+        user_row = db.get_user(telegram_id)
+        if user_row and user_row["mymeet_setup_in_progress"]:
+            db.set_mymeet_setup_in_progress(telegram_id, False)
+            await update.message.reply_text(
+                "⚠️ Сессия настройки MYmeet устарела — бот перезапускался.\n\n"
+                "Запусти /setup_mymeet снова.",
+            )
+            return True
         return False
 
     step = setup.get("step")
@@ -928,6 +940,7 @@ async def _handle_mymeet_setup(
                 err_text = f"❌ Ошибка API: {mte}"
             await msg.edit_text(err_text, parse_mode="HTML")
             context.user_data.pop("mymeet_setup", None)
+            db.set_mymeet_setup_in_progress(telegram_id, False)
             return True
         except Exception as net_exc:
             logger.warning("MYmeet API недоступен при проверке токена: %s", net_exc)
@@ -973,6 +986,7 @@ async def _handle_mymeet_setup(
         # Защита от рестарта бота: если токен/ws_id потеряны — сессия устарела
         if not token or not ws_id:
             context.user_data.pop("mymeet_setup", None)
+            db.set_mymeet_setup_in_progress(telegram_id, False)
             await update.message.reply_text(
                 "⚠️ Сессия настройки устарела (бот перезапускался). "
                 "Запусти /setup_mymeet снова."
@@ -987,7 +1001,9 @@ async def _handle_mymeet_setup(
                 organizer_email=None,  # определяется через organizer.self в Google Calendar
             )
         except Exception as _save_exc:
-            # Логируем технические детали (без токена и ключей) — пользователю не показываем
+            # exc_info=True безопасен: Python-трейсбэки не раскрывают значения локальных
+            # переменных. Текст исключений из crypto/sqlite также не содержит токена:
+            # CryptoError — "Нечего шифровать", sqlite3 ошибки — "disk full" и т.п.
             logger.error(
                 "save_mymeet_config failed for telegram_id=%s: %s",
                 telegram_id, _save_exc, exc_info=True,

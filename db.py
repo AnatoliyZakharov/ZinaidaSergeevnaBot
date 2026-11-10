@@ -90,6 +90,8 @@ def _migrate_mymeet(conn: sqlite3.Connection) -> None:
         ("mymeet_spreadsheet_id", "TEXT"),
         ("mymeet_organizer_email","TEXT"),
         ("mymeet_setup_done",     "INTEGER DEFAULT 0"),
+        # Флаг "wizard запущен, но ещё не завершён" — сохраняется при перезапуске бота
+        ("mymeet_setup_in_progress", "INTEGER DEFAULT 0"),
     ]
     for col, ddl in mymeet_cols:
         try:
@@ -358,7 +360,8 @@ def save_mymeet_config(
                 mymeet_ws_id           = ?,
                 mymeet_spreadsheet_id  = ?,
                 mymeet_organizer_email = ?,
-                mymeet_setup_done      = 1
+                mymeet_setup_done          = 1,
+                mymeet_setup_in_progress   = 0
             WHERE telegram_id = ?
         """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
         if cur.rowcount == 0:
@@ -460,9 +463,23 @@ def reset_mymeet_config(telegram_id: int) -> None:
                 mymeet_ws_id          = NULL,
                 mymeet_spreadsheet_id = NULL,
                 mymeet_organizer_email = NULL,
-                mymeet_setup_done     = 0
+                mymeet_setup_done        = 0,
+                mymeet_setup_in_progress = 0
             WHERE telegram_id = ?
         """, (telegram_id,))
+        conn.commit()
+        conn.close()
+
+
+def set_mymeet_setup_in_progress(telegram_id: int, active: bool) -> None:
+    """Помечаем пользователя как «wizard запущен» (active=True) или «завершён/отменён» (False).
+    Персистируется в БД — переживает перезапуск бота."""
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET mymeet_setup_in_progress = ? WHERE telegram_id = ?",
+            (1 if active else 0, telegram_id),
+        )
         conn.commit()
         conn.close()
 

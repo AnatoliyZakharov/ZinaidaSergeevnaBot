@@ -662,7 +662,8 @@ class TestMymeetSetupTwoStep:
             "mymeet_setup": {"step": "mymeet_sheet"}
         }
 
-        with patch("db.save_mymeet_config") as mock_save:
+        with patch("db.save_mymeet_config") as mock_save, \
+             patch("db.set_mymeet_setup_in_progress") as mock_clr:
             import main as m
             result = await m._handle_mymeet_setup(
                 telegram_id=55667788,
@@ -673,6 +674,7 @@ class TestMymeetSetupTwoStep:
 
         assert result is True
         mock_save.assert_not_called()          # save не должен вызываться
+        mock_clr.assert_called_once_with(55667788, False)   # DB-флаг очищен
         assert "mymeet_setup" not in mock_context.user_data  # сессия очищена
         reply_text = str(mock_message.reply_text.call_args)
         assert "setup_mymeet" in reply_text    # подсказка что делать
@@ -784,3 +786,94 @@ class TestMymeetSetupTwoStep:
         users = db_mod.get_mymeet_users()
         assert len(users) == 1
         assert users[0]["mymeet_token"] == _mk_tok("good_token_abcdef123456789")
+    # ------------------------------------------------------------------ restart guard
+
+    @pytest.mark.asyncio
+    async def test_restart_guard_notifies_via_handle_text(self, db_mod, monkeypatch):
+        """
+        Полная потеря context.user_data (перезапуск бота) при mymeet_setup_in_progress=1.
+        Тест идёт через handle_text — реальный диспетчер — а не прямой вызов
+        _handle_mymeet_setup. Пользователь должен получить уведомление об устаревшей
+        сессии; in_progress должен очиститься.
+        """
+        # Выставляем DB-флаг, имитируя, что wizard был запущен до перезапуска
+        db_mod.set_mymeet_setup_in_progress(55667788, True)
+        user_before = db_mod.get_user(55667788)
+        assert user_before["mymeet_setup_in_progress"] == 1
+
+        # Мок апдейта — пользователь прислал что-то (не команду) после перезапуска бота
+        mock_message = AsyncMock()
+        reply_calls = []
+        mock_message.reply_text = AsyncMock(side_effect=lambda *a, **kw: reply_calls.append((a, kw)))
+        mock_message.text = "some_random_message_or_sheet_id"
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+
+        # context.user_data полностью пусто — имитирует потерю при перезапуске
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+
+        # Патчим db и _require_google чтобы не выходить за рамки теста
+        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.set_mymeet_setup_in_progress",
+                   side_effect=db_mod.set_mymeet_setup_in_progress),              patch("main._require_google", new=AsyncMock(return_value=False)):
+            import main as m
+            await m.handle_text(mock_update, mock_context)
+
+        # Пользователь получил уведомление об устаревшей сессии
+        assert len(reply_calls) == 1, f"Ожидался 1 ответ, получено {len(reply_calls)}"
+        reply_text = reply_calls[0][0][0]
+        assert "устарела" in reply_text or "перезапуск" in reply_text.lower(), (
+            f"Ожидалось сообщение об устаревшей сессии, получено: {reply_text!r}"
+        )
+        assert "/setup_mymeet" in reply_text, "Нет подсказки /setup_mymeet в ответе"
+
+        # DB-флаг очищен
+        user_after = db_mod.get_user(55667788)
+        assert user_after["mymeet_setup_in_progress"] == 0, (
+            "mymeet_setup_in_progress не сброшен после уведомления"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_wizard_no_intercept_via_handle_text(self, db_mod, monkeypatch):
+        """
+        Если mymeet_setup_in_progress=0 (обычный пользователь), handle_text
+        НЕ перехватывает сообщение — wizard не мешает другим сценариям.
+        """
+        # in_progress=0 — не трогали wizard
+        user_row = db_mod.get_user(55667788)
+        assert user_row["mymeet_setup_in_progress"] == 0
+
+        mock_message = AsyncMock()
+        reply_calls = []
+        mock_message.reply_text = AsyncMock(side_effect=lambda *a, **kw: reply_calls.append((a, kw)))
+        mock_message.text = "привет, помоги мне"
+        mock_update = MagicMock()
+        mock_update.message = mock_message
+        mock_update.effective_user.id = 55667788
+
+        mock_context = MagicMock()
+        mock_context.user_data = {}
+
+        # _require_google = False означает, что Google не подключён, бот ответит об этом —
+        # но главное, что wizard-уведомление НЕ сработает
+        require_google_calls = []
+
+        async def fake_require_google(upd):
+            require_google_calls.append(upd)
+            return False  # имитируем: Google не подключён, дальнейшая обработка не нужна
+
+        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.set_mymeet_setup_in_progress",
+                   side_effect=db_mod.set_mymeet_setup_in_progress),              patch("main._require_google", side_effect=fake_require_google):
+            import main as m
+            await m.handle_text(mock_update, mock_context)
+
+        # Wizard не перехватил — _require_google был вызван (нормальный сценарий)
+        assert len(require_google_calls) == 1, (
+            "Ожидалось что _require_google вызван, wizard не должен перехватывать"
+        )
+        # Пользователь НЕ получил "сессия устарела"
+        for call in reply_calls:
+            text = call[0][0]
+            assert "устарела" not in text, f"Wizard неожиданно перехватил: {text!r}"
+

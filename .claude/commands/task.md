@@ -1,165 +1,165 @@
-Ты — координатор AI-команды ZinaidaSergeevnaBot.
-Твоя задача: провести GitHub Issue #$ARGUMENTS по полному циклу разработки,
-используя субагентов, и зафиксировать все результаты в GitHub через `gh` CLI.
+# /task — Выполнение задачи
 
-## Перед началом
+Запускает полный цикл разработки по задаче из GitHub Issues.
 
-Убедись, что ты находишься в корне репозитория ZinaidaSergeevnaBot.
-Если `gh auth status` не показывает авторизацию, остановись и попроси пользователя
-выполнить `gh auth login`.
+**Использование:** `/task <issue-number>`
 
-## Шаг 0: Загрузи задачу
+---
+
+## Шаг 0 — Инициализация
 
 ```bash
-gh issue view $ARGUMENTS --json number,title,body,labels,state
+gh issue view $ARGUMENTS
 ```
 
-Если Issue не найден или закрыт — остановись, сообщи пользователю.
-Извлеки из Issue:
-- Название задачи
-- Описание и мотивацию
-- Критерии приёмки (Acceptance Criteria)
-- Что вне рамок задачи (Out of scope)
+Определи уровень автономности задачи:
 
-Опубликуй комментарий о начале работы:
+- **Уровень 1** — обычные изменения кода, тесты, документация, рефакторинг
+- **Уровень 2** — auth/OAuth, права доступа, изменения хранения данных, CI/CD, crypto.py, логика clear/overwrite в mymeet_sync.py
+- **Уровень 3** — удаление/необратимые преобразования данных, миграции с риском потери данных, ротация ENCRYPTION_KEY, удаление volumes, новые расходы
+
+Запости стартовый комментарий:
+
 ```bash
-gh issue comment $ARGUMENTS --body "🤖 **AI-команда приступила к задаче**
-
-**Этап:** Архитектурный анализ
-**Время:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+gh issue comment $ARGUMENTS --body "🤖 Начинаю работу над задачей #$ARGUMENTS (Уровень: [1/2/3])"
 ```
 
-## Шаг 1: Architect — анализ и план
+---
 
-Используй субагента **architect** для анализа задачи.
-Передай ему:
-- Текст Issue (title, body, acceptance criteria)
-- Путь к репозиторию для самостоятельного изучения кода
+## Шаг 1 — Анализ (Architect)
 
-Дождись от architect структурированного плана в формате:
-```
-## Архитектурный анализ: <название>
-### Затронутые файлы
-### Файлы НЕ затрагиваются
-### Предлагаемое решение
-### Риски
-### Рекомендация: READY TO DEVELOP / NEEDS CLARIFICATION
-```
+Запусти субагента с типом `claude`:
 
-Если architect вернул `NEEDS CLARIFICATION` — опубликуй вопросы в Issue и остановись:
+Запости план в issue:
+
 ```bash
-gh issue comment $ARGUMENTS --body "🏗️ **Архитектурный анализ завершён**\n\n⚠️ Требуется уточнение от Product Owner:\n\n<вопросы>"
+gh issue comment $ARGUMENTS --body "📐 **Технический план:**\n[план]\n\n**Уровень автономности:** [1/2/3]"
 ```
 
-Если `READY TO DEVELOP` — опубликуй план в Issue и двигайся дальше:
+---
+
+## Шаг 2 — Разработка (Developer)
+
+Запусти субагента с типом `claude`:
+
+Запости план в issue:
+
 ```bash
-gh issue comment $ARGUMENTS --body "🏗️ **Архитектурный анализ завершён**\n\n<полный план от architect>"
+gh issue comment $ARGUMENTS --body "📐 **Технический план:**\n[план]\n\n**Уровень автономности:** [1/2/3]"
 ```
 
-## Шаг 2: Developer — реализация
+---
 
-Используй субагента **developer** для реализации.
-Передай ему:
-- Архитектурный план от Шага 1
-- Критерии приёмки из Issue
+## Шаг 2 — Разработка (Developer)
 
-Developer создаёт ветку и реализует задачу. По завершении получи от него:
-- Список изменённых файлов
-- Результаты `python test_smoke.py`
-- Статус проверки на секреты
+Запусти субагента с типом `claude`:
 
-Открой PR командой:
+Запости план в issue:
+
 ```bash
-gh pr create \
-  --title "<название из Issue>" \
-  --body "Closes #$ARGUMENTS
-
-## Что сделано
-<отчёт developer>
-
-## Проверено
-- [ ] python test_smoke.py
-- [ ] Нет захардкоженных секретов" \
-  --base main
+gh issue comment $ARGUMENTS --body "📐 **Технический план:**\n[план]\n\n**Уровень автономности:** [1/2/3]"
 ```
 
-Сохрани номер PR из вывода команды.
+---
 
-## Шаг 3: QA Engineer — независимая проверка
+## Шаг 2 — Разработка (Developer)
 
-Используй субагента **qa-engineer** для проверки.
-Передай ему:
-- Номер PR
-- Критерии приёмки из Issue
+Запусти субагента с типом `claude`:
 
-QA Engineer читает реальный diff через `git diff main...HEAD` и выдаёт вердикт.
+---
 
-Опубликуй вердикт QA как комментарий к PR:
+## Шаг 3 — QA (QA Engineer)
+
+Запусти субагента с типом `claude`:
+
+Запости результат QA на PR:
+
 ```bash
-gh pr comment <номер PR> --body "🧪 **QA-заключение (цикл 1)**\n\n<полный отчёт qa-engineer>"
+# При PASS:
+gh pr comment [PR_NUMBER] --body "✅ **QA: PASS**\n\n[детали]"
+gh pr edit [PR_NUMBER] --add-label "qa: pass"
+
+# При FAIL:
+gh pr comment [PR_NUMBER] --body "❌ **QA: FAIL**\n\n**BLOCKER:**\n[список]"
+gh pr edit [PR_NUMBER] --add-label "qa: fail"
 ```
 
-Добавь лейбл к Issue:
-- Если PASS: `gh issue edit $ARGUMENTS --add-label "qa: pass"`
-- Если FAIL: `gh issue edit $ARGUMENTS --add-label "qa: fail, ai-cycle-1"`
+---
 
-## Шаг 4: Если QA вернул FAIL
+## Шаг 4 — Цикл исправлений (при FAIL)
 
-**Цикл 1 (первое исправление):**
+Если QA вернул FAIL, запусти разработчика на исправления. Максимум 2 цикла.
 
-Запусти **developer** снова, передав ему только BLOCKER-замечания от QA.
-Developer исправляет — только подтверждённые дефекты, не предположения.
-Запусти **qa-engineer** повторно.
+После каждого исправления — повторяй Шаг 3.
 
-Добавь лейбл `ai-cycle-2` к Issue.
-Опубликуй второй вердикт QA как комментарий к PR.
+Если после 2-го цикла всё ещё FAIL:
 
-**Цикл 2 — финальный:**
-
-Если QA снова FAIL — остановись. Не пробуй в третий раз.
 ```bash
-gh issue edit $ARGUMENTS --add-label "needs-human-review"
-gh issue comment $ARGUMENTS --body "⛔ **AI-команда: достигнут лимит циклов исправлений**
-
-QA вернул FAIL после 2 циклов. Нерешённые блокеры:
-
-<список BLOCKER-замечаний>
-
-Требуется решение Product Owner."
+gh pr edit [PR_NUMBER] --add-label "needs-human-review"
+gh pr comment [PR_NUMBER] --body "🛑 **Требуется проверка человека**\n\nПосле 2 циклов исправлений QA не прошёл.\n\n[последний отчёт QA]"
 ```
 
-## Шаг 5: DevOps — только при необходимости
+Остановись. Не продолжай без участия Product Owner.
 
-DevOps подключается **только если** в PR есть изменения файлов:
-`fly.toml`, `Dockerfile`, `Procfile`, `.github/workflows/`, `requirements.txt`
+---
 
-Проверь:
+## Шаг 5 — Проверка инфраструктуры (DevOps, если нужно)
+
+Выполняй **только** если изменены: `fly.toml`, `Dockerfile`, `Procfile`, `.github/workflows/`, `requirements.txt`
+
+Запусти субагента с типом `claude`:
+
+---
+
+## Шаг 6 — Финальное действие по уровню
+
+### Уровень 1 (полная автономия)
+
+Проверь все критерии:
+- [ ] CI зелёный (все smoke-тесты прошли)
+- [ ] QA: PASS
+- [ ] Нет известных BLOCKER
+- [ ] Секреты не обнаружены
+
+Если все выполнены — выполни merge и проверь деплой:
+
 ```bash
-git diff main...HEAD --name-only | grep -E "fly\.toml|Dockerfile|Procfile|\.github/workflows/|requirements\.txt"
+gh pr merge [PR_NUMBER] --squash --delete-branch
+sleep 120
+curl -s https://calendar-bot-anatolii.fly.dev/health || echo "Health check failed"
+gh issue comment $ARGUMENTS --body "✅ **Задача завершена**\n\nPR #[номер] смержен, деплой выполнен.\n\n[итоговый отчёт]"
+gh issue close $ARGUMENTS
 ```
 
-Если есть совпадения — используй субагента **devops**.
-Опубликуй его отчёт как комментарий к PR.
+### Уровень 2 (повышенный риск)
 
-## Шаг 6: Финальный статус
+Остановись перед merge:
 
-После PASS от QA опубликуй итоговый статус:
 ```bash
-gh pr comment <номер PR> --body "✅ **Задача готова к решению Product Owner**
-
-**Issue:** #$ARGUMENTS
-**PR:** #<номер>
-**QA:** PASS
-**DevOps:** <READY / не требовался>
-
-Следующий шаг: Code Review в ChatGPT (Product Owner копирует diff из PR)
-После Code Review: Product Owner принимает решение о merge."
+gh pr comment [PR_NUMBER] --body "⚠️ **Уровень 2 — Требуется независимая проверка**\n\nЗатрагивает: [что именно]\n\nProduct Owner: пожалуйста, запроси аудит ChatGPT и дай разрешение на merge."
+gh issue comment $ARGUMENTS --body "⚠️ **Ожидаю проверки ChatGPT**\n\nPR #[номер] готов. Уровень 2 — нужна независимая проверка перед merge."
 ```
 
-## Правила, которые нельзя нарушать
+Остановись. Жди подтверждения Product Owner.
 
-- Не выполнять merge (`gh pr merge`) и deploy (`fly deploy`) ни при каких условиях.
-- Не изменять production-секреты и `fly.toml` без явного указания Product Owner.
-- Не удалять `/data/bot.db` и volumes.
-- Не расширять scope задачи за рамки Issue.
-- Эскалировать к Product Owner: изменение требований, расходы, риски удаления данных, любые production-действия.
+### Уровень 3 (критические операции)
+
+Остановись немедленно:
+
+```bash
+gh pr comment [PR_NUMBER] --body "🔴 **УРОВЕНЬ 3 — Требуется явное разрешение Product Owner**\n\nКритическая операция: [что именно]\n\nБез явного подтверждения продолжение невозможно."
+gh issue comment $ARGUMENTS --body "🔴 **Ожидаю подтверждения Product Owner**\n\nТребуется ваше явное разрешение. Критическая операция: [что именно]."
+```
+
+Остановись. Не выполняй операцию.
+
+---
+
+## Правила для всех шагов
+
+- **Никогда** не удалять `/data/bot.db` или volumes Fly.io
+- **Никогда** не запускать второй экземпляр бота
+- **Никогда** не выводить значения секретов в комментарии или логи
+- Не расширять scope задачи — фиксируй дополнительные проблемы отдельными issues
+- При неопределённости уровня — применяй более строгий
+- При любой ошибке, блокирующей безопасный выпуск — остановись и сообщи Product Owner

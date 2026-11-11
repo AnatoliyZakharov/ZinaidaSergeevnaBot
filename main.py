@@ -227,19 +227,28 @@ def add_attendees_to_event(telegram_id: int, event_id: str, emails: list[str]) -
 
 
 def add_telemost_to_event(telegram_id: int, event: dict, link: str) -> bool:
-    user = db.get_user(telegram_id)
-    calendar_id = _get_calendar_id(user)
-    service = get_calendar_service(telegram_id)
-    old_desc = event.get("description") or ""
+    """Дописывает ссылку Телемоста в описание события.
+
+    `event` должен быть СВЕЖИМ (только что прочитанным через events().get),
+    чтобы не затереть изменения описания, сделанные после events().list.
+    Патчится только поле description; приглашения участникам не рассылаются.
+    """
+    event_id = event.get("id") if isinstance(event, dict) else None
     try:
+        user = db.get_user(telegram_id)
+        calendar_id = _get_calendar_id(user)
+        service = get_calendar_service(telegram_id)
+        old_desc = event.get("description") or ""
+        line = f"🔗 Яндекс Телемост: {link}"
+        new_desc = f"{old_desc}\n\n{line}" if old_desc else line
         service.events().patch(
             calendarId=calendar_id,
-            eventId=event["id"],
-            body={"description": old_desc + f"\n\n🔗 Яндекс Телемост: {link}"},
+            eventId=event_id,
+            body={"description": new_desc},
         ).execute()
         return True
     except Exception as e:
-        logger.error("Ошибка обновления события %s: %s", event["id"], e)
+        logger.error("Ошибка обновления события %s: %s", event_id, type(e).__name__)
         return False
 
 
@@ -301,33 +310,102 @@ def has_conference_link(event: dict) -> bool:
     return False
 
 
+def _is_event_organizer(event: dict) -> Optional[bool]:
+    """Пользователь — организатор события по данным Google Calendar?
+
+    True  — organizer.self is True;
+    False — организатор указан, но это не пользователь;
+    None  — организатор не определён (поле отсутствует/пустое/не dict).
+    Поле creator намеренно не используется.
+    """
+    if not isinstance(event, dict):
+        return None
+    organizer = event.get("organizer")
+    if not organizer or not isinstance(organizer, dict):
+        return None
+    return organizer.get("self") is True
+
+
+def _fetch_fresh_event(service, calendar_id: str, event_id: str) -> dict:
+    """Перечитывает событие непосредственно перед изменением."""
+    return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+
+
 def process_telemost_links(telegram_id: int) -> dict:
-    result = {"added": [], "skipped": 0, "errors": []}
+    result = {
+        "added": [],
+        "skipped": 0,
+        "skipped_foreign": 0,
+        "skipped_no_organizer": 0,
+        "errors": [],
+    }
     try:
         events = get_events_next_7_days(telegram_id)
     except Exception as e:
-        result["errors"].append(f"Не удалось получить события: {e}")
+        logger.error("process_telemost_links: не удалось получить события user=%s: %s",
+                     telegram_id, type(e).__name__)
+        result["errors"].append("Не удалось получить события из Google Calendar")
         return result
 
+    service = None
+    calendar_id = None
     for event in events:
+        if not isinstance(event, dict):
+            continue
         if event.get("status") == "cancelled":
             continue
         if "date" in event.get("start", {}) and "dateTime" not in event.get("start", {}):
             result["skipped"] += 1
             continue
+
+        # Организатор проверяется ДО любых обращений к Телемосту.
+        is_org = _is_event_organizer(event)
+        if is_org is None:
+            result["skipped_no_organizer"] += 1
+            continue
+        if is_org is False:
+            result["skipped_foreign"] += 1
+            continue
+
         if has_conference_link(event):
+            result["skipped"] += 1
+            continue
+
+        title = event.get("summary") or "(без названия)"
+        event_id = event.get("id")
+        if not event_id:
+            result["skipped"] += 1
+            continue
+
+        # Перечитываем событие: между list и patch его могли изменить.
+        try:
+            if service is None:
+                user = db.get_user(telegram_id)
+                calendar_id = _get_calendar_id(user)
+                service = get_calendar_service(telegram_id)
+            fresh = _fetch_fresh_event(service, calendar_id, event_id)
+        except Exception as e:
+            logger.error("process_telemost_links: не удалось перечитать событие %s user=%s: %s",
+                         event_id, telegram_id, type(e).__name__)
+            result["errors"].append(f"Не удалось перечитать «{title}» из Google Calendar")
+            continue
+
+        if (not isinstance(fresh, dict)
+                or fresh.get("status") == "cancelled"
+                or _is_event_organizer(fresh) is not True
+                or has_conference_link(fresh)):
             result["skipped"] += 1
             continue
 
         link = create_telemost_conference(telegram_id)
         if not link:
-            result["errors"].append(f"Телемост не создался для «{event.get('summary', '?')}»")
+            result["errors"].append(f"Телемост не создался для «{title}»")
             continue
 
-        if add_telemost_to_event(telegram_id, event, link):
-            result["added"].append({"title": event.get("summary", "(без названия)"), "link": link})
+        if add_telemost_to_event(telegram_id, fresh, link):
+            result["added"].append({"title": fresh.get("summary") or title, "link": link})
         else:
-            result["errors"].append(f"Не удалось обновить «{event.get('summary', '?')}»")
+            result["errors"].append(f"Не удалось обновить «{title}»")
     return result
 
 
@@ -339,8 +417,12 @@ def format_telemost_report(res: dict) -> str:
             lines.append(f"  • {item['title']}")
     else:
         lines.append("ℹ️ Новых встреч без ссылок не найдено.")
-    if res["skipped"]:
+    if res.get("skipped", 0):
         lines.append(f"⏭ Пропущено: {res['skipped']}")
+    if res.get("skipped_foreign", 0):
+        lines.append(f"⏭ Чужие встречи (не трогаю): {res['skipped_foreign']}")
+    if res.get("skipped_no_organizer", 0):
+        lines.append(f"⏭ Организатор не определён: {res['skipped_no_organizer']}")
     if res["errors"]:
         lines.append("⚠️ Ошибки:")
         for e in res["errors"]:

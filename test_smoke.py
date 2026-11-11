@@ -1198,6 +1198,333 @@ def test_build_my_tasks_rows_one_time_dedup_without_mtg_id():
     assert len(mod._build_my_tasks_rows(rec, "Иван Петров")) == 2
 
 
+# ── #21: Телемост только во встречи, где пользователь — организатор ──
+
+_TELEMOST_FUNCS = ("_is_event_organizer", "_fetch_fresh_event", "has_conference_link",
+                   "add_telemost_to_event", "process_telemost_links", "format_telemost_report")
+
+
+def _load_main_funcs(names, extra_ns=None, assigns=("CONFERENCE_PATTERNS",)):
+    """Извлекает несколько функций и присваиваний из main.py в одно пространство имён."""
+    import warnings
+    import typing
+    src = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        tree = ast.parse(src)
+    nodes = [n for n in tree.body
+             if (isinstance(n, ast.FunctionDef) and n.name in names)
+             or (isinstance(n, ast.Assign) and any(
+                 isinstance(t, ast.Name) and t.id in assigns for t in n.targets))]
+    found = {n.name for n in nodes if isinstance(n, ast.FunctionDef)}
+    assert found == set(names), f"не найдены в main.py: {set(names) - found}"
+    ns: dict = {"re": re, "Optional": typing.Optional}
+    ns.update(extra_ns or {})
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), ns)
+    return ns
+
+
+class _Exec:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def execute(self):
+        return self._fn()
+
+
+class _FakeCalendar:
+    """Фейковый Google Calendar: хранит события, list/get/patch, patch сохраняется."""
+
+    def __init__(self, events, fresh_overrides=None, patch_error_ids=(), get_error_ids=()):
+        import copy
+        self.store = {e["id"]: copy.deepcopy(e) for e in events}
+        self.order = [e["id"] for e in events]
+        self.fresh_overrides = fresh_overrides or {}
+        self.patch_error_ids = set(patch_error_ids)
+        self.get_error_ids = set(get_error_ids)
+        self.patch_calls = []
+        self.get_calls = []
+
+    def events(self):
+        return self
+
+    def list_items(self):
+        import copy
+        return [copy.deepcopy(self.store[i]) for i in self.order]
+
+    def get(self, calendarId, eventId):
+        import copy
+        self.get_calls.append((calendarId, eventId))
+
+        def run():
+            if eventId in self.get_error_ids:
+                raise RuntimeError("get failed token=SECRET123")
+            if eventId in self.fresh_overrides:
+                return copy.deepcopy(self.fresh_overrides[eventId])
+            return copy.deepcopy(self.store[eventId])
+        return _Exec(run)
+
+    def patch(self, **kwargs):
+        self.patch_calls.append(kwargs)
+
+        def run():
+            if kwargs["eventId"] in self.patch_error_ids:
+                raise RuntimeError("patch failed token=SECRET123")
+            self.store[kwargs["eventId"]].update(kwargs["body"])
+            return self.store[kwargs["eventId"]]
+        return _Exec(run)
+
+
+def _telemost_env(cal, links=None, list_error=None):
+    """Собирает namespace с моками. links — список ссылок (None в списке = сбой создания)."""
+    from unittest.mock import MagicMock
+    db = MagicMock()
+    db.get_user.return_value = {"calendar_id": None}
+    logger = MagicMock()
+    link_iter = iter(links if links is not None else
+                     [f"https://telemost.yandex.ru/j/{i}" for i in range(100)])
+    create = MagicMock(side_effect=lambda telegram_id=None: next(link_iter))
+
+    def get_events(telegram_id):
+        if list_error is not None:
+            raise list_error
+        return cal.list_items()
+
+    ns = _load_main_funcs(_TELEMOST_FUNCS, {
+        "db": db,
+        "logger": logger,
+        "get_calendar_service": MagicMock(return_value=cal),
+        "get_events_next_7_days": get_events,
+        "create_telemost_conference": create,
+        "_get_calendar_id": lambda user: (user or {}).get("calendar_id") or "primary",
+    })
+    return ns, create, logger
+
+
+def _ev(eid, organizer="self", **kw):
+    e = {"id": eid, "summary": f"Встреча {eid}", "status": "confirmed",
+         "start": {"dateTime": "2026-11-12T10:00:00+03:00"}}
+    if organizer == "self":
+        e["organizer"] = {"email": "me@example.com", "self": True}
+    elif organizer == "foreign":
+        e["organizer"] = {"email": "other@example.com"}
+    elif organizer is not None:
+        e["organizer"] = organizer
+    e.update(kw)
+    return e
+
+
+def test_telemost_is_event_organizer_truth_table():
+    """_is_event_organizer: True только при organizer.self is True; нет организатора → None."""
+    f = _load_main_funcs(("_is_event_organizer",))["_is_event_organizer"]
+    assert f({"organizer": {"self": True}}) is True
+    assert f({"organizer": {"self": True, "email": "a@b.c"}}) is True
+    assert f({"organizer": {"self": False}}) is False
+    assert f({"organizer": {"email": "a@b.c"}}) is False
+    assert f({"organizer": {"self": "true"}}) is False
+    assert f({"organizer": {"self": 1}}) is False
+    assert f({"organizer": {"email": "x"}, "creator": {"self": True}}) is False
+    assert f({}) is None
+    assert f({"organizer": None}) is None
+    assert f({"organizer": {}}) is None
+    assert f({"organizer": "me@example.com"}) is None
+    assert f({"creator": {"self": True}}) is None
+    assert f(None) is None
+
+
+def test_telemost_organizer_no_link_added():
+    """Организатор + нет ссылки → ссылка добавлена, patch только description, без sendUpdates."""
+    cal = _FakeCalendar([_ev("e1", description="Повестка")])
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["added"]) == 1, res
+    assert res["errors"] == [], res
+    assert create.call_count == 1
+    assert len(cal.patch_calls) == 1
+    call = cal.patch_calls[0]
+    assert "sendUpdates" not in call, call
+    assert set(call["body"].keys()) == {"description"}, call
+    assert call["eventId"] == "e1" and call["calendarId"] == "primary"
+    desc = call["body"]["description"]
+    assert desc.startswith("Повестка"), desc
+    assert desc.count("https://telemost.yandex.ru/j/0") == 1
+    # остальные поля события не тронуты
+    assert cal.store["e1"]["summary"] == "Встреча e1"
+    assert cal.store["e1"]["organizer"]["self"] is True
+
+
+def test_telemost_organizer_existing_link_untouched():
+    """Организатор + ссылка уже есть (description/location/conferenceData) → без изменений."""
+    events = [
+        _ev("d", description="Zoom: https://zoom.us/j/123"),
+        _ev("l", location="https://telemost.yandex.ru/j/777"),
+        _ev("c", conferenceData={"entryPoints": [{"uri": "https://teams.microsoft.com/l/x"}]}),
+    ]
+    cal = _FakeCalendar(events)
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert res["added"] == [] and res["skipped"] == 3, res
+    assert create.call_count == 0
+    assert cal.patch_calls == []
+
+
+def test_telemost_foreign_organizer_untouched():
+    """Чужой организатор (self False / нет self / creator.self при чужом organizer) → не трогаем."""
+    events = [
+        _ev("f1", organizer={"email": "o@x.ru", "self": False}),
+        _ev("f2", organizer={"email": "o@x.ru"}),
+        _ev("f3", organizer={"email": "o@x.ru"}, creator={"email": "me@x.ru", "self": True}),
+        _ev("f4", organizer={"email": "o@x.ru", "self": "true"}),
+    ]
+    cal = _FakeCalendar(events)
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert res["skipped_foreign"] == 4, res
+    assert res["added"] == []
+    assert create.call_count == 0
+    assert cal.patch_calls == [] and cal.get_calls == []
+
+
+def test_telemost_no_organizer_skipped():
+    """Организатор не определён (нет / {} / None) → skipped_no_organizer, без Телемоста."""
+    e_none = _ev("n3", organizer=None)
+    e_none["organizer"] = None
+    events = [_ev("n1", organizer=None), _ev("n2", organizer={}), e_none]
+    cal = _FakeCalendar(events)
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert res["skipped_no_organizer"] == 3, res
+    assert res["added"] == []
+    assert create.call_count == 0
+    assert cal.patch_calls == []
+
+
+def test_telemost_repeated_run_no_duplicates():
+    """Повторный обход: второй прогон не создаёт конференцию и не патчит."""
+    cal = _FakeCalendar([_ev("r1", description="Текст"), _ev("r2")])
+    ns, create, _ = _telemost_env(cal)
+    res1 = ns["process_telemost_links"](1)
+    assert len(res1["added"]) == 2, res1
+    res2 = ns["process_telemost_links"](1)
+    assert res2["added"] == [] and res2["skipped"] == 2, res2
+    assert create.call_count == 2
+    assert len(cal.patch_calls) == 2
+    for eid in ("r1", "r2"):
+        assert cal.store[eid]["description"].count("telemost.yandex.ru") == 1
+
+
+def test_telemost_race_fresh_has_link():
+    """Гонка: в list ссылки нет, в свежем get — есть → ни create, ни patch."""
+    stale = _ev("g1", description="Старое")
+    fresh = _ev("g1", description="Старое\nhttps://zoom.us/j/1")
+    cal = _FakeCalendar([stale], fresh_overrides={"g1": fresh})
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert res["added"] == [], res
+    assert create.call_count == 0
+    assert cal.patch_calls == []
+
+
+def test_telemost_race_fresh_organizer_changed():
+    """Гонка: в свежем get организатор уже другой → без patch."""
+    cal = _FakeCalendar([_ev("o1")], fresh_overrides={"o1": _ev("o1", organizer="foreign")})
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert res["added"] == [], res
+    assert create.call_count == 0
+    assert cal.patch_calls == []
+
+
+def test_telemost_description_from_fresh_event():
+    """Описание строится из свежего события, а не из устаревших данных list."""
+    cal = _FakeCalendar([_ev("s1", description="Старая версия")],
+                        fresh_overrides={"s1": _ev("s1", description="Новая версия от коллеги")})
+    ns, _, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["added"]) == 1, res
+    desc = cal.patch_calls[0]["body"]["description"]
+    assert desc.startswith("Новая версия от коллеги"), desc
+    assert "Старая версия" not in desc
+
+
+def test_telemost_errors_do_not_leak_secrets():
+    """Ошибка Google Calendar → нейтральный текст; токен не попадает в результат и логи."""
+    cal = _FakeCalendar([])
+    ns, create, logger = _telemost_env(cal, list_error=Exception("token=SECRET123"))
+    res = ns["process_telemost_links"](1)
+    assert res["added"] == []
+    assert res["errors"] == ["Не удалось получить события из Google Calendar"], res
+    assert "SECRET123" not in repr(res)
+    assert "SECRET123" not in repr(logger.mock_calls), logger.mock_calls
+    assert create.call_count == 0
+
+    # ошибки get и patch тоже без раскрытия текста исключения
+    cal = _FakeCalendar([_ev("x1"), _ev("x2")], get_error_ids={"x1"}, patch_error_ids={"x2"})
+    ns, _, logger = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["errors"]) == 2, res
+    assert "SECRET123" not in repr(res)
+    assert "SECRET123" not in repr(logger.mock_calls), logger.mock_calls
+
+
+def test_telemost_patch_error_and_create_failure():
+    """Ошибка patch → error, следующее событие обрабатывается; create=None → error, без patch."""
+    cal = _FakeCalendar([_ev("p1"), _ev("p2")], patch_error_ids={"p1"})
+    ns, _, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["errors"]) == 1 and "Встреча p1" in res["errors"][0], res
+    assert [a["title"] for a in res["added"]] == ["Встреча p2"], res
+    assert len(cal.patch_calls) == 2
+
+    cal = _FakeCalendar([_ev("c1"), _ev("c2")])
+    ns, create, _ = _telemost_env(cal, links=[None, "https://telemost.yandex.ru/j/ok"])
+    res = ns["process_telemost_links"](1)
+    assert len(res["errors"]) == 1 and "Встреча c1" in res["errors"][0], res
+    assert [a["title"] for a in res["added"]] == ["Встреча c2"], res
+    assert [c["eventId"] for c in cal.patch_calls] == ["c2"]
+
+    # ошибка свежего get → error, цикл продолжается
+    cal = _FakeCalendar([_ev("g1"), _ev("g2")], get_error_ids={"g1"})
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["errors"]) == 1 and len(res["added"]) == 1, res
+    assert create.call_count == 1
+    assert [c["eventId"] for c in cal.patch_calls] == ["g2"]
+
+
+def test_telemost_mixed_and_allday_cancelled():
+    """Смешанный набор: отменённые/весь день/чужие/без организатора/свои."""
+    events = [
+        _ev("a", status="cancelled"),
+        _ev("b", start={"date": "2026-11-12"}),
+        _ev("c", organizer="foreign"),
+        _ev("d", organizer=None),
+        _ev("e"),
+    ]
+    cal = _FakeCalendar(events)
+    ns, create, _ = _telemost_env(cal)
+    res = ns["process_telemost_links"](1)
+    assert len(res["added"]) == 1 and res["skipped"] == 1, res
+    assert res["skipped_foreign"] == 1 and res["skipped_no_organizer"] == 1, res
+    assert create.call_count == 1
+    assert [c["eventId"] for c in cal.patch_calls] == ["e"]
+
+
+def test_format_telemost_report_new_and_old_keys():
+    """Отчёт работает со старым словарём и показывает новые счётчики."""
+    fmt = _load_main_funcs(("format_telemost_report",))["format_telemost_report"]
+    old = fmt({"added": [], "skipped": 2, "errors": []})
+    assert "Пропущено: 2" in old
+    assert "Чужие" not in old and "Организатор" not in old
+    new = fmt({"added": [{"title": "T", "link": "L"}], "skipped": 0,
+               "skipped_foreign": 3, "skipped_no_organizer": 1, "errors": ["oops"]})
+    assert "⏭ Чужие встречи (не трогаю): 3" in new, new
+    assert "⏭ Организатор не определён: 1" in new, new
+    assert "Добавлено ссылок: 1" in new
+    new_lines = [l for l in new.splitlines() if "Чужие" in l or "Организатор" in l]
+    assert all("_" not in l and "*" not in l for l in new_lines), new_lines
+
+
 if __name__ == "__main__":
     tests = [
         (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
@@ -1240,6 +1567,19 @@ if __name__ == "__main__":
         (test_my_tasks_same_name_different_case_reuses_sheet, "ФИО в другом регистре — тот же лист"),
         (test_my_tasks_long_name_title_limit,     "длинное ФИО — имя листа ≤100"),
         (test_build_my_tasks_rows_one_time_dedup_without_mtg_id, "дедуп без mtg_id по встрече"),
+        (test_telemost_is_event_organizer_truth_table, "Телемост: _is_event_organizer"),
+        (test_telemost_organizer_no_link_added,    "Телемост: свой + без ссылки → добавлено"),
+        (test_telemost_organizer_existing_link_untouched, "Телемост: свой + ссылка есть → не трогаем"),
+        (test_telemost_foreign_organizer_untouched, "Телемост: чужой организатор → не трогаем"),
+        (test_telemost_no_organizer_skipped,       "Телемост: организатор не определён → пропуск"),
+        (test_telemost_repeated_run_no_duplicates, "Телемост: повторный обход без дублей"),
+        (test_telemost_race_fresh_has_link,        "Телемост: гонка — ссылка появилась"),
+        (test_telemost_race_fresh_organizer_changed, "Телемост: гонка — сменился организатор"),
+        (test_telemost_description_from_fresh_event, "Телемост: описание из свежего события"),
+        (test_telemost_errors_do_not_leak_secrets, "Телемост: ошибки без раскрытия токенов"),
+        (test_telemost_patch_error_and_create_failure, "Телемост: ошибки patch/create/get"),
+        (test_telemost_mixed_and_allday_cancelled, "Телемост: смешанный набор событий"),
+        (test_format_telemost_report_new_and_old_keys, "Телемост: отчёт со старыми/новыми ключами"),
     ]
     failed = []
     for fn, label in tests:

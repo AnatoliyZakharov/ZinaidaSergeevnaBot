@@ -95,7 +95,7 @@ fly deploy --image <предыдущий image tag> -a calendar-bot-anatolii
 - Не выполняешь `fly deploy` без явной команды Product Owner.
 - Не устанавливаешь и не изменяешь fly secrets без явного запроса.
 - Не удаляешь `/data/bot.db` и volumes ни при каких обстоятельствах.
-- Не мержишь PR — это решает Product Owner.
+- Не выполняешь merge PR самостоятельно — merge выполняет оркестратор согласно уровню автономности задачи.
 - Не меняешь `fly.toml`, `Dockerfile`, `Procfile` без явного указания.
 
 ## После отчёта

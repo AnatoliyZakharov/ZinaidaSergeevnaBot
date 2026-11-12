@@ -123,6 +123,8 @@ _MY_TASKS_NEW_COLS = [
     ("link",              "TEXT"),               # ссылка на письмо (Tasks API links)
     ("gt_delete_pending", "INTEGER DEFAULT 0"),  # ручная отмена → удалить в GT
     ("prev_status",       "TEXT"),               # статус до удаления в GT
+    ("sheet_fields",      "TEXT"),               # что бот записал в ячейки (enc JSON)
+    ("overrides",         "TEXT"),               # ручные правки ячеек (enc JSON)
 ]
 _MY_TASKS_SYNC_NEW_COLS = [
     ("last_success_slot", "TEXT"),     # дата слота 19:00, выполненного полностью
@@ -663,11 +665,11 @@ _MY_TASK_FIELDS = (
     "source", "source_key", "title", "origin", "assignee", "task_date", "deadline",
     "status", "verified", "sheet_status", "ext_status", "ext_synced_status",
     "gtasks_list_id", "gtasks_task_id", "missing_since",
-    "link", "gt_delete_pending", "prev_status",
+    "link", "gt_delete_pending", "prev_status", "sheet_fields", "overrides",
 )
 # Пользовательский текст — шифруется (Fernet, тот же ENCRYPTION_KEY, что у
 # MYmeet-токенов).  Префикс отличает шифротекст от старого открытого текста.
-_MY_TASK_ENCRYPTED = ("title", "origin", "assignee", "link")
+_MY_TASK_ENCRYPTED = ("title", "origin", "assignee", "link", "sheet_fields", "overrides")
 _ENC_PREFIX = "enc:v1:"
 
 
@@ -791,14 +793,21 @@ def my_tasks_rekey(telegram_id: int, old_key: str, new_key: str) -> bool:
 
 
 def my_tasks_mark_written(telegram_id: int, statuses: dict) -> None:
-    """После успешной записи листа: sheet_status = записанный статус."""
+    """После успешной записи листа: sheet_status (и sheet_fields — записанные
+    значения ячеек) = то, что бот записал.  Значение — статус или
+    (статус, JSON записанных ячеек)."""
     if not statuses:
         return
+    params = []
+    for key, val in statuses.items():
+        st, fields = val if isinstance(val, tuple) else (val, None)
+        params.append((st, _enc(fields), telegram_id, key))
     with _lock:
         conn = _connect()
         conn.executemany(
-            "UPDATE my_tasks SET sheet_status = ? WHERE telegram_id = ? AND source_key = ?",
-            [(st, telegram_id, key) for key, st in statuses.items()],
+            "UPDATE my_tasks SET sheet_status = ?, sheet_fields = COALESCE(?, sheet_fields) "
+            "WHERE telegram_id = ? AND source_key = ?",
+            params,
         )
         conn.commit()
         conn.close()

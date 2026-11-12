@@ -509,7 +509,7 @@ def _gt(tid, title="Задача", status="needsAction", due=None, list_id="L1",
 
 def _reconcile(mt, records, items, complete=True, list_ids=("L1", "L2"), sheet_vals=None):
     stats, warnings = {}, []
-    plan = mt.reconcile_gtasks(records, items, complete, list_ids, ME, "12.11.2026",
+    plan = mt.reconcile_gtasks(records, items, complete, list_ids, ME,
                                stats, warnings, sheet_vals)
     for r in records.values():
         r.pop("_dirty", None)
@@ -730,7 +730,8 @@ def test_sheet_three_sources_verification_end_to_end():
                              "Позвонить клиенту"}, set(rows)
         # Speaker A, однофамилец, тёзка, чужой — не попали
         assert rows["Отчёт по продажам"][6] == "Требует верификации"
-        assert rows["Бюджет"][6] == "В работе"                 # статус протокола сохранён
+        # статус протокола («В работе») НЕ переносится: новая задача не подтверждена
+        assert rows["Бюджет"][6] == "Требует верификации"
         assert rows["Купить билеты"][7] == "gtasks:L1:g1" and rows["Старое"][6] == "Выполнено"
         assert rows["Позвонить клиенту"][2] == "Telegram — Мария"
         reqs = book.requests()
@@ -754,7 +755,8 @@ def test_sheet_three_sources_verification_end_to_end():
         assert _sync(mt, ms, db, book, gt)["outcome"] == mt.OUT_OK
         assert book.rows(MY_TITLE)["Отчёт по продажам"][6] == "В работе"
         assert ("status", "L1", "g1", "completed") in gt.calls
-        # протокол: возврат к «Требует верификации» в листе протокола не применяется
+        # изменения статуса в протоколе личную задачу не меняют (ни подтверждённую,
+        # ни неподтверждённую)
         for row in book.data["Планёрка"]:
             if row[2] == "Отчёт по продажам":
                 row[5] = "Требует верификации"
@@ -762,7 +764,8 @@ def test_sheet_three_sources_verification_end_to_end():
                 row[5] = "Выполнено"
         _sync(mt, ms, db, book, gt, with_gtasks=False)
         rows = book.rows(MY_TITLE)
-        assert rows["Отчёт по продажам"][6] == "В работе" and rows["Бюджет"][6] == "Выполнено"
+        assert rows["Отчёт по продажам"][6] == "В работе"
+        assert rows["Бюджет"][6] == "Требует верификации"
         assert book.ws["Планёрка"].update.call_count == 0     # протокол не перезаписан
 
 
@@ -1029,7 +1032,8 @@ def test_legacy_sheet_migration_and_legacy_mode():
         upd = [r["updateProtectedRange"] for r in book.requests() if "updateProtectedRange" in r]
         assert len(upd) == 1 and upd[0]["protectedRange"]["protectedRangeId"] == 77
         assert book.data[MY_TITLE][0] == ms.MY_TASKS_HEADER_ROW_V2
-        assert book.rows(MY_TITLE)["Бюджет"][6] == "В работе"
+        # статус старого листа — копия протокола, а не подтверждение пользователя
+        assert book.rows(MY_TITLE)["Бюджет"][6] == "Требует верификации"
     # без builder — прежний режим
     book = _Book({"Планёрка": [PROTO_HDR, ["1", "10.11.2026", "Отчёт", "Петров И.", "",
                                           "В работе", "m1"],
@@ -1306,6 +1310,244 @@ def test_auth_scopes_no_gmail_and_no_gt_insert():
     assert "delete_task(" not in (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
 
+# ══ 10. Финальные исправления аудита: верификация, дата GT, ручные правки ══
+
+def _proto(status="Выполнено", task="Сводка", assignee="Петров Иван"):
+    return ["1", "10.11.2026", task, assignee, "25.11.2026", status, "m7"]
+
+
+def _set_proto_status(book, task, status):
+    for row in book.data["Планёрка"]:
+        if row[2] == task:
+            row[5] = status
+
+
+def test_protocol_verification_only_by_manual_change():
+    """1–4: новая задача протокола «Выполнено» → «Требует верификации», verified=0;
+    изменения протокола не подтверждают и не перетирают; подтверждает только
+    ручная смена статуса в «Мои задачи»."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR, _proto("Выполнено")]})
+        _sync(mt, ms, db, book, with_gtasks=False)
+        key = book.rows(MY_TITLE)["Сводка"][7]
+        assert key.startswith("p:") and book.rows(MY_TITLE)["Сводка"][6] == "Требует верификации"
+        rec = db.my_tasks_get(1, key)
+        assert rec["status"] == "Требует верификации" and rec["verified"] == 0
+        # протокол меняется туда-сюда — личная задача остаётся неподтверждённой
+        for st in ("В работе", "Отменено", "Выполнено", "Просрочено"):
+            _set_proto_status(book, "Сводка", st)
+            _sync(mt, ms, db, book, with_gtasks=False)
+            assert book.rows(MY_TITLE)["Сводка"][6] == "Требует верификации", st
+            assert db.my_tasks_get(1, key)["verified"] == 0
+        # ручное изменение в «Мои задачи» → подтверждение
+        book.set_status(MY_TITLE, "Сводка", "В работе")
+        _sync(mt, ms, db, book, with_gtasks=False)
+        rec = db.my_tasks_get(1, key)
+        assert rec["status"] == "В работе" and rec["verified"] == 1
+        # после подтверждения протокол статус пользователя не перетирает
+        for st in ("Выполнено", "Требует верификации", "Отменено"):
+            _set_proto_status(book, "Сводка", st)
+            _sync(mt, ms, db, book, with_gtasks=False)
+            assert book.rows(MY_TITLE)["Сводка"][6] == "В работе", st
+        # явный ручной возврат к «Требует верификации» — снова не подтверждена
+        book.set_status(MY_TITLE, "Сводка", "Требует верификации")
+        _sync(mt, ms, db, book, with_gtasks=False)
+        assert db.my_tasks_get(1, key)["verified"] == 0
+        assert book.ws["Планёрка"].update.call_count == 0          # протокол не трогаем
+
+
+def test_protocol_verification_db_restore_and_migration():
+    """Восстановление БД: статус пользователя из листа V2 сохраняется;
+    старый лист V1 (копия протокола) подтверждением не считается."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR, _proto("Требует верификации"),
+                                   _proto("Требует верификации", task="Вторая")]})
+        _sync(mt, ms, db, book, with_gtasks=False)
+        book.set_status(MY_TITLE, "Сводка", "В работе")           # подтвердил
+        _sync(mt, ms, db, book, with_gtasks=False)
+    with tempfile.TemporaryDirectory() as tmp2:                    # «потеряли» БД
+        db2 = _tmp_db(tmp2)
+        _user(db2)
+        res = _sync(mt, ms, db2, book, with_gtasks=False)
+        assert res["outcome"] == mt.OUT_OK
+        rows = book.rows(MY_TITLE)
+        assert rows["Сводка"][6] == "В работе" and rows["Вторая"][6] == "Требует верификации"
+        key = rows["Сводка"][7]
+        assert db2.my_tasks_get(1, key)["verified"] == 1
+        assert db2.my_tasks_get(1, rows["Вторая"][7])["verified"] == 0
+    # V1: статусы — копия протокола → «Требует верификации»
+    with tempfile.TemporaryDirectory() as tmp3:
+        db3 = _tmp_db(tmp3)
+        _user(db3)
+        legacy = [ms.MY_TASKS_HEADER_ROW,
+                  [1, "10.11.2026", "Планёрка", "Сводка", "Петров Иван", "25.11.2026",
+                   "Выполнено", "m7"]]
+        book = _Book({"Планёрка": [PROTO_HDR, _proto("Выполнено")], MY_TITLE: legacy})
+        _sync(mt, ms, db3, book, with_gtasks=False)
+        assert book.rows(MY_TITLE)["Сводка"][6] == "Требует верификации"
+        assert db3.my_tasks_load(1)[0]["verified"] == 0
+
+
+def test_gtasks_task_date_not_invented():
+    """5–6: дата постановки GT не подставляется (ни импорт, ни updated);
+    сохранённая дата не стирается."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR]})
+        gt = _FakeGT([_gt("old", title="Старая", updated="2024-01-05T10:00:00.000Z",
+                          links=[{"type": "email", "description": "Письмо",
+                                  "link": "https://mail.google.com/mail/#all/x"}])])
+        _sync(mt, ms, db, book, gt)
+        assert book.rows(MY_TITLE)["Старая"][1] == ""
+        assert db.my_tasks_get(1, "gtasks:L1:old")["task_date"] == ""
+        # запись прошлой версии с датой → повторная синхронизация её не стирает
+        db.my_tasks_upsert(1, [dict(db.my_tasks_get(1, "gtasks:L1:old"), task_date="01.11.2026")])
+        _sync(mt, ms, db, book, gt)
+        _sync(mt, ms, db, book, gt)
+        assert db.my_tasks_get(1, "gtasks:L1:old")["task_date"] == "01.11.2026"
+        # дату, введённую пользователем в листе, тоже не стираем
+        for row in book.data[MY_TITLE][1:]:
+            if row[3].startswith("Старая"):
+                row[1] = "03.11.2026"
+        _sync(mt, ms, db, book, gt)
+        _sync(mt, ms, db, book, gt)
+        assert book.rows(MY_TITLE)["Старая"][1] == "03.11.2026"
+
+
+def test_manual_field_edits_preserved():
+    """Правки названия, срока, ответственного, даты в листе не перезаписываются
+    ни следующей синхронизацией, ни изменениями источника."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR, _proto("Требует верификации")]})
+        gt = _FakeGT([_gt("a", title="Купить билеты", due="2026-11-20T00:00:00.000Z")])
+        mt.add_forwarded(1, {"title": "Позвонить", "assigner": "Мария", "task_date":
+                             "11.11.2026", "deadline": "", "source_key": "tg:p"}, dbm=db)
+        _sync(mt, ms, db, book, gt)
+        for row in book.data[MY_TITLE][1:]:
+            if row[3] == "Купить билеты":
+                row[3], row[5] = "Купить билеты в Казань", "18.11.2026"
+            elif row[3] == "Сводка":
+                row[3], row[4] = "Сводка за ноябрь", "Петров И. и Сидоров"
+            elif row[3] == "Позвонить":
+                row[5] = "13.11.2026"
+        res = _sync(mt, ms, db, book, gt)
+        assert res["outcome"] == mt.OUT_OK and res["stats"]["manual_field_edits"] == 5
+        rows = book.rows(MY_TITLE)
+        assert rows["Купить билеты в Казань"][5] == "18.11.2026"
+        assert rows["Сводка за ноябрь"][4] == "Петров И. и Сидоров"
+        assert rows["Позвонить"][5] == "13.11.2026"
+        # источник меняется — правка пользователя важнее; строка не теряется
+        gt.items[0]["title"] = "Билеты (переименовано в GT)"
+        for row in book.data["Планёрка"]:
+            row[4] = "30.11.2026" if row[2] == "Сводка" else row[4]
+        for _ in range(2):
+            _sync(mt, ms, db, book, gt)
+        rows = book.rows(MY_TITLE)
+        assert set(rows) == {"Купить билеты в Казань", "Сводка за ноябрь", "Позвонить"}, set(rows)
+        assert rows["Купить билеты в Казань"][5] == "18.11.2026"
+        assert rows["Сводка за ноябрь"][5] == "30.11.2026"        # срок не правили → из протокола
+        assert db.my_tasks_get(1, "gtasks:L1:a")["title"] == "Билеты (переименовано в GT)"
+        raw = sqlite3.connect(db.DB_PATH).execute(
+            "SELECT overrides, sheet_fields FROM my_tasks WHERE source_key='gtasks:L1:a'").fetchone()
+        assert all(v.startswith("enc:v1:") and "Казань" not in v for v in raw)
+
+
+def test_concurrent_edit_any_field_conflict():
+    """7–8: правка названия/срока/ответственного/статуса между чтением и записью →
+    конфликт, правка сохранена, запись и удаление в GT не выполняются."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    for col, val in ((3, "Новое название"), (5, "01.12.2026"), (4, "Сидоров А."),
+                     (6, "Выполнено"), (1, "02.11.2026")):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _tmp_db(tmp)
+            _user(db)
+            book = _Book({"Планёрка": [PROTO_HDR]})
+            gt = _FakeGT([_gt("a", title="A"), _gt("b", title="B")])
+            _sync(mt, ms, db, book, gt)
+            book.set_status(MY_TITLE, "A", "Отменено")           # запланировано удаление
+
+            def edit(bk, col=col, val=val):
+                for row in bk.data[MY_TITLE][1:]:
+                    if row[3] == "B":
+                        row[col] = val
+            book.on_reread = edit
+            upd = book.ws[MY_TITLE].update.call_count
+            res = _sync(mt, ms, db, book, gt)
+            assert res["outcome"] == mt.OUT_TRANSIENT, (col, res["text"])
+            assert book.ws[MY_TITLE].update.call_count == upd, col
+            assert gt.deletes() == [] and not [c for c in gt.calls if c[0] == "status"], col
+            row_b = next(r for r in book.data[MY_TITLE][1:] if r[7] == "gtasks:L1:b")
+            assert row_b[col] == val, col
+            # следующая сверка: правка принята и сохранена, удаление выполнено
+            book.on_reread = None
+            res = _sync(mt, ms, db, book, gt)
+            assert res["outcome"] == mt.OUT_OK, (col, res["text"])
+            row_b = next(r for r in book.data[MY_TITLE][1:] if r[7] == "gtasks:L1:b")
+            assert row_b[col] == val, (col, row_b)
+            assert gt.deletes() == [("delete", "L1", "a")], col
+
+
+def test_db_restore_keeps_sheet_edits_without_destructive_ops():
+    """9: БД потеряна/восстановлена из старого снапшота — правки и статусы листа
+    сохраняются, удалений в GT нет, записей не меньше, чем строк."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR, _proto("Требует верификации")]})
+        gt = _FakeGT([_gt("a", title="A"), _gt("b", title="B"), _gt("c", title="C")])
+        _sync(mt, ms, db, book, gt)
+        book.set_status(MY_TITLE, "A", "Отменено")
+        book.set_status(MY_TITLE, "B", "Выполнено")
+        for row in book.data[MY_TITLE][1:]:
+            if row[3] == "C":
+                row[3] = "C — уточнено"
+    with tempfile.TemporaryDirectory() as tmp2:
+        db2 = _tmp_db(tmp2)
+        _user(db2)
+        gt.calls.clear()
+        for _ in range(3):
+            _sync(mt, ms, db2, book, gt)
+        rows = book.rows(MY_TITLE)
+        assert rows["A"][6] == "Отменено" and rows["B"][6] == "Выполнено"
+        assert "C — уточнено" in rows and len(rows) == 4
+        assert gt.deletes() == [] and not [c for c in gt.calls if c[0] == "status"]
+        assert len(db2.my_tasks_load(1)) == 4
+
+
+def test_no_phantom_override_after_gt_push():
+    """После записи листа и push в GT записанные значения не откатываются:
+    следующие переименования в GT отображаются (нет «фантомной» правки)."""
+    ms, mt = _load_ms(), _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        book = _Book({"Планёрка": [PROTO_HDR]})
+        gt = _FakeGT([_gt("a", title="A1")])
+        _sync(mt, ms, db, book, gt)
+        book.set_status(MY_TITLE, "A1", "Выполнено")        # → push в GT
+        gt.items[0]["title"] = "A2"                         # и переименование в GT
+        _sync(mt, ms, db, book, gt)
+        assert ("status", "L1", "a", "completed") in gt.calls
+        gt.items[0].update(title="A3", status="completed")
+        _sync(mt, ms, db, book, gt)
+        rows = book.rows(MY_TITLE)
+        assert set(rows) == {"A3"}, set(rows)
+        rec = db.my_tasks_get(1, "gtasks:L1:a")
+        assert not mt._json(rec.get("overrides")) and rec["sheet_status"] == "Выполнено"
+
+
 TESTS = [
     (test_match_assignee_reliable_only, "Протоколы: только достоверное распознавание"),
     (test_user_name_parts, "Протоколы: разбор ФИО пользователя"),
@@ -1335,6 +1577,13 @@ TESTS = [
     (test_user_lock_serializes_runs, "Блокировка: один пользователь — по очереди"),
     (test_gtasks_api_wrappers, "gtasks: листинг, delete/get/patch, повторы"),
     (test_auth_scopes_no_gmail_and_no_gt_insert, "OAuth без Gmail; задачи в GT не создаются"),
+    (test_protocol_verification_only_by_manual_change, "Протоколы: подтверждение только вручную"),
+    (test_protocol_verification_db_restore_and_migration, "Протоколы: восстановление БД, лист V1"),
+    (test_gtasks_task_date_not_invented, "GT: дата постановки не выдумывается"),
+    (test_manual_field_edits_preserved, "Лист: ручные правки полей сохраняются"),
+    (test_concurrent_edit_any_field_conflict, "Гонка: правка любого поля → конфликт"),
+    (test_db_restore_keeps_sheet_edits_without_destructive_ops, "Восстановление БД: правки целы"),
+    (test_no_phantom_override_after_gt_push, "Лист: нет фантомных правок после push"),
 ]
 
 

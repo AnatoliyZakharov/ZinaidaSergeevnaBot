@@ -6,15 +6,21 @@ my_tasks.py — единый лист «Мои задачи — ФИО» из т
     ДОСТОВЕРНО распознан как пользователь: полное ФИО (любой порядок, падежи),
     фамилия + инициалы.  Одна фамилия, одно имя, «Speaker A» и иные метки
     спикеров — НЕ распознаются (нет достоверной привязки к участнику).
-    Новые задачи получают «Требует верификации»; бот этот статус сам не снимает,
-    верификация — ручное изменение статуса в Sheets.
+    Новые задачи ВСЕГДА получают «Требует верификации» (verified=0), каким бы
+    ни был статус в протоколе; бот этот статус сам не снимает, изменения
+    протокола его не меняют.  Подтверждение — только ручное изменение статуса
+    в листе «Мои задачи».
   • gtasks   — все задачи Google Tasks (все списки, выполненные, скрытые);
     двусторонняя синхронизация статусов ежедневно в 19:00 по поясу пользователя.
   • telegram — пересланные боту в личном чате сообщения (без подтверждения).
 
 Хранилище: таблица SQLite `my_tasks` (db.py; текстовые поля зашифрованы
 Fernet).  Лист — редактируемое представление: перед каждой записью бот читает
-колонку «Статус» и принимает ручные изменения.
+лист и принимает ручные изменения статуса и ячеек (дата, источник, задача,
+ответственный, срок — хранятся как overrides и важнее источника).  Строка
+привязана к записи ключом в скрытой колонке H.  Перед записью лист читается
+повторно: любое изменение A:H → запись и операции GT откладываются.
+Google Tasks: дата постановки не заполняется (дату письма API не отдаёт).
 
 Google Tasks (ключ строки — gtasks:{tasklist_id}:{task_id}):
   • «Выполнено» ↔ completed, «В работе»/«Просрочено»/«Требует верификации» ↔
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import logging
 import re
 import time
@@ -65,6 +72,11 @@ MASS_SHARE = 0.2        # больше 3 — только если ≤ 20 % за
 MAX_DELETES_PER_RUN = 10
 
 TITLE_MAX_LEN = 1000
+# Заголовок редактируемого листа (= mymeet_sync.MY_TASKS_HEADER_ROW_V2)
+HEADER_V2 = ["№", "Дата", "Источник", "Задача", "Ответственный", "Срок", "Статус", "id"]
+# Поля, которые пользователь может поправить в листе: (поле записи, колонка)
+EDIT_FIELDS = (("task_date", 1), ("origin", 2), ("title", 3), ("assignee", 4),
+               ("deadline", 5))
 ALBUM_PLACEHOLDER = "Пересланный альбом"
 
 # Итог сверки
@@ -534,12 +546,12 @@ def _gt_email_link(item: dict) -> str:
 
 
 def row_key(row) -> str | None:
-    """Ключ строки листа «Мои задачи» (A–H): H = gtasks:/tg:-ключ, иначе
-    ключ протокола из ячеек."""
-    cells = [str(c).strip() if c is not None else "" for c in (row or [])]
-    cells += [""] * (8 - len(cells))
+    """Ключ строки листа «Мои задачи» (A–H).  H содержит ключ записи
+    (gtasks:/tg:/p:) — тогда правка видимых ячеек не меняет привязку строки.
+    Старые строки (H = mtg_id или пусто) — ключ протокола из ячеек."""
+    cells = _cells(row)
     h = cells[7]
-    if h.startswith((KEY_GTASKS, KEY_TELEGRAM)):
+    if h.startswith((KEY_GTASKS, KEY_TELEGRAM, KEY_PROTOCOL)):
         return h
     date_, meeting, task, assignee = cells[1], cells[2], cells[3], cells[4]
     if not date_ or not task:
@@ -548,16 +560,86 @@ def row_key(row) -> str | None:
     return f"{KEY_PROTOCOL}{base}|{date_}|{task.lower()}|{assignee.lower()}"
 
 
-def sheet_statuses(my_rows) -> dict:
-    """{key: status} из текущего листа «Мои задачи» (без заголовка)."""
+def _cells(row) -> list:
+    cells = [str(c).strip() if c is not None else "" for c in (row or [])][:8]
+    return cells + [""] * (8 - len(cells))
+
+
+def is_v2_sheet(my_rows) -> bool:
+    """Лист в редактируемом формате (его пишет эта версия бота)."""
+    return bool(my_rows) and _cells(my_rows[0]) == HEADER_V2
+
+
+def sheet_rows_by_key(my_rows) -> dict:
+    """{key: cells[0..7]} из листа «Мои задачи» (без заголовка); первая строка
+    с ключом побеждает."""
     out: dict = {}
     for row in (my_rows or [])[1:]:
         k = row_key(row)
-        if not k:
-            continue
-        st = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
-        out.setdefault(k, st)
+        if k:
+            out.setdefault(k, _cells(row))
     return out
+
+
+def sheet_statuses(my_rows) -> dict:
+    """{key: status} из текущего листа «Мои задачи» (без заголовка)."""
+    return {k: c[6] for k, c in sheet_rows_by_key(my_rows).items()}
+
+
+def sheet_snapshot(my_rows) -> list:
+    """Нормализованный снимок A:H всего листа (для обнаружения любых правок)."""
+    rows = [tuple(_cells(r)) for r in (my_rows or [])]
+    while rows and not any(rows[-1]):
+        rows.pop()
+    return rows
+
+
+def _json(v) -> dict:
+    if isinstance(v, dict):
+        return v
+    try:
+        d = json.loads(v) if v else {}
+        return d if isinstance(d, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def source_values(rec: dict) -> dict:
+    """Значения полей из источника (как бот показал бы их без правок)."""
+    title = rec.get("title") or ""
+    if rec.get("link"):
+        title = f"{title}\n{rec['link']}"
+    return {"task_date": rec.get("task_date") or "", "origin": rec.get("origin") or "",
+            "title": title, "assignee": rec.get("assignee") or "",
+            "deadline": rec.get("deadline") or ""}
+
+
+def display_values(rec: dict) -> dict:
+    """Показываемые значения: ручные правки пользователя важнее источника."""
+    vals = source_values(rec)
+    vals.update({k: v for k, v in _json(rec.get("overrides")).items() if k in vals})
+    return vals
+
+
+def apply_field_edits(rec: dict, cells: list | None) -> int:
+    """Ручные правки ячеек (дата, источник, задача, ответственный, срок):
+    значение, отличное от записанного ботом, сохраняется как правка
+    пользователя и дальше не перезаписывается источником."""
+    if not cells:
+        return 0
+    written = _json(rec.get("sheet_fields"))
+    if not written:
+        return 0
+    ovr = _json(rec.get("overrides"))
+    n = 0
+    for f, idx in EDIT_FIELDS:
+        if f in written and cells[idx] != written[f] and ovr.get(f) != cells[idx]:
+            ovr[f] = cells[idx]
+            n += 1
+    if n:
+        rec["overrides"] = json.dumps(ovr, ensure_ascii=False)
+        rec["_dirty"] = True
+    return n
 
 
 def apply_sheet_edit(rec: dict, sheet_val: str | None) -> bool:
@@ -570,7 +652,8 @@ def apply_sheet_edit(rec: dict, sheet_val: str | None) -> bool:
     if rec.get("sheet_status") is None or sheet_val == rec.get("sheet_status"):
         return False
     rec["status"] = sheet_val
-    rec["verified"] = 1
+    # Явный ручной выбор: «Требует верификации» — не подтверждено, иное — подтверждено
+    rec["verified"] = 0 if sheet_val == ST_UNVERIFIED else 1
     rec["_dirty"] = True
     if sheet_val != ST_CANCELLED and rec.get("gt_delete_pending"):
         rec["gt_delete_pending"] = 0          # передумал — удаление отменяется
@@ -581,11 +664,12 @@ def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
                        stats: dict) -> list:
     """Строки протоколов (формат mymeet_sync._build_my_tasks_rows) → записи.
 
-    Новая задача: «Требует верификации»; если в листе протокола у неё уже
-    стоит другой статус (выставлен там ранее) — он сохраняется.
-    Существующая: ручная правка в «Мои задачи» важнее; изменение статуса
-    в протоколе принимается, только если это НЕ возврат к «Требует
-    верификации» (бот сам верификацию не снимает и не возвращает).
+    Новая задача — ВСЕГДА «Требует верификации», verified=0, независимо от
+    статуса в протоколе.  Статус протокола никогда не меняет статус личной
+    задачи (ни до, ни после подтверждения): подтверждение — только ручное
+    изменение статуса в листе «Мои задачи» (apply_sheet_edit).
+    Содержимое (задача, срок, ответственный…) обновляется из протокола;
+    ручные правки этих ячеек хранятся отдельно (overrides) и важнее.
     Возвращает ключи активных протокольных задач.
     """
     active, seen = [], set()
@@ -599,24 +683,16 @@ def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
         pstatus = str(pstatus or "").strip()
         rec = records.get(key)
         if rec is None:
-            manual = pstatus in STATUS_VALUES and pstatus != ST_UNVERIFIED
             rec = {
                 "source": SRC_PROTOCOL, "source_key": key,
-                "status": pstatus if manual else ST_UNVERIFIED,
-                "verified": 1 if manual else 0,
+                "status": ST_UNVERIFIED, "verified": 0,
                 "ext_status": pstatus, "sheet_status": None, "_dirty": True,
             }
             records[key] = rec
             stats["protocol_new"] = stats.get("protocol_new", 0) + 1
         else:
-            if (not apply_sheet_edit(rec, sheet_vals.get(key))
-                    and pstatus in STATUS_VALUES and pstatus != ST_UNVERIFIED
-                    and pstatus != (rec.get("ext_status") or "")
-                    and pstatus != rec.get("status")):
-                rec["status"] = pstatus
-                rec["verified"] = 1
-                rec["_dirty"] = True
-            if (rec.get("ext_status") or "") != pstatus:
+            apply_sheet_edit(rec, sheet_vals.get(key))
+            if (rec.get("ext_status") or "") != pstatus:   # только для справки
                 rec["ext_status"] = pstatus
                 rec["_dirty"] = True
         for field, val in (("title", task), ("origin", meeting), ("assignee", assignee),
@@ -659,7 +735,7 @@ class GTPlan:
 
 
 def reconcile_gtasks(records: dict, items: list, complete: bool, list_ids,
-                     full_name: str, today: str, stats: dict, warnings: list,
+                     full_name: str, stats: dict, warnings: list,
                      sheet_vals: dict | None = None) -> GTPlan:
     """Google Tasks → записи; возвращает план внешних операций.
 
@@ -702,7 +778,9 @@ def reconcile_gtasks(records: dict, items: list, complete: bool, list_ids,
             rec = {
                 "source": SRC_GTASKS, "source_key": key, "status": st, "verified": 1,
                 "ext_status": raw, "ext_synced_status": st, "sheet_status": None,
-                "task_date": today, "gt_delete_pending": 0, "_dirty": True,
+                # Дата постановки: Tasks API не отдаёт дату письма, а дату
+                # импорта/обновления подставлять нельзя → пусто.
+                "task_date": "", "gt_delete_pending": 0, "_dirty": True,
             }
             records[key] = rec
             stats["gtasks_new"] = stats.get("gtasks_new", 0) + 1
@@ -810,24 +888,16 @@ def _deadline_key(d: str):
 
 def build_sheet_rows(records: dict, active_protocol: list) -> list:
     """Строки листа: все gtasks/telegram + активные протокольные.
-    [№, Дата, Источник, Задача, Ответственный, Срок, Статус, H, ключ]
-    Для протокольных H = mtg_id (как раньше), иначе H = ключ."""
+    [№, Дата, Источник, Задача, Ответственный, Срок, Статус, H=ключ, ключ]
+    Значения — с учётом ручных правок пользователя (display_values)."""
     rows = []
     active = set(active_protocol)
     for key, r in records.items():
-        if r.get("source") == SRC_PROTOCOL:
-            if key not in active:
-                continue
-            base = key[len(KEY_PROTOCOL):].split("|", 1)[0]
-            h = "" if base.startswith("~") else base
-        else:
-            h = key
-        title = r.get("title") or ""
-        if r.get("link"):
-            title = f"{title}\n{r['link']}"
-        rows.append([None, r.get("task_date") or "", r.get("origin") or "", title,
-                     r.get("assignee") or "", r.get("deadline") or "",
-                     r.get("status") or ST_IN_WORK, h, key])
+        if r.get("source") == SRC_PROTOCOL and key not in active:
+            continue
+        v = display_values(r)
+        rows.append([None, v["task_date"], v["origin"], v["title"], v["assignee"],
+                     v["deadline"], r.get("status") or ST_IN_WORK, key, key])
     rows.sort(key=lambda x: (_deadline_key(x[5]), _deadline_key(x[1]), x[3]))
     for i, x in enumerate(rows, 1):
         x[0] = i
@@ -852,8 +922,8 @@ class MyTasksBuilder:
 
     Порядок вызовов из mymeet_sync:
       matcher() → build(candidates, my_rows) → [защита от сжатия]
-      → sheet_unchanged(my_rows, fresh_rows) [повторное чтение листа]
-      → execute_external() → запись листа → commit().
+      → sheet_unchanged(my_rows, fresh_rows) [повторное чтение A:H: любые правки
+      → конфликт] → запись листа → commit() → execute_external().
     blocked(reason) — запись листа не выполнена (сжатие/конфликт).
     gtasks: (items, complete, list_ids) — сверка с GT в этом прогоне;
     gt_ops: объект с set_task_status/delete_task/get_task_state (gtasks.py).
@@ -913,7 +983,15 @@ class MyTasksBuilder:
             if r.pop("_plaintext", False):
                 r["_dirty"] = True              # старая запись → будет зашифрована
         sheet_read = bool(sheet_available and my_rows)
-        sheet_vals = sheet_statuses(my_rows) if sheet_read else {}
+        sheet_cells = sheet_rows_by_key(my_rows) if sheet_read else {}
+        sheet_vals = {k: c[6] for k, c in sheet_cells.items()}
+        v2 = is_v2_sheet(my_rows) if sheet_read else False
+
+        # 0. Ручные правки ячеек (задача, срок, ответственный, дата, источник)
+        for key, rec in records.items():
+            n = apply_field_edits(rec, sheet_cells.get(key))
+            if n:
+                _inc(self.stats, "manual_field_edits", n)
 
         # 1. Ручные правки gtasks/telegram (по ключам, как они сейчас в листе)
         gt_total = sum(1 for r in records.values() if r.get("source") == SRC_GTASKS)
@@ -945,9 +1023,8 @@ class MyTasksBuilder:
         # 3. Google Tasks
         if self.gtasks is not None:
             items, complete, list_ids = self.gtasks
-            today = fmt_date(datetime.now(_tz(self.tz_name)).date())
             plan = reconcile_gtasks(records, items, complete, list_ids, self.full_name,
-                                    today, self.stats, self.warnings,
+                                    self.stats, self.warnings,
                                     sheet_vals if sheet_read else None)
             if (self.stats.get("gtasks_mass_missing") or self.stats.get("gtasks_list_missing")
                     or self.stats.get("gtasks_mass_delete")):
@@ -968,13 +1045,30 @@ class MyTasksBuilder:
             self._plan = plan
 
         # 4. Восстановление состояния: запись, которую бот в лист ещё не писал,
-        #    а в листе по её ключу уже есть статус (восстановление БД, повторный
-        #    импорт) — принимаем статус листа как есть, БЕЗ внешних действий
-        #    (не удаляем и не отправляем в GT): не затираем пометку пользователя.
+        #    а в листе по её ключу уже есть значения (восстановление БД, повторный
+        #    импорт) — принимаем их как есть, БЕЗ внешних действий (не удаляем и
+        #    не отправляем в GT).  Протокольные статусы — только из листа V2:
+        #    в старом листе (V1) статусы — копия протокола, а не решение
+        #    пользователя, и подтверждением не считаются.
         for key, rec in records.items():
-            v = sheet_vals.get(key)
-            if (rec.get("sheet_status") is None and v in STATUS_VALUES
-                    and v != rec.get("status") and rec.get("ext_status") != GT_DELETED):
+            cells = sheet_cells.get(key)
+            if cells is None or rec.get("sheet_status") is not None:
+                continue
+            if v2 and not _json(rec.get("sheet_fields")):
+                cur = display_values(rec)
+                ovr = _json(rec.get("overrides"))
+                for f, idx in EDIT_FIELDS:
+                    if cells[idx] != cur[f]:
+                        ovr[f] = cells[idx]
+                if ovr != _json(rec.get("overrides")):
+                    rec["overrides"] = json.dumps(ovr, ensure_ascii=False)
+                    rec["_dirty"] = True
+                    _inc(self.stats, "adopted_fields")
+            v = cells[6]
+            if rec.get("source") == SRC_PROTOCOL and not v2:
+                continue
+            if (v in STATUS_VALUES and v != rec.get("status")
+                    and rec.get("ext_status") != GT_DELETED):
                 rec["status"] = v
                 if rec.get("source") == SRC_GTASKS:
                     rec["ext_synced_status"] = v
@@ -987,12 +1081,12 @@ class MyTasksBuilder:
         self._records = records
         self._save(list(records.values()))
         rows = build_sheet_rows(records, active)
-        self._written = {r[8]: r[6] for r in rows}
+        self._written = {r[8]: (r[6], {f: r[idx] for f, idx in EDIT_FIELDS}) for r in rows}
         return [r[:8] for r in rows]
 
     def sheet_unchanged(self, before_rows, fresh_rows) -> bool:
-        """Статусы листа не изменились между чтением и записью."""
-        return sheet_statuses(before_rows) == sheet_statuses(fresh_rows)
+        """Лист (A:H целиком) не менялся между первым и повторным чтением."""
+        return sheet_snapshot(before_rows) == sheet_snapshot(fresh_rows)
 
     def blocked(self, reason: str) -> None:
         self.block_reason = reason
@@ -1048,9 +1142,15 @@ class MyTasksBuilder:
         self._save(changed)
 
     def commit(self) -> None:
-        """Лист записан — запоминаем записанные статусы."""
+        """Лист записан — запоминаем записанные статус и значения ячеек."""
         if self._written:
-            self._store().my_tasks_mark_written(self.telegram_id, self._written)
+            payload = {k: (st, json.dumps(f, ensure_ascii=False))
+                       for k, (st, f) in self._written.items()}
+            self._store().my_tasks_mark_written(self.telegram_id, payload)
+            for k, (st, f) in payload.items():
+                if k in self._records:          # чтобы последующий _save не откатил
+                    self._records[k]["sheet_status"] = st
+                    self._records[k]["sheet_fields"] = f
         self.committed = True
 
 

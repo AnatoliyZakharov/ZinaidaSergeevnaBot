@@ -1071,8 +1071,8 @@ def _count_my_task_rows(rows) -> int:
 
 
 def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -> bool:
-    """Повторно читает лист «Мои задачи» и проверяет, что статусы не менялись
-    после первого чтения.  Ошибка чтения → False (не рискуем)."""
+    """Повторно читает лист «Мои задачи» (A:H) и проверяет, что ни одна ячейка
+    не менялась после первого чтения.  Ошибка чтения → False (не рискуем)."""
     try:
         resp = _gs_call(spreadsheet.values_batch_get, [_quote_sheet_title(title) + "!A:H"])
         vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
@@ -1167,18 +1167,16 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                         warnings.append(msg)
                     elif exists and not _my_tasks_sheet_stable(
                             spreadsheet, my_title, my_rows, rows_builder):
-                        # Пользователь менял статусы, пока шла сверка — не
+                        # Пользователь правил лист, пока шла сверка — не
                         # перезаписываем его правку; повторим сверку позже.
-                        msg = (f"{my_title}: статусы изменились во время синхронизации — "
+                        msg = (f"{my_title}: лист изменён во время синхронизации — "
                                f"запись отложена, повторю")
                         rows = None
                         rows_builder.blocked("conflict")
                         logger.warning("My tasks: %s", msg)
                         warnings.append(msg)
-                    else:
-                        # Внешние операции (Google Tasks) — только после проверки
-                        rows_builder.execute_external()
                 if rows is not None:
+                    # Запись сразу после повторного чтения — окно гонки = 1 запрос
                     ws = _write_my_tasks_sheet(
                         spreadsheet, my_title, exists, rows, warnings,
                         editable=rows_builder is not None)
@@ -1186,6 +1184,9 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                     my_count = len(rows)
                     if rows_builder is not None:
                         rows_builder.commit()
+                        # Внешние операции (Google Tasks) — только после проверки
+                        # листа и его успешной записи
+                        rows_builder.execute_external()
                         if exists:
                             sheet_meta = next(
                                 (sh for sh in meta.get("sheets") or []

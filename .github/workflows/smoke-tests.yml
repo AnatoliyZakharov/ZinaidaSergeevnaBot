@@ -13,6 +13,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # тест миграции БД читает db.py из коммита до PR
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -23,6 +25,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --quiet gspread requests google-auth
+          # «Мои задачи»: реальные объекты Telegram и Fernet — тесты не пропускаются
+          pip install --quiet python-telegram-bot==21.6 cryptography==43.0.3
 
       - name: Run smoke tests
         run: python test_smoke.py

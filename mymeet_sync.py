@@ -55,6 +55,18 @@ MY_TASKS_SHEET_PREFIX = f"{MY_TASKS_SHEET_NAME} — "
 MY_TASKS_HEADER_ROW = [
     "№", "Дата", "Совещание", "Задача", "Ответственный", "Срок", "Статус", "mtg_id",
 ]
+# Редактируемый лист из трёх источников (протоколы + Google Tasks + Telegram,
+# см. my_tasks.py): та же раскладка, «Совещание» → «Источник», H — ключ строки.
+MY_TASKS_HEADER_ROW_V2 = [
+    "№", "Дата", "Источник", "Задача", "Ответственный", "Срок", "Статус", "id",
+]
+MY_TASKS_PROTECTION_PREFIX = "Генерируется ботом"
+MY_TASKS_PROTECTION_EDITABLE = (
+    "Генерируется ботом из протоколов, Google Tasks и Telegram. "
+    "Менять можно только «Статус» — бот учтёт его при синхронизации.")
+# Защита от массового удаления: не перезаписываем лист, если строк стало
+# меньше половины (при ≥ MY_TASKS_SHRINK_MIN строках в листе).
+MY_TASKS_SHRINK_MIN = 10
 MY_TASKS_COL_WIDTHS_PX = [50, 110, 220, 420, 180, 120, 190]  # A–G
 MY_TASKS_STATUS_COL = 6                                      # G (0-based)
 MY_TASKS_MTG_ID_COL = 7                                      # H — hidden
@@ -709,6 +721,8 @@ def _build_user_config(user_config: dict | None) -> dict:
         "email":    email,
         "gcal_organizer_data": cfg.get("gcal_organizer_data"),  # dict{"ids","times"} or None
         "full_name": cfg.get("mymeet_full_name") or "",          # ФИО for «Мои задачи»
+        # my_tasks.MyTasksBuilder (или None — прежний режим только протоколов)
+        "my_tasks_builder": cfg.get("my_tasks_builder"),
     }
 
 
@@ -759,14 +773,16 @@ def _is_my_tasks_title(title: str) -> bool:
 
 
 def _is_my_tasks_header(row) -> bool:
-    """True when the first row (read as A:G or wider) is the «Мои задачи» header."""
+    """True when the first row (read as A:G or wider) is a «Мои задачи» header
+    (legacy «Совещание»/mtg_id or V2 «Источник»/id)."""
     if not row:
         return False
     cells = [str(c).strip() for c in row]
     while cells and not cells[-1]:
         cells.pop()
     n = len(cells)
-    return n >= len(MY_TASKS_HEADER_ROW) - 1 and cells == MY_TASKS_HEADER_ROW[:n]
+    return n >= len(MY_TASKS_HEADER_ROW) - 1 and (
+        cells == MY_TASKS_HEADER_ROW[:n] or cells == MY_TASKS_HEADER_ROW_V2[:n])
 
 
 def _resolve_my_tasks_title(titles, full_name: str) -> str:
@@ -788,7 +804,7 @@ def _resolve_my_tasks_title(titles, full_name: str) -> str:
     return same[0] if same else desired
 
 
-def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
+def _build_my_tasks_rows(sheets: dict, full_name: str, matcher=None) -> list:
     """Build «Мои задачи» data rows from protocol sheets.
 
     sheets    — {sheet_title: rows} as read from the spreadsheet (A:G)
@@ -806,10 +822,16 @@ def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
     one meeting there).
     Among duplicates a row with a manually set status (≠ «Требует верификации»)
     wins, otherwise the first one seen.
+
+    matcher — optional callable(assignee, mtg_id) -> bool replacing the exact
+    ФИО comparison (my_tasks: word order, cases, surname + initials).
     """
     target = _norm_person(full_name)
     if not target:
         return []
+    if matcher is None:
+        def matcher(assignee, _mid):
+            return _norm_person(assignee) == target
 
     picked: dict[str, list] = {}
     for title, rows in sheets.items():
@@ -832,7 +854,7 @@ def _build_my_tasks_rows(sheets: dict, full_name: str) -> list:
             _num, date, task, assignee, deadline, status, mid = cells
             if not date or not task:
                 continue
-            if _norm_person(assignee) != target:
+            if not matcher(assignee, mid):
                 continue
             if mid:
                 base = mid
@@ -931,9 +953,12 @@ def _ensure_status_colors(spreadsheet, metadata: dict, targets: dict) -> None:
 
 
 def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
-                          warnings: list):
+                          warnings: list, editable: bool = False):
     """Get-or-add the user's «Мои задачи — ФИО» sheet, overwrite its data,
     format it, set the filter.  Returns the worksheet.
+
+    editable=True (my_tasks builder): V2 header, status dropdown in G, the
+    soft protection leaves the status column unprotected.
 
     The sheet is never cleared before writing: data is written first
     (A1:H{n}), and only after a successful update the tail of old rows below
@@ -945,23 +970,25 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     else:
         ws = _gs_call(spreadsheet.add_worksheet, title=title, rows=1000, cols=10)
         # One-time soft protection: the sheet is regenerated on every sync.
+        prot = {
+            "range": {"sheetId": ws.id},
+            "description": "Генерируется ботом при синхронизации. "
+                           "Статус меняйте в листе протокола.",
+            "warningOnly": True,
+        }
+        if editable:
+            prot["description"] = MY_TASKS_PROTECTION_EDITABLE
+            prot["unprotectedRanges"] = [_my_tasks_status_range(ws.id)]
         try:
             _gs_call(spreadsheet.batch_update, {"requests": [{
-                "addProtectedRange": {
-                    "protectedRange": {
-                        "range": {"sheetId": ws.id},
-                        "description": "Генерируется ботом при синхронизации. "
-                                       "Статус меняйте в листе протокола.",
-                        "warningOnly": True,
-                    }
-                }
+                "addProtectedRange": {"protectedRange": prot}
             }]})
         except Exception as e:
             msg = f"{title} (защита листа): {e}"
             logger.warning("Sheet formatting error (%s): %s", title, msg)
             warnings.append(msg)
 
-    all_data = [MY_TASKS_HEADER_ROW] + rows
+    all_data = [MY_TASKS_HEADER_ROW_V2 if editable else MY_TASKS_HEADER_ROW] + rows
     need_rows = len(all_data)
     need_cols = len(MY_TASKS_HEADER_ROW)
     try:
@@ -983,7 +1010,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     warnings.extend(_apply_full_format(
         spreadsheet, ws, data_rows=len(rows),
         ncols=len(MY_TASKS_COL_WIDTHS_PX),
-        status_col=None,                    # read-only sheet — no dropdown
+        status_col=MY_TASKS_STATUS_COL if editable else None,  # legacy: read-only
         col_widths=MY_TASKS_COL_WIDTHS_PX,
         hidden_col=MY_TASKS_MTG_ID_COL,
     ))
@@ -1007,7 +1034,56 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     return ws
 
 
-def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
+def _my_tasks_status_range(sheet_id: int) -> dict:
+    return {"sheetId": sheet_id, "startRowIndex": 1,
+            "startColumnIndex": MY_TASKS_STATUS_COL,
+            "endColumnIndex": MY_TASKS_STATUS_COL + 1}
+
+
+def _my_tasks_protection_update_requests(sheet_meta: dict, sheet_id: int) -> list:
+    """Existing sheets created read-only: switch our soft protection to
+    «status column editable».  Foreign protections are not touched."""
+    reqs = []
+    for pr in (sheet_meta or {}).get("protectedRanges") or []:
+        desc = str(pr.get("description") or "")
+        if not desc.startswith(MY_TASKS_PROTECTION_PREFIX):
+            continue
+        if desc == MY_TASKS_PROTECTION_EDITABLE and pr.get("unprotectedRanges"):
+            continue
+        if "protectedRangeId" not in pr:
+            continue
+        reqs.append({"updateProtectedRange": {
+            "protectedRange": {
+                "protectedRangeId": pr["protectedRangeId"],
+                "description": MY_TASKS_PROTECTION_EDITABLE,
+                "unprotectedRanges": [_my_tasks_status_range(sheet_id)],
+            },
+            "fields": "description,unprotectedRanges",
+        }})
+    return reqs
+
+
+def _count_my_task_rows(rows) -> int:
+    """Data rows (with a task) in a «Мои задачи» sheet read as A:H."""
+    if not rows or not _is_my_tasks_header(rows[0]):
+        return 0
+    return sum(1 for r in rows[1:] if len(r) > 3 and str(r[3]).strip())
+
+
+def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -> bool:
+    """Повторно читает лист «Мои задачи» (A:H) и проверяет, что ни одна ячейка
+    не менялась после первого чтения.  Ошибка чтения → False (не рискуем)."""
+    try:
+        resp = _gs_call(spreadsheet.values_batch_get, [_quote_sheet_title(title) + "!A:H"])
+        vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+        fresh = (vranges[0] or {}).get("values") or [] if vranges else []
+    except Exception as e:
+        logger.warning("My tasks: re-read failed (%s): %s", title, type(e).__name__)
+        return False
+    return rows_builder.sheet_unchanged(before_rows, fresh)
+
+
+def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) -> tuple:
     """Post-sync step: status colours on protocol sheets and on every
     «Мои задачи — …» sheet; when full_name is set, the user's personal
     «Мои задачи — {ФИО}» sheet is (re)written.  Other users' sheets are never
@@ -1016,13 +1092,21 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
     Returns (warnings: list[str], my_tasks_count: int | None, my_title: str | None).
     my_tasks_count is None when the sheet was not written.
     Never raises for sheet-level problems — they are returned as warnings.
+
+    rows_builder (my_tasks.MyTasksBuilder) switches the personal sheet to the
+    editable three-source mode: builder.build() gets protocol candidates and
+    the current sheet (to accept manual status edits) and returns rows;
+    builder.commit() is called only after a successful write.  The sheet is
+    not rewritten if it would shrink below half (mass-deletion guard).
     """
     warnings: list[str] = []
     full_name = (full_name or "").strip()
 
-    meta = _gs_call(spreadsheet.fetch_sheet_metadata, params={
-        "fields": "sheets(properties(sheetId,title),conditionalFormats,basicFilter)",
-    })
+    fields = "sheets(properties(sheetId,title),conditionalFormats,basicFilter)"
+    if rows_builder is not None:
+        fields = ("sheets(properties(sheetId,title),conditionalFormats,basicFilter,"
+                  "protectedRanges(protectedRangeId,description,unprotectedRanges))")
+    meta = _gs_call(spreadsheet.fetch_sheet_metadata, params={"fields": fields})
     if not isinstance(meta, dict):
         meta = {}
     sheet_ids: dict[str, int] = {}
@@ -1031,12 +1115,14 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
         if "title" in props:
             sheet_ids[props["title"]] = props.get("sheetId", 0)
     titles = list(sheet_ids)
+    my_title = _resolve_my_tasks_title(titles, full_name) if full_name else None
 
     values: dict[str, list] = {}
     if titles:
         suffix = "!A:G" if full_name else "!A1:G1"
         resp = _gs_call(spreadsheet.values_batch_get,
-                        [_quote_sheet_title(t) + suffix for t in titles])
+                        [_quote_sheet_title(t) + ("!A:H" if t == my_title else suffix)
+                         for t in titles])
         vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
         for t, vr in zip(titles, vranges):
             values[t] = (vr or {}).get("values") or []
@@ -1051,9 +1137,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             color_targets[sheet_ids[t]] = MY_TASKS_STATUS_COL
 
     my_count = None
-    my_title = None
     if full_name:
-        my_title = _resolve_my_tasks_title(titles, full_name)
         if my_title in protocol_titles:
             msg = (f"Лист «{my_title}» занят протоколом встречи с таким "
                    f"же названием — личный лист не обновлён")
@@ -1061,12 +1145,59 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             warnings.append(msg)
         else:
             try:
-                rows = _build_my_tasks_rows(
-                    {t: values[t] for t in protocol_titles}, full_name)
-                ws = _write_my_tasks_sheet(
-                    spreadsheet, my_title, my_title in sheet_ids, rows, warnings)
-                color_targets[ws.id] = MY_TASKS_STATUS_COL
-                my_count = len(rows)
+                proto = {t: values[t] for t in protocol_titles}
+                exists = my_title in sheet_ids
+                if rows_builder is None:
+                    rows = _build_my_tasks_rows(proto, full_name)
+                else:
+                    my_rows = values.get(my_title) if exists else None
+                    candidates = _build_my_tasks_rows(
+                        proto, full_name, matcher=rows_builder.matcher())
+                    rows = rows_builder.build(candidates, my_rows)
+                    before = _count_my_task_rows(my_rows)
+                    if rows is None:
+                        pass                    # аномалия builder-а (см. его warnings)
+                    elif before >= MY_TASKS_SHRINK_MIN and len(rows) * 2 < before:
+                        msg = (f"{my_title}: строк стало бы {len(rows)} вместо "
+                               f"{before} — лист не перезаписан (защита от массового "
+                               f"удаления)")
+                        rows = None
+                        rows_builder.blocked("shrink")
+                        logger.warning("My tasks: %s", msg)
+                        warnings.append(msg)
+                    elif exists and not _my_tasks_sheet_stable(
+                            spreadsheet, my_title, my_rows, rows_builder):
+                        # Пользователь правил лист, пока шла сверка — не
+                        # перезаписываем его правку; повторим сверку позже.
+                        msg = (f"{my_title}: лист изменён во время синхронизации — "
+                               f"запись отложена, повторю")
+                        rows = None
+                        rows_builder.blocked("conflict")
+                        logger.warning("My tasks: %s", msg)
+                        warnings.append(msg)
+                if rows is not None:
+                    # Запись сразу после повторного чтения — окно гонки = 1 запрос
+                    ws = _write_my_tasks_sheet(
+                        spreadsheet, my_title, exists, rows, warnings,
+                        editable=rows_builder is not None)
+                    color_targets[ws.id] = MY_TASKS_STATUS_COL
+                    my_count = len(rows)
+                    if rows_builder is not None:
+                        rows_builder.commit()
+                        # Внешние операции (Google Tasks) — только после проверки
+                        # листа и его успешной записи
+                        rows_builder.execute_external()
+                        if exists:
+                            sheet_meta = next(
+                                (sh for sh in meta.get("sheets") or []
+                                 if (sh.get("properties") or {}).get("title") == my_title),
+                                {})
+                            preqs = _my_tasks_protection_update_requests(sheet_meta, ws.id)
+                            if preqs:
+                                try:
+                                    _gs_call(spreadsheet.batch_update, {"requests": preqs})
+                                except Exception as e:
+                                    warnings.append(f"{my_title} (защита листа): {e}")
             except Exception as e:
                 msg = f"{my_title}: {e}"
                 logger.warning("Sheet formatting error (%s): %s", my_title, msg)
@@ -1080,6 +1211,15 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str) -> tuple:
             logger.warning("Sheet formatting error (status colors): %s", msg)
             warnings.append(msg)
     return warnings, my_count, my_title
+
+
+def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder) -> tuple:
+    """Rewrite only the personal «Мои задачи» sheet (+ status colours) without
+    touching MYmeet: used by the daily Google Tasks sync and after a forwarded
+    Telegram task.  Returns the same tuple as _sync_my_tasks_and_colors."""
+    gc = _gs_client()
+    spreadsheet = gc.open_by_key(sheet_id or SPREADSHEET_ID)
+    return _sync_my_tasks_and_colors(spreadsheet, full_name, rows_builder=rows_builder)
 
 
 # ── Core sync ─────────────────────────────────────────────────────────────────
@@ -1415,7 +1555,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     my_tasks_title = None
     try:
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name)
+            spreadsheet, full_name, rows_builder=cfg.get("my_tasks_builder"))
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error (Мои задачи / цвета): %s", e)

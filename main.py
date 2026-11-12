@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from datetime import datetime, time, timedelta, timezone
+import time as time_module
 from typing import Optional
 
 import pytz
@@ -47,6 +48,7 @@ from googleapiclient.discovery import build
 import db
 import gtasks
 import auth
+import my_tasks
 import crypto as _crypto
 from crypto import CryptoDecryptError
 from mymeet_sync import sync_to_sheets_async, fetch_workspaces, verify_token_and_get_workspace, MymeetTokenError
@@ -630,6 +632,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎙 «Поставь встречу с командой в пятницу в 15:00»\n"
             "🎙 «Добавь ссылки на телемост»\n\n"
             "Ссылки Телемост добавляются автоматически каждые 3 часа.\n\n"
+            "📋 Перешли мне любое сообщение — оно станет задачей в «Мои задачи»\n"
+            "🔄 Google Tasks ↔ «Мои задачи» — каждый день в 19:00 (сейчас: /sync\\_tasks)\n\n"
             "/settings — настройки  |  /disconnect — отключить Google\n"
             "/setname Имя Фамилия — ФИО для листа «Мои задачи — Имя Фамилия» в таблице MYmeet",
             parse_mode="Markdown",
@@ -721,12 +725,16 @@ async def cmd_setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.upsert_user(telegram_id, update.effective_user.username)
     hint = (
         "Лист «Мои задачи — <ваше ФИО>» (например, «Мои задачи — Иван Петров») "
-        "в вашей таблице MYmeet собирает задачи, где "
-        "«Ответственный» совпадает с этим ФИО (без учёта регистра и пробелов; "
-        "только имя или только фамилия не подходят).\n"
+        "в вашей таблице MYmeet собирает:\n"
+        "• задачи из протоколов, где вы ответственный (полное ФИО в любом порядке "
+        "и падеже или фамилия с инициалами) — со статусом «Требует верификации», "
+        "пока вы сами не поменяете статус;\n"
+        "• все задачи Google Tasks (статусы синхронизируются в 19:00);\n"
+        "• пересланные боту сообщения.\n"
         "У каждого пользователя общей таблицы — свой лист. "
-        "Лист обновляется при каждой синхронизации и только для чтения: "
-        "статус задачи меняйте в листе протокола встречи."
+        "В листе можно менять только «Статус» — бот учтёт это при синхронизации.\n"
+        "⚠️ «Отменено» у задачи из Google Tasks удаляет её в Google Tasks "
+        "при ближайшей синхронизации (19:00 или /sync_tasks)."
     )
     if not context.args:
         user = db.get_user(telegram_id)
@@ -1329,7 +1337,23 @@ def _user_row_to_mymeet_config(user) -> dict | None:
         return None
     cfg = dict(user)
     cfg["mymeet_token"] = token
+    # «Мои задачи» в редактируемом режиме (протоколы + Google Tasks + Telegram).
+    # Google Tasks здесь не опрашивается — только при ежедневной сверке в 19:00.
+    cfg["my_tasks_builder"] = my_tasks.MyTasksBuilder(
+        user["telegram_id"], _user_full_name(user), tz_name=user["timezone"])
     return cfg
+
+
+# Сериализация записей листа «Мои задачи» одного пользователя (MYmeet-синк,
+# ежедневная сверка Google Tasks, обновление после пересланного сообщения).
+_my_tasks_locks: dict[int, asyncio.Lock] = {}
+
+
+def _user_lock(telegram_id: int) -> asyncio.Lock:
+    lock = _my_tasks_locks.get(telegram_id)
+    if lock is None:
+        lock = _my_tasks_locks[telegram_id] = asyncio.Lock()
+    return lock
 
 
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,7 +1386,8 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_config["gcal_organizer_data"] = gcal_data_1d
         msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
         try:
-            result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
+            async with _user_lock(telegram_id):
+                result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
             await msg.edit_text(result)
         except Exception as e:
             logger.error("MYmeet sync error: %s", e, exc_info=True)
@@ -1420,7 +1445,9 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         user_config["gcal_organizer_data"] = gcal_data
         try:
-            result = await sync_to_sheets_async(days=days, append=False, user_config=user_config)
+            async with _user_lock(telegram_id):
+                result = await sync_to_sheets_async(days=days, append=False,
+                                                    user_config=user_config)
             await msg.edit_text(result)
         except Exception as e:
             logger.error("MYmeet sync full error: %s", e, exc_info=True)
@@ -1442,10 +1469,167 @@ async def scheduled_mymeet_sync():
         if not user_config:
             continue
         try:
-            result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
+            async with _user_lock(user["telegram_id"]):
+                result = await sync_to_sheets_async(days=1, append=True,
+                                                    user_config=user_config)
             logger.info("MYmeet sync [%s]: %s", user["telegram_id"], result.replace("\n", " | "))
         except Exception as e:
             logger.error("MYmeet sync error [%s]: %s", user["telegram_id"], e, exc_info=True)
+
+
+# ─── «Мои задачи»: Google Tasks + пересланные сообщения ───────
+
+MY_TASKS_REFRESH_DELAY = 20          # сек: пачка пересланных → одна запись листа
+_my_tasks_refresh_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _run_my_tasks_sync(telegram_id: int, with_gtasks: bool) -> dict:
+    async with _user_lock(telegram_id):
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: my_tasks.run_sync(telegram_id, with_gtasks=with_gtasks)
+        )
+
+
+def _schedule_my_tasks_refresh(telegram_id: int) -> None:
+    """Отложенная перезапись листа (debounce) после пересланных сообщений."""
+    prev = _my_tasks_refresh_tasks.get(telegram_id)
+    if prev and not prev.done():
+        prev.cancel()
+
+    async def _later():
+        try:
+            await asyncio.sleep(MY_TASKS_REFRESH_DELAY)
+            res = await _run_my_tasks_sync(telegram_id, with_gtasks=False)
+            logger.info("My tasks refresh [%s]: outcome=%s", telegram_id, res["outcome"])
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("My tasks refresh error [%s]: %s", telegram_id, type(e).__name__)
+
+    _my_tasks_refresh_tasks[telegram_id] = asyncio.create_task(_later())
+
+
+async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Любое сообщение, пересланное в личный чат, → задача в «Мои задачи» без
+    подтверждения.  Срабатывает раньше мастера MYmeet: пересылка — всегда задача,
+    обычные (не пересланные) сообщения мастер получает как прежде."""
+    telegram_id = update.effective_user.id
+    message = update.message
+    db.upsert_user(telegram_id, update.effective_user.username)
+    user = db.get_user(telegram_id)
+    info = my_tasks.forward_info(message, (user["timezone"] if user else None) or DEFAULT_TZ)
+    if info is None:
+        return
+    try:
+        created = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: my_tasks.add_forwarded(telegram_id, info))
+    except Exception as e:
+        logger.error("handle_forwarded: ошибка сохранения [%s]: %s", telegram_id,
+                     type(e).__name__)
+        await message.reply_text("😔 Не удалось сохранить задачу. Попробуй ещё раз.")
+        return
+    db.log_event(telegram_id, "my_task_forward")
+    if info["album"] and not created:
+        return          # другая часть того же альбома — задача уже есть
+    title = info["title"] if len(info["title"]) <= 120 else info["title"][:117] + "…"
+    if not created:
+        await message.reply_text(f"♻️ Уже в «Мои задачи»: {title}")
+        return
+    lines = [f"📌 Добавлено в «Мои задачи»: {title}"]
+    if info["assigner"]:
+        lines.append(f"👤 Постановщик: {info['assigner']}")
+    lines.append(f"📅 Дата: {info['task_date']}")
+    if info["deadline"]:
+        lines.append(f"⏰ Срок: {info['deadline']}")
+    if not (user and user["mymeet_spreadsheet_id"]):
+        lines.append("ℹ️ Таблица не настроена — лист появится после /setup_mymeet")
+    elif not _user_full_name(user):
+        lines.append("ℹ️ Укажите ФИО (/setname Имя Фамилия), чтобы появился лист")
+    else:
+        _schedule_my_tasks_refresh(telegram_id)
+    if user and user["mymeet_setup_in_progress"]:
+        lines.append("ℹ️ Идёт настройка MYmeet: токен и ссылку отправьте обычным "
+                     "сообщением, не пересылкой.")
+    await message.reply_text("\n".join(lines))
+
+
+def _record_daily_result(telegram_id: int, slot: str, res: dict, state: dict | None) -> bool:
+    """Сохраняет итог сверки. Возвращает True, если пользователя надо уведомить."""
+    now = time_module.time()
+    state = state or {}
+    outcome = res.get("outcome")
+    if outcome == my_tasks.OUT_OK:
+        db.my_tasks_sync_save(telegram_id, last_success_slot=slot, fail_count=0,
+                              next_attempt_ts=0, last_attempt_ts=now, last_outcome=outcome)
+        return False
+    fails = int(state.get("fail_count") or 0) + 1
+    notify = my_tasks.should_notify(outcome, fails, state.get("notified_slot"), slot)
+    fields = dict(fail_count=fails, last_attempt_ts=now, last_outcome=outcome,
+                  next_attempt_ts=now + my_tasks.next_attempt_delay(fails))
+    if notify:
+        fields["notified_slot"] = slot
+    db.my_tasks_sync_save(telegram_id, **fields)
+    return notify
+
+
+async def cmd_sync_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sync_tasks — сверка Google Tasks ↔ «Мои задачи» сейчас (обычно — в 19:00)."""
+    telegram_id = update.effective_user.id
+    db.upsert_user(telegram_id, update.effective_user.username)
+    user = db.get_user(telegram_id)
+    if not db.is_google_connected(telegram_id):
+        await update.message.reply_text("🔑 Сначала подключи Google: /connect")
+        return
+    msg = await update.message.reply_text("⏳ Синхронизирую Google Tasks ↔ «Мои задачи»...")
+    try:
+        res = await _run_my_tasks_sync(telegram_id, with_gtasks=True)
+        if res["outcome"] == my_tasks.OUT_OK:
+            slot = my_tasks.daily_slot(datetime.now(timezone.utc).astimezone(_tz(user)))
+            db.my_tasks_sync_save(telegram_id, last_success_slot=slot, fail_count=0,
+                                  next_attempt_ts=0, last_outcome=res["outcome"])
+        await msg.edit_text(res["text"])
+    except Exception as e:
+        logger.error("cmd_sync_tasks error [%s]: %s", telegram_id, type(e).__name__)
+        await msg.edit_text("❌ Синхронизация не выполнена (внутренняя ошибка). Попробуй позже.")
+
+
+async def scheduled_my_tasks_daily(bot: Bot):
+    """Каждые 15 минут.  Для каждого пользователя с Google: если наступил
+    слот 19:00 по его поясу и он ещё не выполнен полностью — сверка.
+    Неудача (частичная/временная/аномалия) не отмечает слот выполненным:
+    повтор с паузой 15→30→60→120 мин, в том числе после 19:59 и ночью,
+    пока не будет успеха (дальше — уже следующий слот)."""
+    users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
+    now_utc = datetime.now(timezone.utc)
+    for user in users:
+        telegram_id = user["telegram_id"]
+        try:
+            local = now_utc.astimezone(_tz(user))
+        except Exception:
+            local = now_utc.astimezone(pytz.timezone(DEFAULT_TZ))
+        state = db.my_tasks_sync_get(telegram_id)
+        slot = my_tasks.daily_due(state, local, now_utc.timestamp())
+        if not slot:
+            continue
+        try:
+            res = await _run_my_tasks_sync(telegram_id, with_gtasks=True)
+        except Exception as e:
+            logger.error("My tasks daily error [%s]: %s", telegram_id, type(e).__name__)
+            res = {"outcome": my_tasks.OUT_TRANSIENT,
+                   "text": my_tasks._HEADINGS[my_tasks.OUT_TRANSIENT]}
+        logger.info("My tasks daily [%s] slot=%s outcome=%s", telegram_id, slot,
+                    res["outcome"])
+        try:
+            notify = _record_daily_result(telegram_id, slot, res, state)
+            if notify:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text="Синхронизация «Мои задачи» (19:00)\n\n" + res["text"],
+                    disable_notification=True,
+                )
+        except Exception as e:
+            logger.error("My tasks daily record/notify error [%s]: %s", telegram_id,
+                         type(e).__name__)
 
 
 # ─── OAuth callback (aiohttp web server) ─────────────────────
@@ -1658,6 +1842,7 @@ async def run_bot():
     app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",  cmd_del_contact))
     app.add_handler(CommandHandler("tasks",         cmd_tasks))
+    app.add_handler(CommandHandler("sync_tasks",    cmd_sync_tasks))
     app.add_handler(CommandHandler("sync_mymeet",      cmd_sync_mymeet))
     app.add_handler(CommandHandler("sync_mymeet_full", cmd_sync_mymeet_full))
     app.add_handler(CommandHandler("setup_mymeet",     cmd_setup_mymeet))
@@ -1666,6 +1851,9 @@ async def run_bot():
         lambda u, c: _handle_mymeet_ws_callback(u, c),
         pattern=r"^mymeet_ws:",
     ))
+    # Пересланные сообщения → «Мои задачи» (раньше голосовых/текстовых хендлеров)
+    app.add_handler(MessageHandler(
+        filters.FORWARDED & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_forwarded))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -1701,6 +1889,17 @@ async def run_bot():
         minute=0,
         id="mymeet_daily_sync",
         replace_existing=True,
+        timezone="UTC",
+    )
+    scheduler.add_job(
+        scheduled_my_tasks_daily,
+        "cron",
+        minute="*/15",   # 19:00 по поясу пользователя — проверяется на каждом тике
+        args=[app.bot],
+        id="my_tasks_daily",
+        replace_existing=True,
+        max_instances=1,      # тики не накладываются друг на друга
+        coalesce=True,
         timezone="UTC",
     )
     scheduler.start()

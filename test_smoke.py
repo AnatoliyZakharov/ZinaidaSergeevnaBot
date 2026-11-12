@@ -1581,6 +1581,9 @@ if __name__ == "__main__":
         (test_telemost_mixed_and_allday_cancelled, "Телемост: смешанный набор событий"),
         (test_format_telemost_report_new_and_old_keys, "Телемост: отчёт со старыми/новыми ключами"),
     ]
+    # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
+    from test_my_tasks import TESTS as _MY_TASKS_TESTS
+    tests += _MY_TASKS_TESTS
     failed = []
     for fn, label in tests:
         try:

@@ -75,6 +75,46 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
             CREATE INDEX IF NOT EXISTS idx_events_user ON events(telegram_id, created_at);
+
+            -- «Мои задачи»: задачи из Google Tasks / Telegram и учёт статусов
+            -- протокольных задач (см. my_tasks.py). Строки никогда не удаляются
+            -- ботом; UNIQUE защищает от дублей.
+            CREATE TABLE IF NOT EXISTS my_tasks (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id       INTEGER NOT NULL,
+                source            TEXT    NOT NULL,   -- protocol | gtasks | telegram
+                source_key        TEXT    NOT NULL,   -- p:… | gtasks:{id} | tg:{hash}
+                title             TEXT    NOT NULL DEFAULT '',
+                origin            TEXT    DEFAULT '', -- совещание / список GT / постановщик
+                assignee          TEXT    DEFAULT '',
+                task_date         TEXT    DEFAULT '', -- dd.mm.yyyy
+                deadline          TEXT    DEFAULT '', -- dd.mm.yyyy
+                status            TEXT    NOT NULL,
+                verified          INTEGER DEFAULT 0,
+                sheet_status      TEXT,               -- последний записанный в лист
+                ext_status        TEXT,               -- последний увиденный во внешнем источнике
+                ext_synced_status TEXT,               -- статус на момент сверки с GT
+                gtasks_list_id    TEXT,
+                gtasks_task_id    TEXT,
+                missing_since     REAL,               -- пропала из Google Tasks
+                created_at        REAL    DEFAULT (unixepoch()),
+                updated_at        REAL    DEFAULT (unixepoch()),
+                UNIQUE (telegram_id, source_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_my_tasks_user ON my_tasks(telegram_id);
+
+            -- Встречи MYmeet, синхронизированные пользователем (для «Speaker A»)
+            CREATE TABLE IF NOT EXISTS my_meetings (
+                telegram_id INTEGER NOT NULL,
+                mtg_id      TEXT    NOT NULL,
+                PRIMARY KEY (telegram_id, mtg_id)
+            );
+
+            -- Ежедневная синхронизация Google Tasks (19:00 по поясу пользователя)
+            CREATE TABLE IF NOT EXISTS my_tasks_sync (
+                telegram_id     INTEGER PRIMARY KEY,
+                last_daily_date TEXT
+            );
         """)
         conn.commit()
         # Миграция: добавляем MYmeet-поля если их ещё нет
@@ -595,6 +635,126 @@ def get_mymeet_pending(telegram_id: int) -> Optional[tuple]:
             telegram_id,
         )
         return None
+
+# ─── «Мои задачи» (my_tasks.py) ──────────────────────────────
+
+_MY_TASK_FIELDS = (
+    "source", "source_key", "title", "origin", "assignee", "task_date", "deadline",
+    "status", "verified", "sheet_status", "ext_status", "ext_synced_status",
+    "gtasks_list_id", "gtasks_task_id", "missing_since",
+)
+
+
+def my_tasks_load(telegram_id: int) -> list[dict]:
+    """Все записи «Мои задачи» пользователя (dict по полям _MY_TASK_FIELDS)."""
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(
+            f"SELECT {', '.join(_MY_TASK_FIELDS)} FROM my_tasks WHERE telegram_id = ? "
+            "ORDER BY id",
+            (telegram_id,),
+        ).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def my_tasks_upsert(telegram_id: int, records: list[dict]) -> None:
+    """Вставка/обновление записей по (telegram_id, source_key). Ничего не удаляет."""
+    if not records:
+        return
+    cols = list(_MY_TASK_FIELDS)
+    placeholders = ", ".join("?" for _ in cols)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "source_key")
+    sql = (
+        f"INSERT INTO my_tasks (telegram_id, {', '.join(cols)}) VALUES (?, {placeholders}) "
+        f"ON CONFLICT(telegram_id, source_key) DO UPDATE SET {updates}, "
+        "updated_at = unixepoch()"
+    )
+    params = []
+    for r in records:
+        vals = [r.get(c) for c in cols]
+        vals[cols.index("status")] = vals[cols.index("status")] or "В работе"
+        vals[cols.index("title")] = vals[cols.index("title")] or ""
+        params.append([telegram_id] + vals)
+    with _lock:
+        conn = _connect()
+        conn.executemany(sql, params)
+        conn.commit()
+        conn.close()
+
+
+def my_tasks_insert_new(telegram_id: int, record: dict) -> bool:
+    """Вставляет запись, если её ещё нет. True — создана, False — уже была (дубль)."""
+    cols = [c for c in _MY_TASK_FIELDS if c in record]
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            f"INSERT OR IGNORE INTO my_tasks (telegram_id, {', '.join(cols)}) "
+            f"VALUES (?, {', '.join('?' for _ in cols)})",
+            [telegram_id] + [record[c] for c in cols],
+        )
+        conn.commit()
+        created = cur.rowcount > 0
+        conn.close()
+    return created
+
+
+def my_tasks_mark_written(telegram_id: int, statuses: dict) -> None:
+    """После успешной записи листа: sheet_status = записанный статус."""
+    if not statuses:
+        return
+    with _lock:
+        conn = _connect()
+        conn.executemany(
+            "UPDATE my_tasks SET sheet_status = ? WHERE telegram_id = ? AND source_key = ?",
+            [(st, telegram_id, key) for key, st in statuses.items()],
+        )
+        conn.commit()
+        conn.close()
+
+
+def my_meetings_add(telegram_id: int, mtg_ids) -> None:
+    with _lock:
+        conn = _connect()
+        conn.executemany(
+            "INSERT OR IGNORE INTO my_meetings (telegram_id, mtg_id) VALUES (?, ?)",
+            [(telegram_id, str(m)) for m in mtg_ids if m],
+        )
+        conn.commit()
+        conn.close()
+
+
+def my_meetings_get(telegram_id: int) -> list[str]:
+    with _lock:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT mtg_id FROM my_meetings WHERE telegram_id = ?", (telegram_id,)
+        ).fetchall()
+        conn.close()
+    return [r[0] for r in rows]
+
+
+def my_tasks_daily_get(telegram_id: int) -> Optional[str]:
+    with _lock:
+        conn = _connect()
+        row = conn.execute(
+            "SELECT last_daily_date FROM my_tasks_sync WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+        conn.close()
+    return row[0] if row else None
+
+
+def my_tasks_daily_set(telegram_id: int, day: str) -> None:
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO my_tasks_sync (telegram_id, last_daily_date) VALUES (?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET last_daily_date = excluded.last_daily_date",
+            (telegram_id, day),
+        )
+        conn.commit()
+        conn.close()
+
 
 # ─── Метрики событий ─────────────────────────────────────────
 

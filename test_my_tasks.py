@@ -34,6 +34,7 @@ _crypto._fernet = None
 PROTO_HDR = _ts._PROTO_HDR
 ME = "Иван Петров"
 MY_TITLE = f"Мои задачи — {ME}"
+PRE_PR_COMMIT = "5fb90f9"     # main до PR #25 (схема БД production)
 
 
 def _load_my_tasks():
@@ -367,8 +368,9 @@ def test_forward_during_mymeet_wizard_creates_task():
 # ══ 4. БД: схема, миграции, шифрование ═══════════════════════════════════
 
 def _main_db_module(tmp):
-    """db.py из origin/main (до PR) — для проверки обновления существующей БД."""
-    src = subprocess.run(["git", "show", "origin/main:db.py"], cwd=REPO_ROOT,
+    """db.py production-версии до PR (main @ 5fb90f9) — проверка обновления
+    существующей БД.  Коммит зафиксирован: после merge main уже содержит новый db.py."""
+    src = subprocess.run(["git", "show", f"{PRE_PR_COMMIT}:db.py"], cwd=REPO_ROOT,
                          capture_output=True, text=True)
     if src.returncode != 0:
         return None
@@ -384,7 +386,7 @@ def _main_db_module(tmp):
 def test_db_upgrade_existing_database_preserves_data():
     with tempfile.TemporaryDirectory() as tmp:
         old = _main_db_module(tmp)
-        assert old is not None or not IN_CI, "нет origin/main в CI"
+        assert old is not None or not IN_CI, f"нет коммита {PRE_PR_COMMIT} в CI (fetch-depth)"
         if old is None:
             return
         old.init_db()

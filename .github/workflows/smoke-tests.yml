@@ -23,6 +23,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --quiet gspread requests google-auth
+          # «Мои задачи»: реальные объекты Telegram и Fernet — тесты не пропускаются
+          pip install --quiet python-telegram-bot==21.6 cryptography==43.0.3
 
       - name: Run smoke tests
         run: python test_smoke.py

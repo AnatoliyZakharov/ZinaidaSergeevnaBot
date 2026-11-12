@@ -824,7 +824,7 @@ def _build_my_tasks_rows(sheets: dict, full_name: str, matcher=None) -> list:
     wins, otherwise the first one seen.
 
     matcher — optional callable(assignee, mtg_id) -> bool replacing the exact
-    ФИО comparison (my_tasks: abbreviations, initials, cases, «Speaker A»).
+    ФИО comparison (my_tasks: word order, cases, surname + initials).
     """
     target = _norm_person(full_name)
     if not target:
@@ -1070,6 +1070,19 @@ def _count_my_task_rows(rows) -> int:
     return sum(1 for r in rows[1:] if len(r) > 3 and str(r[3]).strip())
 
 
+def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -> bool:
+    """Повторно читает лист «Мои задачи» и проверяет, что статусы не менялись
+    после первого чтения.  Ошибка чтения → False (не рискуем)."""
+    try:
+        resp = _gs_call(spreadsheet.values_batch_get, [_quote_sheet_title(title) + "!A:H"])
+        vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+        fresh = (vranges[0] or {}).get("values") or [] if vranges else []
+    except Exception as e:
+        logger.warning("My tasks: re-read failed (%s): %s", title, type(e).__name__)
+        return False
+    return rows_builder.sheet_unchanged(before_rows, fresh)
+
+
 def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) -> tuple:
     """Post-sync step: status colours on protocol sheets and on every
     «Мои задачи — …» sheet; when full_name is set, the user's personal
@@ -1142,13 +1155,29 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                         proto, full_name, matcher=rows_builder.matcher())
                     rows = rows_builder.build(candidates, my_rows)
                     before = _count_my_task_rows(my_rows)
-                    if before >= MY_TASKS_SHRINK_MIN and len(rows) * 2 < before:
+                    if rows is None:
+                        pass                    # аномалия builder-а (см. его warnings)
+                    elif before >= MY_TASKS_SHRINK_MIN and len(rows) * 2 < before:
                         msg = (f"{my_title}: строк стало бы {len(rows)} вместо "
                                f"{before} — лист не перезаписан (защита от массового "
                                f"удаления)")
                         rows = None
+                        rows_builder.blocked("shrink")
                         logger.warning("My tasks: %s", msg)
                         warnings.append(msg)
+                    elif exists and not _my_tasks_sheet_stable(
+                            spreadsheet, my_title, my_rows, rows_builder):
+                        # Пользователь менял статусы, пока шла сверка — не
+                        # перезаписываем его правку; повторим сверку позже.
+                        msg = (f"{my_title}: статусы изменились во время синхронизации — "
+                               f"запись отложена, повторю")
+                        rows = None
+                        rows_builder.blocked("conflict")
+                        logger.warning("My tasks: %s", msg)
+                        warnings.append(msg)
+                    else:
+                        # Внешние операции (Google Tasks) — только после проверки
+                        rows_builder.execute_external()
                 if rows is not None:
                     ws = _write_my_tasks_sheet(
                         spreadsheet, my_title, exists, rows, warnings,
@@ -1255,10 +1284,6 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     total_tasks = sum(len(m["tasks"]) for m in all_meetings)
     logger.info("Total tasks: %d", total_tasks)
-    _builder = cfg.get("my_tasks_builder")
-    if _builder is not None:
-        # Встречи пользователя — для распознавания «Speaker A» в «Мои задачи»
-        _builder.add_own_meetings([m["id"] for m in all_meetings if m["id"]])
 
     name_counts   = Counter(m["name"] for m in all_meetings)
     recurring_set = {n for n, c in name_counts.items() if c > 1}

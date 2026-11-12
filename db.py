@@ -78,12 +78,13 @@ def init_db() -> None:
 
             -- «Мои задачи»: задачи из Google Tasks / Telegram и учёт статусов
             -- протокольных задач (см. my_tasks.py). Строки никогда не удаляются
-            -- ботом; UNIQUE защищает от дублей.
+            -- ботом; UNIQUE защищает от дублей. Текстовые поля (title, origin,
+            -- assignee, link) хранятся зашифрованными (enc:v1:<Fernet>).
             CREATE TABLE IF NOT EXISTS my_tasks (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id       INTEGER NOT NULL,
                 source            TEXT    NOT NULL,   -- protocol | gtasks | telegram
-                source_key        TEXT    NOT NULL,   -- p:… | gtasks:{id} | tg:{hash}
+                source_key        TEXT    NOT NULL,   -- p:… | gtasks:{list}:{id} | tg:{hash}
                 title             TEXT    NOT NULL DEFAULT '',
                 origin            TEXT    DEFAULT '', -- совещание / список GT / постановщик
                 assignee          TEXT    DEFAULT '',
@@ -96,21 +97,14 @@ def init_db() -> None:
                 ext_synced_status TEXT,               -- статус на момент сверки с GT
                 gtasks_list_id    TEXT,
                 gtasks_task_id    TEXT,
-                missing_since     REAL,               -- пропала из Google Tasks
+                missing_since     REAL,               -- пропала / удалена в Google Tasks
                 created_at        REAL    DEFAULT (unixepoch()),
                 updated_at        REAL    DEFAULT (unixepoch()),
                 UNIQUE (telegram_id, source_key)
             );
             CREATE INDEX IF NOT EXISTS idx_my_tasks_user ON my_tasks(telegram_id);
 
-            -- Встречи MYmeet, синхронизированные пользователем (для «Speaker A»)
-            CREATE TABLE IF NOT EXISTS my_meetings (
-                telegram_id INTEGER NOT NULL,
-                mtg_id      TEXT    NOT NULL,
-                PRIMARY KEY (telegram_id, mtg_id)
-            );
-
-            -- Ежедневная синхронизация Google Tasks (19:00 по поясу пользователя)
+            -- Ежедневная сверка Google Tasks (19:00 по поясу пользователя)
             CREATE TABLE IF NOT EXISTS my_tasks_sync (
                 telegram_id     INTEGER PRIMARY KEY,
                 last_daily_date TEXT
@@ -119,7 +113,34 @@ def init_db() -> None:
         conn.commit()
         # Миграция: добавляем MYmeet-поля если их ещё нет
         _migrate_mymeet(conn)
+        _migrate_add_columns(conn, "my_tasks", _MY_TASKS_NEW_COLS)
+        _migrate_add_columns(conn, "my_tasks_sync", _MY_TASKS_SYNC_NEW_COLS)
         conn.close()
+
+
+# Колонки, добавленные после первой версии таблиц «Мои задачи» (идемпотентно)
+_MY_TASKS_NEW_COLS = [
+    ("link",              "TEXT"),               # ссылка на письмо (Tasks API links)
+    ("gt_delete_pending", "INTEGER DEFAULT 0"),  # ручная отмена → удалить в GT
+    ("prev_status",       "TEXT"),               # статус до удаления в GT
+]
+_MY_TASKS_SYNC_NEW_COLS = [
+    ("last_success_slot", "TEXT"),     # дата слота 19:00, выполненного полностью
+    ("fail_count",        "INTEGER DEFAULT 0"),
+    ("next_attempt_ts",   "REAL"),
+    ("last_attempt_ts",   "REAL"),
+    ("last_outcome",      "TEXT"),
+    ("notified_slot",     "TEXT"),
+]
+
+
+def _migrate_add_columns(conn: sqlite3.Connection, table: str, cols: list) -> None:
+    """ALTER TABLE ADD COLUMN для отсутствующих колонок. Ничего не удаляет."""
+    existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for col, ddl in cols:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    conn.commit()
 
 
 def _migrate_mymeet(conn: sqlite3.Connection) -> None:
@@ -642,7 +663,36 @@ _MY_TASK_FIELDS = (
     "source", "source_key", "title", "origin", "assignee", "task_date", "deadline",
     "status", "verified", "sheet_status", "ext_status", "ext_synced_status",
     "gtasks_list_id", "gtasks_task_id", "missing_since",
+    "link", "gt_delete_pending", "prev_status",
 )
+# Пользовательский текст — шифруется (Fernet, тот же ENCRYPTION_KEY, что у
+# MYmeet-токенов).  Префикс отличает шифротекст от старого открытого текста.
+_MY_TASK_ENCRYPTED = ("title", "origin", "assignee", "link")
+_ENC_PREFIX = "enc:v1:"
+
+
+def _enc(value):
+    if value is None or value == "":
+        return value
+    return _ENC_PREFIX + _crypto.encrypt_token(str(value))
+
+
+def _dec_record(row) -> dict:
+    """Строка БД → dict с расшифрованными полями.
+    Ошибка расшифровки: поле = None, _decrypt_error = True (данные в БД не
+    трогаются; вызывающий не должен перезаписывать лист/запись)."""
+    r = dict(row)
+    for f in _MY_TASK_ENCRYPTED:
+        v = r.get(f)
+        if isinstance(v, str) and v.startswith(_ENC_PREFIX):
+            try:
+                r[f] = _crypto.decrypt_token(v[len(_ENC_PREFIX):])
+            except Exception:
+                r[f] = None
+                r["_decrypt_error"] = True
+        elif v:
+            r["_plaintext"] = True      # старая незашифрованная запись
+    return r
 
 
 def my_tasks_load(telegram_id: int) -> list[dict]:
@@ -655,11 +705,41 @@ def my_tasks_load(telegram_id: int) -> list[dict]:
             (telegram_id,),
         ).fetchall()
         conn.close()
-    return [dict(r) for r in rows]
+    return [_dec_record(r) for r in rows]
+
+
+def my_tasks_get(telegram_id: int, source_key: str) -> Optional[dict]:
+    with _lock:
+        conn = _connect()
+        row = conn.execute(
+            f"SELECT {', '.join(_MY_TASK_FIELDS)} FROM my_tasks "
+            "WHERE telegram_id = ? AND source_key = ?",
+            (telegram_id, source_key),
+        ).fetchone()
+        conn.close()
+    return _dec_record(row) if row else None
+
+
+def _record_params(telegram_id: int, r: dict, cols: list) -> list:
+    vals = []
+    for c in cols:
+        v = r.get(c)
+        if c == "status":
+            v = v or "В работе"
+        elif c == "title":
+            v = v or ""
+        elif c == "gt_delete_pending":
+            v = int(v or 0)
+        if c in _MY_TASK_ENCRYPTED:
+            v = _enc(v)
+        vals.append(v)
+    return [telegram_id] + vals
 
 
 def my_tasks_upsert(telegram_id: int, records: list[dict]) -> None:
-    """Вставка/обновление записей по (telegram_id, source_key). Ничего не удаляет."""
+    """Вставка/обновление записей по (telegram_id, source_key). Ничего не удаляет.
+    Записи с ошибкой расшифровки не сохраняются (защита от затирания)."""
+    records = [r for r in records if not r.get("_decrypt_error")]
     if not records:
         return
     cols = list(_MY_TASK_FIELDS)
@@ -670,12 +750,7 @@ def my_tasks_upsert(telegram_id: int, records: list[dict]) -> None:
         f"ON CONFLICT(telegram_id, source_key) DO UPDATE SET {updates}, "
         "updated_at = unixepoch()"
     )
-    params = []
-    for r in records:
-        vals = [r.get(c) for c in cols]
-        vals[cols.index("status")] = vals[cols.index("status")] or "В работе"
-        vals[cols.index("title")] = vals[cols.index("title")] or ""
-        params.append([telegram_id] + vals)
+    params = [_record_params(telegram_id, r, cols) for r in records]
     with _lock:
         conn = _connect()
         conn.executemany(sql, params)
@@ -691,12 +766,28 @@ def my_tasks_insert_new(telegram_id: int, record: dict) -> bool:
         cur = conn.execute(
             f"INSERT OR IGNORE INTO my_tasks (telegram_id, {', '.join(cols)}) "
             f"VALUES (?, {', '.join('?' for _ in cols)})",
-            [telegram_id] + [record[c] for c in cols],
+            _record_params(telegram_id, record, cols),
         )
         conn.commit()
         created = cur.rowcount > 0
         conn.close()
     return created
+
+
+def my_tasks_rekey(telegram_id: int, old_key: str, new_key: str) -> bool:
+    """Переименовывает ключ записи (миграция ключа Google Tasks, перенос задачи
+    между списками). Не выполняется, если новый ключ уже занят (без дублей)."""
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            "UPDATE my_tasks SET source_key = ? WHERE telegram_id = ? AND source_key = ? "
+            "AND NOT EXISTS (SELECT 1 FROM my_tasks WHERE telegram_id = ? AND source_key = ?)",
+            (new_key, telegram_id, old_key, telegram_id, new_key),
+        )
+        conn.commit()
+        ok = cur.rowcount > 0
+        conn.close()
+    return ok
 
 
 def my_tasks_mark_written(telegram_id: int, statuses: dict) -> None:
@@ -713,44 +804,35 @@ def my_tasks_mark_written(telegram_id: int, statuses: dict) -> None:
         conn.close()
 
 
-def my_meetings_add(telegram_id: int, mtg_ids) -> None:
-    with _lock:
-        conn = _connect()
-        conn.executemany(
-            "INSERT OR IGNORE INTO my_meetings (telegram_id, mtg_id) VALUES (?, ?)",
-            [(telegram_id, str(m)) for m in mtg_ids if m],
-        )
-        conn.commit()
-        conn.close()
+_SYNC_FIELDS = ("last_success_slot", "fail_count", "next_attempt_ts", "last_attempt_ts",
+                "last_outcome", "notified_slot")
 
 
-def my_meetings_get(telegram_id: int) -> list[str]:
-    with _lock:
-        conn = _connect()
-        rows = conn.execute(
-            "SELECT mtg_id FROM my_meetings WHERE telegram_id = ?", (telegram_id,)
-        ).fetchall()
-        conn.close()
-    return [r[0] for r in rows]
-
-
-def my_tasks_daily_get(telegram_id: int) -> Optional[str]:
+def my_tasks_sync_get(telegram_id: int) -> Optional[dict]:
     with _lock:
         conn = _connect()
         row = conn.execute(
-            "SELECT last_daily_date FROM my_tasks_sync WHERE telegram_id = ?", (telegram_id,)
+            f"SELECT {', '.join(_SYNC_FIELDS)} FROM my_tasks_sync WHERE telegram_id = ?",
+            (telegram_id,),
         ).fetchone()
         conn.close()
-    return row[0] if row else None
+    return dict(row) if row else None
 
 
-def my_tasks_daily_set(telegram_id: int, day: str) -> None:
+def my_tasks_sync_save(telegram_id: int, **fields) -> None:
+    """Обновляет состояние ежедневной сверки (только переданные поля)."""
+    fields = {k: v for k, v in fields.items() if k in _SYNC_FIELDS}
+    if not fields:
+        return
+    cols = list(fields)
     with _lock:
         conn = _connect()
         conn.execute(
-            "INSERT INTO my_tasks_sync (telegram_id, last_daily_date) VALUES (?, ?) "
-            "ON CONFLICT(telegram_id) DO UPDATE SET last_daily_date = excluded.last_daily_date",
-            (telegram_id, day),
+            f"INSERT INTO my_tasks_sync (telegram_id, {', '.join(cols)}) "
+            f"VALUES (?, {', '.join('?' for _ in cols)}) "
+            f"ON CONFLICT(telegram_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in cols),
+            [telegram_id] + [fields[c] for c in cols],
         )
         conn.commit()
         conn.close()

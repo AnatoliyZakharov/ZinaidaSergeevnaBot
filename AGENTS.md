@@ -66,6 +66,7 @@ QA → Security → DevOps → решение Product Owner (по правила
 - CI job «Docker packaging» блокирует выпуск, если локальный модуль, нужный приложению, не копируется в образ; тот же контроль в preflight `deploy.yml` блокирует деплой.
 - Deploy Monitor (job в `deploy.yml`) 10 минут наблюдает новую версию от её старта и выдаёт `HEALTHY` / `DEGRADED` / `FAILED` / `ROLLED_BACK` / `UNKNOWN`. Без достоверных данных — `UNKNOWN`, а не успех.
 - Автооткат при `FAILED` — только если предыдущая версия однозначна, между версиями не менялись `db.py`/`crypto.py`/`fly.toml`, Fly всё ещё на новой версии и нет более нового релиза; одна попытка за run. Иначе — `FAILED` и срочное уведомление PO. Kill-switch: repository variable `AUTO_ROLLBACK_DISABLED=true`.
+- Ручной `workflow_dispatch` (mode=monitor-only) — только наблюдение, без deploy и отката; отдельная concurrency-группа `production-monitor-only`, push-деплои не вытесняет.
 - Отчёт: job summary, артефакт `deploy-monitor-report`, issue «Deploy incident: …» при не-HEALTHY. Текст логов и сырой JSON flyctl не публикуются (репозиторий публичный).
 
 ### Права на merge

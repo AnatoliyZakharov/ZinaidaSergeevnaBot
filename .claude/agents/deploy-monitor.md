@@ -40,6 +40,8 @@ gh run list --workflow=deploy.yml --commit "$SHA" --json databaseId,status,concl
 
 Если run не найден в течение 5 минут после merge — статус `UNKNOWN` («deploy-run не запущен»).
 
+Ручная проверка текущего production без деплоя: `gh workflow run deploy.yml -f mode=monitor-only`. Такой run идёт в отдельной concurrency-группе `production-monitor-only`: он не вытесняет ожидающий push-деплой (группа `production-deploy`) и никогда не выполняет откат. Если он совпал по времени с деплоем, то увидит смену образа и вернёт `UNKNOWN`.
+
 ### 2. Дождаться завершения (не более 40 минут)
 
 ```bash

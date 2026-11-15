@@ -9,7 +9,7 @@ name: Deploy to Fly.io
 #               HEALTHY / DEGRADED / FAILED / ROLLED_BACK / UNKNOWN, при FAILED —
 #               автооткат на предыдущий образ, только если все условия безопасны.
 # Ручной запуск (workflow_dispatch, mode=monitor-only) — проверить текущий production
-# без деплоя и без отката.
+# без деплоя и без отката; отдельная concurrency-группа production-monitor-only.
 # Аварийное отключение автоотката: repository variable AUTO_ROLLBACK_DISABLED=true.
 
 on:
@@ -25,8 +25,11 @@ on:
           - monitor-only
         default: monitor-only
 
+# push-деплои выстраиваются в очередь в production-deploy. Ручной monitor-only
+# вынесен в отдельную группу: он не может вытеснить ожидающий push-деплой
+# (в одной группе ожидающий run заменяется новым) и никогда не откатывает.
 concurrency:
-  group: production-deploy
+  group: ${{ github.event_name == 'push' && 'production-deploy' || 'production-monitor-only' }}
   cancel-in-progress: false
 
 permissions:

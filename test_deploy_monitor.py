@@ -90,8 +90,9 @@ RELEASES = [
 
 class FakeFly:
     def __init__(self, clock, status_fn=new_ok, logs=(), exec_result=(True, ""),
-                 releases=RELEASES, rollback_ok=True, after_rollback=restored_ok):
+                 releases=RELEASES, rollback_ok=True, after_rollback=restored_ok, logs_fail=None):
         self.clock, self.status_fn, self.log_entries = clock, status_fn, list(logs)
+        self.logs_fail = logs_fail
         self.exec_result, self._releases = exec_result, releases
         self.rollback_ok, self.after_rollback = rollback_ok, after_rollback
         self.rolled_at = None
@@ -113,6 +114,8 @@ class FakeFly:
 
     def logs(self):
         now = self.clock.now()
+        if self.logs_fail and self.logs_fail(now):
+            raise dm.FlyUnavailable("logs")
         visible = [e for e in self.log_entries if dm.parse_ts(e["timestamp"]) <= now]
         return visible[-100:]
 
@@ -623,6 +626,104 @@ def test_dm_notifier_incident_dedup():
     assert dm.find_pr_number("feat: x (#21) (#22)") == 22 and dm.find_pr_number("fix: y") is None
 
 
+# ─── Замечания QA (MINOR) ────────────────────────────────────────────────────
+
+def test_dm_no_health_checks_not_healthy():
+    """Нет health checks во всём окне → UNKNOWN; пропали на отдельных опросах → DEGRADED."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: new_ok(now, checks=None))
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] == dm.UNKNOWN, rep["reasons"]
+    assert mon.obs.no_checks_ticks > 0 and mon.obs.checks_coverage == 0
+    assert not fly.deploy_calls
+    clock2 = FakeClock()
+    fly2 = FakeFly(clock2, status_fn=lambda now: new_ok(
+        now, checks=None if T_START + 100 <= now < T_START + 130 else "passing"))
+    rep2, mon2, _ = run(ctx(), fly2)
+    assert mon2.obs.no_checks_ticks == 1 and mon2.obs.checks_coverage >= 0.9
+    assert rep2["status"] == dm.DEGRADED, rep2["reasons"]
+
+
+def test_dm_log_buffer_overflow_before_first_poll():
+    """FATAL сразу после T0 и 400 строк после → буфер вытеснил начало окна → не HEALTHY."""
+    clock = FakeClock()
+    logs = [log_entry(T0 + 1, "ModuleNotFoundError: No module named 'x'")]
+    logs += [log_entry(T0 + 2 + i * 0.04, "[INFO] httpx: HTTP Request ok") for i in range(400)]
+    fly = FakeFly(clock, logs=logs)
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] != dm.HEALTHY, rep["reasons"]
+    assert rep["status"] == dm.UNKNOWN and mon.obs.logs_start_missing, rep["reasons"]
+    assert "ModuleNotFoundError" not in rep["observation"]["fatal_categories"]  # действительно вытеснен
+    assert not fly.deploy_calls
+
+
+def test_dm_single_failing_check_degraded():
+    """Один failing check за окно → DEGRADED, не HEALTHY."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: new_ok(
+        now, checks="critical" if T_START + 200 <= now < T_START + 230 else "passing"))
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.obs.failing_check_ticks == 1 and mon.obs.max_consecutive_failing == 1
+    assert rep["status"] == dm.DEGRADED, rep["reasons"]
+    assert not fly.deploy_calls
+
+
+def test_dm_superseded_unknown_no_rollback():
+    """Во время наблюдения машины перешли на другой образ → UNKNOWN, без отката."""
+    clock = FakeClock()
+
+    def st(now):
+        if now < T_START + 150:
+            return new_ok(now)
+        return status(100, machine(NEWER_SHA, NEWER_DIG, NEWER_IMG, 100, starts=[T0]))
+    fly = FakeFly(clock, status_fn=st)
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.obs.superseded and rep["status"] == dm.UNKNOWN, rep["reasons"]
+    assert not fly.deploy_calls and not rep["rollback"]["considered"]
+
+
+def test_dm_logs_coverage_low_unknown():
+    """Покрытие логов < 90% при полном покрытии статусов → UNKNOWN."""
+    clock = FakeClock()
+    fly = FakeFly(clock, logs_fail=lambda now: int((now - T_START) / 30) % 4 == 1)
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.obs.coverage >= 0.9 and mon.obs.logs_coverage < 0.9, (mon.obs.coverage, mon.obs.logs_coverage)
+    assert rep["status"] == dm.UNKNOWN, rep["reasons"]
+
+
+def test_dm_status_coverage_low_unknown():
+    """Покрытие статусов < 90% (сбои не подряд) при полном покрытии логов → UNKNOWN."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: dm.FlyUnavailable("x")
+                  if int((now - T_START) / 30) % 4 == 1 else new_ok(now))
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.obs.coverage < 0.9 and mon.obs.logs_coverage >= 0.9, (mon.obs.coverage, mon.obs.logs_coverage)
+    assert not mon.obs.fly_unavailable
+    assert rep["status"] == dm.UNKNOWN, rep["reasons"]
+
+
+def test_dm_unknown_new_release_rollback_forbidden():
+    """Номер релиза новой версии неизвестен → откат запрещён, deploy_image не вызывается."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: status(
+        100, machine(NEW_SHA, NEW_DIG, NEW_IMG, "", starts=[T0])),
+        logs=[log_entry(T0 + 30, "ModuleNotFoundError: x")])
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.ctx.new_release is None
+    assert rep["status"] == dm.FAILED and not fly.deploy_calls, rep["rollback"]
+    assert any("номер релиза" in r for r in rep["rollback"]["reasons"]), rep["rollback"]
+
+
+def test_dm_last_tick_not_started_failed():
+    """На последнем опросе машина не started (без рестартов и failing checks) → FAILED."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: new_ok(
+        now, state="stopped" if now >= T_START + 560 else "started"))
+    rep, mon, _ = run(ctx(rollback_enabled=False), fly)
+    assert mon.obs.last_tick_all_started is False and mon.obs.restarts == 0
+    assert rep["status"] == dm.FAILED, rep["reasons"]
+
+
 TESTS = [
     (test_dm_healthy_10_minutes, "Monitor: стабильно 10 мин → HEALTHY"),
     (test_dm_machine_never_starts_failed, "Monitor: машина не стартует → FAILED"),
@@ -643,6 +744,14 @@ TESTS = [
     (test_dm_t0_from_new_version_start_and_snapshot, "Monitor: T0 от старта новой версии"),
     (test_dm_capture_prev, "Monitor: capture-prev"),
     (test_dm_notifier_incident_dedup, "Monitor: issue инцидента без дублей"),
+    (test_dm_no_health_checks_not_healthy, "Monitor: нет health checks → UNKNOWN/DEGRADED"),
+    (test_dm_log_buffer_overflow_before_first_poll, "Monitor: буфер логов вытеснил начало окна"),
+    (test_dm_single_failing_check_degraded, "Monitor: один failing check → DEGRADED"),
+    (test_dm_superseded_unknown_no_rollback, "Monitor: смена образа → UNKNOWN без отката"),
+    (test_dm_logs_coverage_low_unknown, "Monitor: покрытие логов < 90% → UNKNOWN"),
+    (test_dm_status_coverage_low_unknown, "Monitor: покрытие статусов < 90% → UNKNOWN"),
+    (test_dm_unknown_new_release_rollback_forbidden, "Monitor: release неизвестен → откат запрещён"),
+    (test_dm_last_tick_not_started_failed, "Monitor: последний опрос не started → FAILED"),
 ]
 
 if __name__ == "__main__":

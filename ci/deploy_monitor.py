@@ -47,6 +47,9 @@ STATUSES = (HEALTHY, DEGRADED, FAILED, ROLLED_BACK, UNKNOWN)
 ROLLBACK_PROTECTED_FILES = ("db.py", "crypto.py", "fly.toml")
 
 DEFAULT_APP = "calendar-bot-anatolii"
+# `flyctl logs --no-tail` отдаёт хвост буфера (~100 записей). Полный буфер, начинающийся
+# позже T0, означает, что записи между T0 и первым опросом могли быть вытеснены.
+LOG_BUFFER_FULL = 100
 MODULE_CHECK_OK = "DEPLOY_MONITOR_IMPORT_OK"
 
 
@@ -477,6 +480,9 @@ class Observation:
     fly_unavailable: bool = False
     logs_ok_ticks: int = 0
     log_gaps: int = 0
+    logs_start_missing: bool = False              # записи от T0 до первого опроса вытеснены
+    checks_present_ticks: int = 0                 # опросы, где у всех машин есть health checks
+    no_checks_ticks: int = 0
     restarts: int = 0
     exits: int = 0
     failing_check_ticks: int = 0
@@ -497,6 +503,10 @@ class Observation:
     @property
     def logs_coverage(self) -> float:
         return self.logs_ok_ticks / self.expected_ticks if self.expected_ticks else 0.0
+
+    @property
+    def checks_coverage(self) -> float:
+        return self.checks_present_ticks / self.status_ok_ticks if self.status_ok_ticks else 0.0
 
 
 class Monitor:
@@ -584,6 +594,13 @@ class Monitor:
         if self._last_log_ts is not None and tss and min(tss) > self._last_log_ts:
             self.obs.log_gaps += 1  # буфер переполнился между опросами — возможен пропуск
             complete = False
+        elif (self._last_log_ts is None and tss and min(tss) > self.ctx.t0
+              and len(entries) >= LOG_BUFFER_FULL):
+            # первый успешный опрос: буфер полон и начинается позже T0 — начало окна потеряно
+            self.obs.log_gaps += 1
+            self.obs.logs_start_missing = True
+            complete = False
+            self.event("логи от T0 до первого опроса вытеснены из буфера — данных нет")
         for e in entries:
             ts = parse_ts(e.get("timestamp"))
             inst = str(e.get("instance", ""))
@@ -632,6 +649,7 @@ class Monitor:
     def observe(self) -> None:
         ctx, cfg, obs = self.ctx, self.cfg, self.obs
         start = self.clock.now()
+        last_ids: set = set()
         end = max(ctx.t0 + cfg.observe, start + cfg.min_live_ticks * cfg.poll)
         if ctx.mode == "monitor-only":
             end = start + cfg.observe
@@ -645,6 +663,9 @@ class Monitor:
                     obs.early_stop = "fly_unavailable"
                     self.event(f"Fly недоступен {self._consec_fly_err} опроса подряд")
                     break
+                if last_ids:
+                    # статус не получен, но логи читаем по последним известным машинам
+                    self._process_logs(last_ids)
             else:
                 obs.status_ok_ticks += 1
                 apps = snap.app_machines
@@ -663,6 +684,10 @@ class Monitor:
                             self._exit_events.add((m.id, t))
                 obs.restarts = max(len(self._restart_events), len(self._exit_events))
                 obs.exits = len(self._exit_events)
+                if all(m.checks for m in apps):
+                    obs.checks_present_ticks += 1
+                else:
+                    obs.no_checks_ticks += 1  # нет данных health check — не «passing»
                 failing = any(m.checks_failing for m in apps)
                 if failing:
                     obs.failing_check_ticks += 1
@@ -671,7 +696,8 @@ class Monitor:
                 else:
                     self._consec_failing = 0
                 obs.last_tick_all_started = all(m.state == "started" for m in apps)
-                self._process_logs({m.id for m in apps})
+                last_ids = {m.id for m in apps}
+                self._process_logs(last_ids)
                 if self.clock.now() >= ctx.t0 + cfg.module_check_delay:
                     self._module_check(apps)
                 if obs.fatal:
@@ -730,6 +756,11 @@ class Monitor:
             unknown.append("Fly.io недоступен ≥3 опроса подряд")
         if o.coverage < cfg.min_coverage:
             unknown.append(f"покрытие статусов {o.coverage:.0%} < {cfg.min_coverage:.0%}")
+        if o.logs_start_missing:
+            unknown.append("логи от T0 до первого опроса недоступны (буфер переполнен)")
+        if o.checks_coverage < cfg.min_coverage:
+            unknown.append(f"health checks присутствуют на {o.checks_coverage:.0%} опросов "
+                           f"< {cfg.min_coverage:.0%} — нет данных о здоровье")
         if o.logs_coverage < cfg.min_coverage:
             unknown.append(f"покрытие логов {o.logs_coverage:.0%} < {cfg.min_coverage:.0%}")
         if o.module_check != "ok":
@@ -740,6 +771,8 @@ class Monitor:
         degraded = []
         if o.restarts == 1:
             degraded.append("1 рестарт после T0")
+        if o.no_checks_ticks:
+            degraded.append(f"health checks отсутствовали на {o.no_checks_ticks} опросах")
         if o.failing_check_ticks:
             degraded.append(f"health check failing на {o.failing_check_ticks} опросах")
         if o.errors:
@@ -846,7 +879,8 @@ class Monitor:
                         for (ty, st, t) in m.events:
                             if ty == "start" and st == "started" and t and t > start:
                                 restarts.add((m.id, t))
-                last_ok = started and not any(m.checks_failing for m in apps)
+                last_ok = (started and all(m.checks for m in apps)
+                           and not any(m.checks_failing for m in apps))
             except FlyUnavailable:
                 consec_err += 1
                 last_ok = False
@@ -923,6 +957,8 @@ class Monitor:
                 "reached_started": o.reached_started, "ticks": o.ticks,
                 "expected_ticks": o.expected_ticks, "status_coverage": round(o.coverage, 3),
                 "logs_coverage": round(o.logs_coverage, 3), "log_gaps": o.log_gaps,
+                "logs_start_missing": o.logs_start_missing,
+                "checks_coverage": round(o.checks_coverage, 3), "no_checks_ticks": o.no_checks_ticks,
                 "fly_errors_total": o.fly_errors_total,
                 "fly_errors_max_consecutive": o.fly_errors_max_consecutive,
                 "restarts_after_t0": o.restarts, "exits_after_t0": o.exits,
@@ -975,7 +1011,8 @@ def render_markdown(r: dict) -> str:
         "",
         "### Наблюдение",
         f"- Опросов: {o['ticks']}/{o['expected_ticks']}, покрытие статусов {o['status_coverage']:.0%}, "
-        f"логов {o['logs_coverage']:.0%}, ошибок Fly {o['fly_errors_total']}",
+        f"логов {o['logs_coverage']:.0%}, health checks {o['checks_coverage']:.0%}, "
+        f"ошибок Fly {o['fly_errors_total']}",
         f"- Рестартов после T0: {o['restarts_after_t0']}; failing checks: {o['failing_check_ticks']} опросов "
         f"(подряд максимум {o['max_consecutive_failing_checks']})",
         f"- FATAL: {o['fatal_categories'] or 'нет'}; ERROR: {o['error_categories'] or 'нет'}; "

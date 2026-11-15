@@ -42,16 +42,18 @@ gh run list --workflow=deploy.yml --commit "$SHA" --json databaseId,status,concl
 
 Ручная проверка текущего production без деплоя: `gh workflow run deploy.yml -f mode=monitor-only`. Такой run идёт в отдельной concurrency-группе `production-monitor-only`: он не вытесняет ожидающий push-деплой (группа `production-deploy`) и никогда не выполняет откат. Если он совпал по времени с деплоем, то увидит смену образа и вернёт `UNKNOWN`.
 
-### 2. Дождаться завершения (не более 40 минут)
+### 2. Дождаться завершения (не более 60 минут)
 
 ```bash
-timeout 2400 gh run watch <run-id> --exit-status --interval 30 || true
+# job «Deploy Monitor» ограничен timeout-minutes: 45, поэтому watch завершится сам
+# (`timeout` в macOS по умолчанию нет — не используй его)
+gh run watch <run-id> --exit-status --interval 30 || true
 gh run view <run-id> --json status,conclusion,jobs --jq '.jobs[] | {name, conclusion}'
 ```
 
-Job `Deploy Monitor` наблюдает 10 минут **от старта новой версии** (T0), при необходимости выполняет откат и проверяет восстановленную версию — полный run занимает до ~30 минут.
+Job `Deploy Monitor` наблюдает 10 минут **от старта новой версии** (T0), при необходимости выполняет откат и проверяет восстановленную версию — по худшему сценарию (ожидание версии 6 мин + наблюдение 10 мин + deploy отката до 8 мин + проверка восстановления 4 мин + задержки API) job длится около 32 минут, лимит job — 45 минут; весь run вместе с preflight и deploy — до ~60 минут.
 
-Если run не завершился за 40 минут — статус `UNKNOWN`, в отчёте указать ссылку на run для повторной сверки.
+Если run не завершился за 60 минут — статус `UNKNOWN`, в отчёте указать ссылку на run для повторной сверки.
 
 ### 3. Скачать артефакт отчёта
 
@@ -95,7 +97,7 @@ for r in json.load(sys.stdin)[:3]: print(r['Version'], r['Status'], r['CreatedAt
 | `DEGRADED` | артефакт `DEGRADED` (1 рестарт, отдельные падения health check, `[ERROR]` в логах без FATAL) |
 | `FAILED` | артефакт `FAILED`: новая версия сломана, автооткат запрещён условиями или не удался — **срочно** уведомить Product Owner |
 | `ROLLED_BACK` | артефакт `ROLLED_BACK` и Fly подтверждает предыдущую версию — релиз не выпущен, нужен fix |
-| `UNKNOWN` | нет run/артефакта, таймаут, противоречия, недоступность Fly/ssh, нехватка данных |
+| `UNKNOWN` | нет run/артефакта, таймаут, противоречия, недоступность Fly/ssh, нехватка данных, проверка импорта без однозначного результата (`module_check: inconclusive`, например `KeyError` — FAILED только при `ModuleNotFoundError`/`ImportError`/`SyntaxError`) |
 
 Если достоверных данных нет — **запрещено** объявлять релиз успешным.
 

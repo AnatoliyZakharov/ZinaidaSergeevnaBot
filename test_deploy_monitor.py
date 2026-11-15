@@ -724,6 +724,121 @@ def test_dm_last_tick_not_started_failed():
     assert rep["status"] == dm.FAILED, rep["reasons"]
 
 
+# ─── Цикл исправлений 1 (QA FAIL на 582735a) ─────────────────────────────────
+
+def test_dm_monitor_only_long_running_full_buffer_healthy():
+    """monitor-only: машина работает 3 дня, буфер логов всегда полный (1 строка/7 с) → HEALTHY.
+    Окно логов — от запуска наблюдения; ошибки до него не учитываются."""
+    clock = FakeClock()
+    started = T_START - 3 * 86400
+    logs = [log_entry(T_START - 3600 + i * 7, "[INFO] httpx: HTTP Request ok") for i in range(700)]
+    logs.append(log_entry(T_START - 100, "[ERROR] main: before monitor start"))
+    logs.sort(key=lambda e: e["timestamp"])
+    fly = FakeFly(clock, status_fn=lambda now: status(
+        100, machine(NEW_SHA, NEW_DIG, NEW_IMG, 100, starts=[started])), logs=logs)
+    assert len(fly.logs()) == 100 and dm.parse_ts(fly.logs()[0]["timestamp"]) > started
+    rep, mon, _ = run(ctx(mode="monitor-only", expected_sha=""), fly)
+    assert not mon.obs.logs_start_missing, rep["reasons"]
+    assert rep["status"] == dm.HEALTHY, rep["reasons"]
+    assert not fly.deploy_calls
+
+
+def test_dm_module_check_keyerror_inconclusive_not_failed():
+    """Проверка модулей: KeyError (нет env в ssh) → UNKNOWN без отката; ModuleNotFoundError → FAILED."""
+    clock = FakeClock()
+    fly = FakeFly(clock, exec_result=(False, "KeyError"))
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["observation"]["module_check"] == "inconclusive", rep["observation"]
+    assert rep["status"] == dm.UNKNOWN and not fly.deploy_calls, rep
+    assert not rep["rollback"]["considered"]
+    for exc in ("ModuleNotFoundError", "ImportError", "SyntaxError"):
+        clock2 = FakeClock()
+        fly2 = FakeFly(clock2, exec_result=(False, exc))
+        rep2, mon2, _ = run(ctx(rollback_enabled=False), fly2)
+        assert rep2["status"] == dm.FAILED and mon2.obs.early_stop == "module_check", (exc, rep2)
+    assert dm.classify_module_check("builtins.KeyError") == "inconclusive"
+    assert dm.classify_module_check("") == "inconclusive"
+    # реальный FlyCtl: Traceback с KeyError → (False, "KeyError") → inconclusive
+    tb = "Traceback (most recent call last):\n  File x\nKeyError: 'TELEGRAM_TOKEN'\n"
+    f = dm.FlyCtl(APP, runner=lambda a, **k: subprocess.CompletedProcess(a, 1, "", tb))
+    ok, exc = f.exec_check(MID, ["main"])
+    assert ok is False and exc == "KeyError" and dm.classify_module_check(exc) == "inconclusive"
+
+
+def test_dm_module_check_command_placeholders_setdefault_only():
+    """Команда проверки: фиктивные env только через setdefault, без перезаписи; только import."""
+    cmd = dm.build_module_check_command(["db", "main"])
+    code = cmd.split("'")[1]
+    for k, _ in dm.MODULE_CHECK_ENV_PLACEHOLDERS:
+        assert f'os.environ.setdefault("{k}"' in code, k
+    for name in ("TELEGRAM_TOKEN", "YANDEX_API_KEY", "YANDEX_FOLDER_ID", "GOOGLE_CLIENT_ID",
+                 "GOOGLE_CLIENT_SECRET", "OAUTH_REDIRECT_URI"):
+        assert name in dict(dm.MODULE_CHECK_ENV_PLACEHOLDERS), name
+    assert "os.environ[" not in code and "putenv" not in code and ".update(" not in code
+    assert "/data" not in code and "run_bot" not in code and "__main__" not in code
+    dm.validate_flyctl_args(["ssh", "console", "--app", APP, "--machine", MID, "-C", cmd], APP)
+    # реальные значения не перезаписываются: выполняем код локально с безопасным модулем
+    import os as _os
+    env = {"PATH": _os.environ.get("PATH", ""), "TELEGRAM_TOKEN": "real"}
+    probe = code.replace("[importlib.import_module",
+                         'print(os.environ["TELEGRAM_TOKEN"], os.environ["DB_PATH"]);[importlib.import_module')
+    out = subprocess.run([sys.executable, "-c", probe, "json"], capture_output=True, text=True,
+                         env=env, timeout=30).stdout
+    assert out.splitlines()[0] == "real /tmp/deploy-monitor-import-check.db", out
+    assert dm.MODULE_CHECK_OK in out
+
+
+def test_dm_verify_restored_requires_checks():
+    """После отката у восстановленной машины нет health checks → не подтверждено → FAILED."""
+    clock = FakeClock()
+    fly = FakeFly(clock, logs=[log_entry(T0 + 30, "ModuleNotFoundError: x")],
+                  after_rollback=lambda now, ra: status(101, machine(
+                      PREV_SHA, PREV_DIG, PREV_IMG, 101, checks=None, starts=[T0, ra + 30])))
+    rep, _, _ = run(ctx(), fly)
+    assert len(fly.deploy_calls) == 1
+    assert rep["status"] == dm.FAILED and rep["rollback"]["result"] == "restore_not_confirmed", rep
+
+
+def test_dm_logs_without_status_not_failed_if_superseded():
+    """Логи прочитаны на опросе без статуса; следующий статус — другой релиз → UNKNOWN, не FAILED.
+    Если следующий статус подтверждает новый образ — FATAL засчитывается → FAILED."""
+    fatal = [log_entry(T_START + 80, "ModuleNotFoundError: No module named 'x'")]
+
+    def st_superseded(now):
+        if T_START + 90 <= now < T_START + 120:
+            return dm.FlyUnavailable("x")
+        if now >= T_START + 120:
+            return status(102, machine(NEWER_SHA, NEWER_DIG, NEWER_IMG, 102, starts=[T_START + 85]))
+        return new_ok(now)
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=st_superseded, logs=fatal)
+    rep, mon, _ = run(ctx(), fly)
+    assert mon.obs.superseded and rep["status"] == dm.UNKNOWN, rep["reasons"]
+    assert not rep["observation"]["fatal_categories"] and not fly.deploy_calls
+
+    def st_confirmed(now):
+        if T_START + 90 <= now < T_START + 120:
+            return dm.FlyUnavailable("x")
+        return new_ok(now)
+    clock2 = FakeClock()
+    fly2 = FakeFly(clock2, status_fn=st_confirmed, logs=fatal)
+    rep2, mon2, _ = run(ctx(rollback_enabled=False), fly2)
+    assert "ModuleNotFoundError" in rep2["observation"]["fatal_categories"], rep2["observation"]
+    assert rep2["status"] == dm.FAILED and mon2.obs.early_stop == "fatal_log", rep2["reasons"]
+
+
+
+def test_dm_unconfirmed_log_findings_at_end_unknown():
+    """FATAL прочитан на последних опросах без статуса, подтверждения нет до конца окна → UNKNOWN."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: dm.FlyUnavailable("x") if now >= T_START + 540
+                  else new_ok(now), logs=[log_entry(T_START + 530, "ModuleNotFoundError: x")])
+    rep, mon, _ = run(ctx(), fly)
+    assert not mon.obs.fly_unavailable and mon.obs.coverage >= 0.9, (mon.obs.coverage,)
+    assert mon.obs.unconfirmed_findings >= 1, rep["observation"]
+    assert rep["status"] == dm.UNKNOWN and not fly.deploy_calls, rep["reasons"]
+
+
 TESTS = [
     (test_dm_healthy_10_minutes, "Monitor: стабильно 10 мин → HEALTHY"),
     (test_dm_machine_never_starts_failed, "Monitor: машина не стартует → FAILED"),
@@ -752,6 +867,12 @@ TESTS = [
     (test_dm_status_coverage_low_unknown, "Monitor: покрытие статусов < 90% → UNKNOWN"),
     (test_dm_unknown_new_release_rollback_forbidden, "Monitor: release неизвестен → откат запрещён"),
     (test_dm_last_tick_not_started_failed, "Monitor: последний опрос не started → FAILED"),
+    (test_dm_monitor_only_long_running_full_buffer_healthy, "Monitor: monitor-only, 3 дня, полный буфер → HEALTHY"),
+    (test_dm_module_check_keyerror_inconclusive_not_failed, "Monitor: KeyError в проверке → UNKNOWN, Import → FAILED"),
+    (test_dm_module_check_command_placeholders_setdefault_only, "Monitor: команда проверки — setdefault, только import"),
+    (test_dm_verify_restored_requires_checks, "Monitor: откат без health checks не подтверждён"),
+    (test_dm_logs_without_status_not_failed_if_superseded, "Monitor: логи без статуса + superseded → UNKNOWN"),
+    (test_dm_unconfirmed_log_findings_at_end_unknown, "Monitor: неподтверждённые находки в конце → UNKNOWN"),
 ]
 
 if __name__ == "__main__":

@@ -33,6 +33,15 @@ docker run --rm --network none \
   ${MODULES}
 echo "::endgroup::"
 
+echo "::group::Deploy Monitor import check (exact production command, no env at all)"
+# Та же фиксированная команда, что Deploy Monitor выполняет через flyctl ssh console.
+# Контейнер без env и без сети: фиктивные значения подставляются только через setdefault.
+# После импорта БД не должна появиться ни в /data, ни в /app — бот не запускается.
+CHECK_CMD="$(python ci/deploy_monitor.py module-check-command)"
+docker run --rm --network none --entrypoint sh "${IMAGE}" -c \
+  "${CHECK_CMD} && test ! -e /data/bot.db && test ! -e /app/bot.db && echo 'no database files created'"
+echo "::endgroup::"
+
 echo "::group::Entrypoint file present in image"
 docker run --rm --network none --entrypoint test "${IMAGE}" -f "${ENTRY}"
 echo "entrypoint OK: ${ENTRY}"

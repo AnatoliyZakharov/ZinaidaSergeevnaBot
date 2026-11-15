@@ -84,14 +84,41 @@ _RE_MODULE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _RE_SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
 
+# Переменные, которые модули приложения читают через os.environ[...] при импорте.
+# Если ssh-сессия Fly не получает env машины, они подставляются фиктивными
+# значениями ТОЛЬКО при отсутствии (setdefault — реальные не перезаписываются),
+# чтобы KeyError не маскировал проверку. DB_PATH → /tmp: импорт БД не открывает,
+# но даже теоретически не коснётся /data/bot.db. Значения не секретные.
+MODULE_CHECK_ENV_PLACEHOLDERS = (
+    ("TELEGRAM_TOKEN", "deploy-monitor-placeholder"),
+    ("YANDEX_API_KEY", "deploy-monitor-placeholder"),
+    ("YANDEX_FOLDER_ID", "deploy-monitor-placeholder"),
+    ("GOOGLE_CLIENT_ID", "deploy-monitor-placeholder"),
+    ("GOOGLE_CLIENT_SECRET", "deploy-monitor-placeholder"),
+    ("OAUTH_REDIRECT_URI", "http://localhost/deploy-monitor"),
+    ("DB_PATH", "/tmp/deploy-monitor-import-check.db"),
+)
+# Только эти классы исключений означают сломанную упаковку → FAILED.
+# Всё остальное (KeyError, нет маркера, ошибка ssh, timeout) — нет данных → UNKNOWN.
+MODULE_CHECK_FATAL_EXC = ("ModuleNotFoundError", "ImportError", "SyntaxError")
+
+
 def build_module_check_command(modules: list[str]) -> str:
-    """Фиксированная read-only проверка импорта модулей внутри работающей машины."""
+    """Фиксированная read-only проверка импорта модулей внутри работающей машины.
+    Только import: бот не запускается (main.py стартует лишь в __main__), БД не открывается."""
     if not modules or not all(_RE_MODULE.match(m) for m in modules):
         raise ForbiddenCommand("invalid module list")
-    code = ("import importlib,sys;sys.path.insert(0,\"/app\");"
+    env = ";".join(f"os.environ.setdefault(\"{k}\",\"{v}\")" for k, v in MODULE_CHECK_ENV_PLACEHOLDERS)
+    code = ("import importlib,os,sys;" + env + ";sys.path.insert(0,\"/app\");"
             "[importlib.import_module(m) for m in sys.argv[1:]];"
             f"print(\"{MODULE_CHECK_OK}\")")
     return f"python -c '{code}' " + " ".join(modules)
+
+
+def classify_module_check(exc: str) -> str:
+    """'failed' только для явных ошибок импорта/синтаксиса, иначе 'inconclusive'."""
+    base = (exc or "").rsplit(".", 1)[-1]
+    return "failed" if base in MODULE_CHECK_FATAL_EXC else "inconclusive"
 
 
 def image_ref_ok(ref: str, app: str) -> bool:
@@ -312,7 +339,8 @@ class FlyCtl:
         return parse_log_stream(self._run(["logs", "--app", self.app, "--no-tail", "--json"]))
 
     def exec_check(self, machine_id: str, modules: list[str]) -> tuple[Optional[bool], str]:
-        """→ (True, "") — импорт прошёл; (False, ExcClass) — упал; FlyUnavailable — ssh недоступен."""
+        """→ (True, "") — импорт прошёл; (False, ExcClass) — Traceback в выводе (решение о
+        FAILED/UNKNOWN — classify_module_check); FlyUnavailable — ssh недоступен/нет маркера."""
         cmd = build_module_check_command(modules)
         out = self._run(["ssh", "console", "--app", self.app, "--machine", machine_id, "-C", cmd],
                         timeout=120, check=False)
@@ -491,9 +519,10 @@ class Observation:
     fatal: dict = field(default_factory=dict)     # category -> count
     errors: dict = field(default_factory=dict)    # category -> count
     exc_classes: dict = field(default_factory=dict)
-    module_check: str = "not_run"                 # ok | failed | unavailable | not_run
+    module_check: str = "not_run"                 # ok | failed | inconclusive | unavailable | not_run
     module_check_exc: str = ""
     early_stop: str = ""
+    unconfirmed_findings: int = 0                 # находки логов, не подтверждённые статусом
     deploy_not_applied: bool = False
 
     @property
@@ -519,6 +548,8 @@ class Monitor:
         self.rollback: dict = {"considered": False, "allowed": False, "executed": False,
                                "reasons": [], "result": ""}
         self._seen_logs: set = set()
+        self._log_start: Optional[float] = None          # нижняя граница окна логов
+        self._pending: list = []                          # находки логов без подтверждения статусом
         self._last_log_ts: Optional[float] = None
         self._restart_events: set = set()
         self._exit_events: set = set()
@@ -582,7 +613,24 @@ class Monitor:
             self.clock.sleep(cfg.poll)
 
     # --- Шаг 2: наблюдение
-    def _process_logs(self, ids: set) -> None:
+    def _record_log(self, sev: str, cat: str, exc: Optional[str]) -> None:
+        bucket = self.obs.fatal if sev == "FATAL" else self.obs.errors
+        if cat not in bucket:
+            self.event(f"лог {sev}: {cat}" + (f" ({exc})" if exc else ""))
+        bucket[cat] = bucket.get(cat, 0) + 1
+        if exc:
+            self.obs.exc_classes[exc] = self.obs.exc_classes.get(exc, 0) + 1
+
+    def _confirm_pending(self) -> None:
+        """Статус подтвердил: машины всё ещё на наблюдаемом образе → находки засчитываются."""
+        for item in self._pending:
+            self._record_log(*item)
+        self._pending = []
+
+    def _process_logs(self, ids: set, confirmed: bool = True) -> None:
+        """confirmed=False — статус на этом опросе не получен: находки откладываются до
+        следующего успешного статуса (машину мог заменить другой релиз)."""
+        window = self._log_start if self._log_start is not None else self.ctx.t0
         try:
             entries = self.fly.logs()
         except FlyUnavailable:
@@ -594,17 +642,17 @@ class Monitor:
         if self._last_log_ts is not None and tss and min(tss) > self._last_log_ts:
             self.obs.log_gaps += 1  # буфер переполнился между опросами — возможен пропуск
             complete = False
-        elif (self._last_log_ts is None and tss and min(tss) > self.ctx.t0
+        elif (self._last_log_ts is None and tss and min(tss) > window
               and len(entries) >= LOG_BUFFER_FULL):
-            # первый успешный опрос: буфер полон и начинается позже T0 — начало окна потеряно
+            # первый успешный опрос: буфер полон и начинается позже начала окна — начало потеряно
             self.obs.log_gaps += 1
             self.obs.logs_start_missing = True
             complete = False
-            self.event("логи от T0 до первого опроса вытеснены из буфера — данных нет")
+            self.event("логи от начала окна до первого опроса вытеснены из буфера — данных нет")
         for e in entries:
             ts = parse_ts(e.get("timestamp"))
             inst = str(e.get("instance", ""))
-            if ts is None or ts < self.ctx.t0 or inst not in ids:
+            if ts is None or ts < window or inst not in ids:
                 continue
             msg = str(e.get("message", ""))
             key = (e.get("timestamp"), inst, hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest())
@@ -615,13 +663,10 @@ class Monitor:
             c = classify_message(msg)
             if not c:
                 continue
-            sev, cat, exc = c
-            bucket = self.obs.fatal if sev == "FATAL" else self.obs.errors
-            if cat not in bucket:
-                self.event(f"лог {sev}: {cat}" + (f" ({exc})" if exc else ""))
-            bucket[cat] = bucket.get(cat, 0) + 1
-            if exc:
-                self.obs.exc_classes[exc] = self.obs.exc_classes.get(exc, 0) + 1
+            if confirmed:
+                self._record_log(*c)
+            else:
+                self._pending.append(c)
         if tss:
             self._last_log_ts = max(tss + ([self._last_log_ts] if self._last_log_ts else []))
         if complete:
@@ -637,8 +682,12 @@ class Monitor:
             for m in apps:
                 ok, exc = self.fly.exec_check(m.id, list(self.ctx.modules))
                 if not ok:
-                    self.obs.module_check, self.obs.module_check_exc = "failed", exc
-                    self.event(f"проверка импорта модулей: FAILED ({exc})")
+                    verdict = classify_module_check(exc)
+                    self.obs.module_check, self.obs.module_check_exc = verdict, exc or ""
+                    if verdict == "failed":
+                        self.event(f"проверка импорта модулей: FAILED ({exc})")
+                    else:
+                        self.event(f"проверка импорта модулей: нет вывода ({exc or 'нет маркера'}) — UNKNOWN")
                     return
             self.obs.module_check = "ok"
             self.event("проверка импорта модулей: OK")
@@ -653,6 +702,9 @@ class Monitor:
         end = max(ctx.t0 + cfg.observe, start + cfg.min_live_ticks * cfg.poll)
         if ctx.mode == "monitor-only":
             end = start + cfg.observe
+        # окно логов: в deploy — от T0 (старт новой версии); в monitor-only версия могла
+        # стартовать дни назад, буфер Fly (~100 записей) столько не хранит — окно от запуска
+        self._log_start = ctx.t0 if ctx.mode == "deploy" else max(ctx.t0, start)
         obs.expected_ticks = max(1, int(math.ceil((end - start) / cfg.poll)))
         self.event(f"наблюдение до {iso(end)} ({obs.expected_ticks} опросов)")
         while self.clock.now() < end:
@@ -664,12 +716,18 @@ class Monitor:
                     self.event(f"Fly недоступен {self._consec_fly_err} опроса подряд")
                     break
                 if last_ids:
-                    # статус не получен, но логи читаем по последним известным машинам
-                    self._process_logs(last_ids)
+                    # статус не получен, но логи читаем по последним известным машинам;
+                    # находки — только после подтверждения следующим успешным статусом
+                    self._process_logs(last_ids, confirmed=False)
             else:
                 obs.status_ok_ticks += 1
                 apps = snap.app_machines
+                if apps and all(m.digest == ctx.new_digest for m in apps):
+                    self._confirm_pending()
                 if not apps or any(m.digest != ctx.new_digest for m in apps):
+                    if self._pending:
+                        obs.unconfirmed_findings += len(self._pending)
+                        self._pending = []  # логи могли принадлежать другому релизу
                     obs.superseded = True
                     obs.early_stop = "superseded"
                     self.event("машины ушли с наблюдаемого образа (новый релиз/откат) — наблюдение остановлено")
@@ -712,8 +770,11 @@ class Monitor:
                     self.event(f"критический сбой: {obs.early_stop} — наблюдение остановлено")
                     break
             self.clock.sleep(cfg.poll)
+        if self._pending:
+            obs.unconfirmed_findings += len(self._pending)
+            self._pending = []
         # модульная проверка не успела (короткое окно) — одна попытка в конце
-        if (not obs.early_stop and obs.module_check in ("not_run", "unavailable")
+        if (not obs.early_stop and obs.module_check in ("not_run", "unavailable", "inconclusive")
                 and not obs.fly_unavailable):
             snap = self._status()
             if snap is not None and snap.app_machines and all(
@@ -763,6 +824,8 @@ class Monitor:
                            f"< {cfg.min_coverage:.0%} — нет данных о здоровье")
         if o.logs_coverage < cfg.min_coverage:
             unknown.append(f"покрытие логов {o.logs_coverage:.0%} < {cfg.min_coverage:.0%}")
+        if o.unconfirmed_findings:
+            unknown.append(f"находки в логах без подтверждения статусом Fly: {o.unconfirmed_findings}")
         if o.module_check != "ok":
             unknown.append(f"проверка импорта модулей: {o.module_check}")
         if unknown:
@@ -968,6 +1031,7 @@ class Monitor:
                 "exception_classes": dict(o.exc_classes),
                 "module_check": o.module_check, "module_check_exception": o.module_check_exc,
                 "early_stop": o.early_stop, "superseded": o.superseded,
+                "unconfirmed_findings": o.unconfirmed_findings,
             },
             "rollback": dict(self.rollback),
             "timeline": [{"t": iso(t), "event": e} for t, e in self.timeline],
@@ -1090,6 +1154,8 @@ def main(argv=None) -> int:
     cp = sub.add_parser("capture-prev")
     cp.add_argument("--app", default=os.environ.get("FLY_APP", DEFAULT_APP))
     cp.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT", ""))
+    sub.add_parser("module-check-command",
+                   help="вывести фиксированную команду проверки импорта (для docker smoke в CI)")
     rp = sub.add_parser("run")
     rp.add_argument("--app", default=os.environ.get("FLY_APP", DEFAULT_APP))
     rp.add_argument("--mode", choices=["deploy", "monitor-only"], default="deploy")
@@ -1104,6 +1170,14 @@ def main(argv=None) -> int:
     rp.add_argument("--run-url", default="")
     rp.add_argument("--modules", default="", help="имена модулей через пробел (по умолчанию — из checker)")
     args = ap.parse_args(argv)
+
+    if args.cmd == "module-check-command":
+        mods = _default_modules()
+        if not mods:
+            print("ERROR: module list unavailable (packaging check failed)", file=sys.stderr)
+            return 1
+        print(build_module_check_command(mods))
+        return 0
 
     if args.cmd == "capture-prev":
         out = capture_prev(FlyCtl(args.app))

@@ -1525,6 +1525,38 @@ def test_format_telemost_report_new_and_old_keys():
     assert all("_" not in l and "*" not in l for l in new_lines), new_lines
 
 
+def test_dockerfile_copies_all_runtime_modules():
+    """Все локальные модули, которые импортирует main.py (в т.ч. транзитивно и
+    лениво внутри функций), копируются в Docker-образ. Регрессия релиза #25:
+    my_tasks.py не попал в образ → ModuleNotFoundError на старте."""
+    import warnings
+    needed, queue = set(), ["main"]
+    while queue:
+        name = queue.pop()
+        if name in needed:
+            continue
+        needed.add(name)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse((REPO_ROOT / f"{name}.py").read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                mods = [node.module.split(".")[0]]
+            queue.extend(m for m in mods if (REPO_ROOT / f"{m}.py").exists())
+    copied = set()
+    for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if parts and parts[0].upper() == "COPY":
+            copied |= {p[:-3] for p in parts[1:-1] if p.endswith(".py")}
+            if parts[1:-1] == ["."]:
+                copied |= needed                       # COPY . . — копируется всё
+    missing = sorted(needed - copied)
+    assert not missing, f"Dockerfile не копирует модули: {missing}"
+
+
 if __name__ == "__main__":
     tests = [
         (test_no_hardcoded_secrets,              "нет захардкоженных секретов"),
@@ -1584,6 +1616,7 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    tests.append((test_dockerfile_copies_all_runtime_modules, "Dockerfile копирует все модули main.py"))
     failed = []
     for fn, label in tests:
         try:

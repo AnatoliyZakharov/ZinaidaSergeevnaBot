@@ -80,7 +80,7 @@
 - **Google OAuth-токены хранятся в открытом виде** (не зашифрованы)
 - **mymeet_sync.py: clear перед write** — если запись упала, лист остаётся пустым (частично исправлено в PR #16)
 - **mymeet_sync.py: silent exception** — ошибка чтения существующих статусов не блокирует overwrite
-- **Нет механизма отката** в deploy.yml — упавший деплой не откатывается автоматически
+- **Автооткат в deploy.yml (Deploy Monitor, issue #29)** — после деплоя job `Deploy Monitor` 10 минут наблюдает новую версию от её старта (T0); при `FAILED` откатывает на предыдущий образ (`flyctl deploy --image <prev>`) только если: предыдущая версия однозначна (одна started-машина, checks passing, релиз complete), между версиями не менялись `db.py`/`crypto.py`/`fly.toml`, Fly всё ещё на новой версии и нет более нового релиза, одна попытка за run. Volume, БД и secrets не затрагиваются. Ограничения: схема БД не откатывается (миграции аддитивны, при изменении `db.py` автооткат запрещён → `FAILED` + уведомление PO); проверка импорта модулей в production требует права `ssh` у `FLY_API_TOKEN` (иначе `UNKNOWN`); логи читаются из буфера Fly (~100 записей). Kill-switch: repository variable `AUTO_ROLLBACK_DISABLED=true`.
 
 ### Правила работы с данными
 
@@ -104,8 +104,10 @@
 7. При Уровне 1 — merge и deploy после прохождения всех критериев
 8. При Уровне 2 — остановись, запроси ChatGPT review
 9. При Уровне 3 — остановись, запроси Product Owner
-10. Проверь работоспособность после деплоя
-11. Сообщи итог
+10. После merge: deploy → Deploy Monitor — дождись статуса агента `deploy-monitor` (или зафиксируй в issue «контролируемое ожидание: run <url>»)
+11. Сообщи итог (с обязательной строкой «Deploy Monitor: <статус>»)
+
+Порядок релиза: QA → Security → DevOps → решение Product Owner (по правилам уровня) → merge → deploy → Deploy Monitor → итоговый отчёт. Правила разрешения merge и deploy не меняются; зелёный deploy-шаг или `/health` не доказывают успешный релиз — только `HEALTHY` от Deploy Monitor.
 
 ---
 
@@ -152,7 +154,7 @@
 
 ## 8. Агенты
 
-`.claude/agents/` содержит специализированных агентов: `architect`, `developer`, `qa-engineer`, `devops`.
+`.claude/agents/` содержит специализированных агентов: `architect`, `developer`, `qa-engineer`, `devops`, `deploy-monitor`.
 
 Команда `/task <issue-number>` запускает полный цикл через агентов.
 
@@ -170,6 +172,7 @@
 **Безопасность:** риски или подтверждение их отсутствия  
 **GitHub:** ссылка на PR, статус merge  
 **Deploy:** выполнен / не выполнен / требует действия  
+**Deploy Monitor:** HEALTHY / DEGRADED / FAILED / ROLLED_BACK / UNKNOWN (ссылка на run)  
 **Ограничения:** что осталось нерешённым  
 **Действие Product Owner:** только если действительно требуется
 
@@ -185,7 +188,9 @@
 - `crypto.py` — Fernet шифрование токенов
 - `fly.toml` — конфигурация Fly.io (не менять без явного указания)
 - `Dockerfile` / `Procfile` — не менять без явного указания
-- `.github/workflows/deploy.yml` — push в main = автодеплой на Fly.io
+- `.github/workflows/deploy.yml` — push в main = preflight (упаковка образа) → автодеплой на Fly.io → Deploy Monitor (автооткат)
+- `ci/check_docker_packaging.py` — проверка, что все локальные модули приложения копируются в Docker-образ (CI job «Docker packaging»)
+- `ci/deploy_monitor.py` — наблюдение за релизом, вердикт и безопасный откат
 
 ---
 

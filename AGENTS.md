@@ -56,13 +56,24 @@
 | architect     | .claude/agents/architect.md    | Шаг 1 — анализ до разработки                  |
 | developer     | .claude/agents/developer.md    | Шаг 2 — реализация и PR                       |
 | qa-engineer   | .claude/agents/qa-engineer.md  | Шаг 3 — независимая проверка                  |
-| devops        | .claude/agents/devops.md       | Шаг 5 — только при изменениях инфраструктуры  |
+| devops        | .claude/agents/devops.md       | Шаг 5 — только при изменениях инфраструктуры; проверяет полноту Docker-образа |
+| deploy-monitor | .claude/agents/deploy-monitor.md | Шаг 7 — после каждого merge в main: ждёт Deploy Monitor в deploy.yml, перепроверяет Fly read-only, статус для PO |
+
+### Процесс релиза
+
+QA → Security → DevOps → решение Product Owner (по правилам уровня) → merge → deploy → Deploy Monitor → итоговый отчёт.
+
+- CI job «Docker packaging» блокирует выпуск, если локальный модуль, нужный приложению, не копируется в образ; тот же контроль в preflight `deploy.yml` блокирует деплой.
+- Deploy Monitor (job в `deploy.yml`) 10 минут наблюдает новую версию от её старта и выдаёт `HEALTHY` / `DEGRADED` / `FAILED` / `ROLLED_BACK` / `UNKNOWN`. Без достоверных данных — `UNKNOWN`, а не успех.
+- Автооткат при `FAILED` — только если предыдущая версия однозначна, между версиями не менялись `db.py`/`crypto.py`/`fly.toml`, Fly всё ещё на новой версии и нет более нового релиза; одна попытка за run. Иначе — `FAILED` и срочное уведомление PO. Kill-switch: repository variable `AUTO_ROLLBACK_DISABLED=true`.
+- Отчёт: job summary, артефакт `deploy-monitor-report`, issue «Deploy incident: …» при не-HEALTHY. Текст логов и сырой JSON flyctl не публикуются (репозиторий публичный).
 
 ### Права на merge
 
 - developer — не выполняет merge самостоятельно
 - qa-engineer — не выполняет merge
 - devops — не выполняет merge
+- deploy-monitor — не выполняет merge, deploy и ручной rollback (откат выполняет только workflow)
 - оркестратор — выполняет merge только для Уровня 1 при AUTO_RELEASE_READY = true; для Уровней 2 и 3 — ждёт подтверждения
 
 ---

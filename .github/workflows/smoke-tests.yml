@@ -36,3 +36,24 @@ jobs:
           MYMEET_SPREADSHEET_ID: ""
           ORGANIZER_EMAIL: ""
           GOOGLE_SA_KEY: "{}"
+
+  docker-packaging:
+    # Полнота Docker-образа (issue #29): все локальные модули, нужные entrypoint,
+    # попадают в образ; образ собирается и модули импортируются внутри него.
+    # Имя job — required check для branch protection на main.
+    name: Docker packaging
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Static packaging check (Dockerfile COPY vs imports)
+        run: python ci/check_docker_packaging.py
+
+      - name: Build image and smoke-test imports
+        run: bash ci/docker_import_smoke.sh

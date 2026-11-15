@@ -1,19 +1,164 @@
 name: Deploy to Fly.io
 
+# push в main = production deploy (решение о merge принимается по правилам CLAUDE.md).
+# preflight → deploy → Deploy Monitor (issue #29):
+#   preflight — полнота Docker-образа (блокирует деплой при ошибке упаковки)
+#               и фиксация предыдущей версии для безопасного отката;
+#   deploy    — прежняя команда `flyctl deploy --remote-only` без изменений;
+#   monitor   — 10 минут наблюдения от старта новой версии, вердикт
+#               HEALTHY / DEGRADED / FAILED / ROLLED_BACK / UNKNOWN, при FAILED —
+#               автооткат на предыдущий образ, только если все условия безопасны.
+# Ручной запуск (workflow_dispatch, mode=monitor-only) — проверить текущий production
+# без деплоя и без отката; отдельная concurrency-группа production-monitor-only.
+# Аварийное отключение автоотката: repository variable AUTO_ROLLBACK_DISABLED=true.
+
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "monitor-only — наблюдение за текущим production, без deploy и rollback"
+        type: choice
+        options:
+          - monitor-only
+        default: monitor-only
+
+# push-деплои выстраиваются в очередь в production-deploy. Ручной monitor-only
+# вынесен в отдельную группу: он не может вытеснить ожидающий push-деплой
+# (в одной группе ожидающий run заменяется новым) и никогда не откатывает.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'production-deploy' || 'production-monitor-only' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  FLY_APP: calendar-bot-anatolii
+  AUTO_ROLLBACK_ENABLED: "true"
+  AUTO_ROLLBACK_DISABLED: ${{ vars.AUTO_ROLLBACK_DISABLED == 'true' && 'true' || 'false' }}
+  DEPLOY_MODE: ${{ github.event_name == 'workflow_dispatch' && 'monitor-only' || 'deploy' }}
 
 jobs:
-  deploy:
+  preflight:
+    name: Preflight (packaging + previous release)
     runs-on: ubuntu-latest
+    outputs:
+      prev_image: ${{ steps.prev.outputs.prev_image }}
+      prev_digest: ${{ steps.prev.outputs.prev_digest }}
+      prev_sha: ${{ steps.prev.outputs.prev_sha }}
+      prev_release: ${{ steps.prev.outputs.prev_release }}
+      prev_healthy: ${{ steps.prev.outputs.prev_healthy }}
+      prev_captured_at: ${{ steps.prev.outputs.prev_captured_at }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Static packaging check (Dockerfile COPY vs imports)
+        run: python ci/check_docker_packaging.py
+
+      - name: Build image and smoke-test imports
+        if: env.DEPLOY_MODE == 'deploy'
+        run: bash ci/docker_import_smoke.sh
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Capture previous release
+        id: prev
+        if: env.DEPLOY_MODE == 'deploy'
+        run: python ci/deploy_monitor.py capture-prev --app "$FLY_APP" --output "$GITHUB_OUTPUT"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy:
+    name: Deploy
+    needs: preflight
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.deploy.outcome }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
+      # continue-on-error: даже при exit 1 машина может остаться на новом образе
+      # (урок v98) — monitor всё равно проверяет production и решает об откате.
+      # --label DEPLOY_SHA: явная docker-метка образа (попадает в image_ref.labels
+      # в `flyctl status --json`, рядом с неявной GH_SHA, которую ставит flyctl в
+      # GitHub Actions) — по ней Deploy Monitor опознаёт новую версию.
+      # GITHUB_SHA — стандартная переменная Actions (без ${{ }} внутри run).
       - name: Deploy
-        run: flyctl deploy --remote-only
+        id: deploy
+        continue-on-error: true
+        run: flyctl deploy --remote-only --label "DEPLOY_SHA=${GITHUB_SHA}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  monitor:
+    name: Deploy Monitor
+    needs: [preflight, deploy]
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Monitor release
+        run: |
+          python ci/deploy_monitor.py run \
+            --app "$FLY_APP" \
+            --mode "$DEPLOY_MODE" \
+            --expected-sha "$EXPECTED_SHA" \
+            --prev-image "$PREV_IMAGE" \
+            --prev-digest "$PREV_DIGEST" \
+            --prev-sha "$PREV_SHA" \
+            --prev-release "$PREV_RELEASE" \
+            --prev-healthy "$PREV_HEALTHY" \
+            --prev-captured-at "$PREV_CAPTURED_AT" \
+            --deploy-outcome "$DEPLOY_OUTCOME" \
+            --report-json deploy-monitor-report.json \
+            --run-url "$RUN_URL"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ env.DEPLOY_MODE == 'deploy' && github.sha || '' }}
+          PREV_IMAGE: ${{ needs.preflight.outputs.prev_image }}
+          PREV_DIGEST: ${{ needs.preflight.outputs.prev_digest }}
+          PREV_SHA: ${{ needs.preflight.outputs.prev_sha }}
+          PREV_RELEASE: ${{ needs.preflight.outputs.prev_release }}
+          PREV_HEALTHY: ${{ needs.preflight.outputs.prev_healthy }}
+          PREV_CAPTURED_AT: ${{ needs.preflight.outputs.prev_captured_at }}
+          DEPLOY_OUTCOME: ${{ needs.deploy.outputs.outcome || 'skipped' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Upload monitor report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-monitor-report
+          path: deploy-monitor-report.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -15,7 +15,7 @@ tools:
 ## Проект в production
 
 - Платформа: Fly.io, приложение `calendar-bot-anatolii`
-- Деплой: автоматически при merge в `main` через `.github/workflows/deploy.yml`
+- Деплой: автоматически при merge в `main` через `.github/workflows/deploy.yml` (preflight с проверкой упаковки → deploy → Deploy Monitor с автооткатом)
 - Ручной деплой: `fly deploy --remote-only -a calendar-bot-anatolii`
 - База данных: SQLite volume `/data/bot.db` — **никогда не удалять**
 
@@ -47,7 +47,33 @@ fly status -a calendar-bot-anatolii 2>/dev/null || echo "fly CLI unavailable"
 fly logs -a calendar-bot-anatolii --no-tail -n 50 2>/dev/null || echo "fly CLI unavailable"
 ```
 
-### 5. Breaking changes
+### 5. Полнота Docker-образа (обязательно перед READY TO DEPLOY)
+
+Ошибка v99: `my_tasks.py` не попал в образ (`COPY` в Dockerfile), импорт работал локально и ломался в контейнере. Проверка не ограничивается `grep "import"` в `main.py`.
+
+```bash
+# статический анализ: AST-обход от entrypoint (CMD/ENTRYPOINT, сверка с Procfile)
+# по транзитивным локальным импортам — import / from ... import / вложенные в
+# функции, try, if / относительные / importlib.import_module("литерал")
+python ci/check_docker_packaging.py
+python ci/check_docker_packaging.py --list-modules
+
+# при наличии docker — сборка и import-smoke внутри образа (без сети, фиктивные env)
+command -v docker >/dev/null && bash ci/docker_import_smoke.sh || echo "docker unavailable — опираться на CI job Docker packaging"
+
+# CI: job «Docker packaging» на PR должен быть зелёным
+gh pr checks <PR> 2>/dev/null | grep -i "Docker packaging"
+```
+
+Проверь вручную по diff:
+- новые `.py`-файлы, нужные приложению при запуске, добавлены в `COPY`;
+- `CMD` в Dockerfile совпадает с `Procfile`; entrypoint-файл копируется;
+- новые зависимости есть в `requirements.txt`; пути `WORKDIR`/`COPY` корректны;
+- предупреждения checker о нелитеральных динамических импортах разобраны.
+
+Тесты (`test_*.py`), локальные утилиты, `ci/`, документацию копировать в образ **не требуется** — checker требует только модули, достижимые из entrypoint.
+
+### 6. Breaking changes
 
 Проверь, есть ли изменения, требующие:
 - Новых переменных окружения (fly secrets)
@@ -62,6 +88,12 @@ fly logs -a calendar-bot-anatolii --no-tail -n 50 2>/dev/null || echo "fly CLI u
 ### CI/CD
 - GitHub Actions: PASS / FAIL / UNKNOWN
 - Последний run: <статус и ссылка, если доступно>
+
+### Полнота Docker-образа
+- `ci/check_docker_packaging.py`: OK / ERROR (какие модули)
+- Локальный docker build + import smoke: PASS / FAIL / не выполнялся (нет docker)
+- CI job «Docker packaging»: PASS / FAIL / UNKNOWN
+- CMD ↔ Procfile: совпадают / нет
 
 ### Конфигурация деплоя
 - `fly.toml`: без изменений / изменён (что именно)
@@ -78,7 +110,11 @@ fly logs -a calendar-bot-anatolii --no-tail -n 50 2>/dev/null || echo "fly CLI u
 2. <Шаг 2>
 
 ### Инструкции для отката (если что-то пойдёт не так)
-fly deploy --image <предыдущий image tag> -a calendar-bot-anatolii
+Автоматически: job «Deploy Monitor» в `deploy.yml` откатывает на предыдущий образ при FAILED,
+если выполнены все условия безопасности (предыдущая версия однозначна, `db.py`/`crypto.py`/`fly.toml`
+не менялись, Fly всё ещё на новой версии, kill-switch `AUTO_ROLLBACK_DISABLED` выключен).
+Вручную (только по решению Product Owner):
+flyctl deploy --app calendar-bot-anatolii --image <ImageRef предыдущего complete-релиза из `flyctl releases --json --image`> --config fly.toml --wait-timeout 5m
 
 ### Статус готовности
 **READY TO DEPLOY** / **BLOCKED** (причина)
@@ -89,6 +125,9 @@ fly deploy --image <предыдущий image tag> -a calendar-bot-anatolii
 - Критичные ошибки в конфигурации (`fly.toml`, `Dockerfile`)
 - Новые переменные окружения не добавлены в fly secrets
 - CI провален и причина не устранена
+- `ci/check_docker_packaging.py` нашёл модуль, не скопированный в образ (missing)
+- `CMD` в Dockerfile не совпадает с `Procfile` или entrypoint не копируется
+- CI job «Docker packaging» красный или не запускался
 
 ## Ограничения
 

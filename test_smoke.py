@@ -1584,6 +1584,10 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
+    from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
+    from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS
+    tests += _DOCKER_PACKAGING_TESTS + _DEPLOY_MONITOR_TESTS
     failed = []
     for fn, label in tests:
         try:

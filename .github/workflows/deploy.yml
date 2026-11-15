@@ -53,6 +53,7 @@ jobs:
       prev_sha: ${{ steps.prev.outputs.prev_sha }}
       prev_release: ${{ steps.prev.outputs.prev_release }}
       prev_healthy: ${{ steps.prev.outputs.prev_healthy }}
+      prev_captured_at: ${{ steps.prev.outputs.prev_captured_at }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,10 +94,14 @@ jobs:
 
       # continue-on-error: даже при exit 1 машина может остаться на новом образе
       # (урок v98) — monitor всё равно проверяет production и решает об откате.
+      # --label DEPLOY_SHA: явная docker-метка образа (попадает в image_ref.labels
+      # в `flyctl status --json`, рядом с неявной GH_SHA, которую ставит flyctl в
+      # GitHub Actions) — по ней Deploy Monitor опознаёт новую версию.
+      # GITHUB_SHA — стандартная переменная Actions (без ${{ }} внутри run).
       - name: Deploy
         id: deploy
         continue-on-error: true
-        run: flyctl deploy --remote-only
+        run: flyctl deploy --remote-only --label "DEPLOY_SHA=${GITHUB_SHA}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -132,6 +137,7 @@ jobs:
             --prev-sha "$PREV_SHA" \
             --prev-release "$PREV_RELEASE" \
             --prev-healthy "$PREV_HEALTHY" \
+            --prev-captured-at "$PREV_CAPTURED_AT" \
             --deploy-outcome "$DEPLOY_OUTCOME" \
             --report-json deploy-monitor-report.json \
             --run-url "$RUN_URL"
@@ -144,6 +150,7 @@ jobs:
           PREV_SHA: ${{ needs.preflight.outputs.prev_sha }}
           PREV_RELEASE: ${{ needs.preflight.outputs.prev_release }}
           PREV_HEALTHY: ${{ needs.preflight.outputs.prev_healthy }}
+          PREV_CAPTURED_AT: ${{ needs.preflight.outputs.prev_captured_at }}
           DEPLOY_OUTCOME: ${{ needs.deploy.outputs.outcome || 'skipped' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 

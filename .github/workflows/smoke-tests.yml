@@ -27,6 +27,8 @@ jobs:
           pip install --quiet gspread requests google-auth
           # «Мои задачи»: реальные объекты Telegram и Fernet — тесты не пропускаются
           pip install --quiet python-telegram-bot==21.6 cryptography==43.0.3
+          # проверка deploy.yml в test_deploy_monitor (явная метка DEPLOY_SHA)
+          pip install --quiet pyyaml
 
       - name: Run smoke tests
         run: python test_smoke.py

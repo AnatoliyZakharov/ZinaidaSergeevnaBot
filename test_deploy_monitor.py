@@ -5,6 +5,7 @@ Fly.io, git, GitHub и часы — заглушки: ни сети, ни subpro
 Запуск: python test_deploy_monitor.py  (также входит в python test_smoke.py)
 """
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -39,7 +40,7 @@ class FakeClock:
 
 
 def machine(sha, digest, image, release, state="started", checks="passing",
-            starts=(), exits=(), mid=MID, group="app"):
+            starts=(), exits=(), mid=MID, group="app", deploy_sha=None):
     ev = [{"type": "start", "status": "started", "source": "flyd", "timestamp": int(t * 1000)}
           for t in starts]
     ev += [{"type": "exit", "status": "stopped", "source": "flyd", "timestamp": int(t * 1000)}
@@ -47,7 +48,7 @@ def machine(sha, digest, image, release, state="started", checks="passing",
     return {
         "id": mid, "state": state, "instance_id": "01ABC",
         "image_ref": {"registry": "registry.fly.io", "repository": APP, "tag": "x",
-                      "digest": digest, "labels": {"GH_SHA": sha, "GH_REPO": "o/r"}},
+                      "digest": digest, "labels": _labels(sha, deploy_sha)},
         "config": {"image": image, "metadata": {"fly_process_group": group,
                                                  "fly_release_version": str(release),
                                                  "fly_release_id": "rel_x"},
@@ -56,6 +57,15 @@ def machine(sha, digest, image, release, state="started", checks="passing",
         "checks": [{"name": "servicecheck-00-http-8080", "status": checks, "output": "OK"}]
         if checks else [],
     }
+
+
+def _labels(sha, deploy_sha):
+    lb = {"GH_REPO": "o/r"}
+    if sha is not None:
+        lb["GH_SHA"] = sha
+    if deploy_sha is not None:
+        lb["DEPLOY_SHA"] = deploy_sha
+    return lb
 
 
 def status(version, *machines):
@@ -82,8 +92,10 @@ def log_entry(ts, msg, inst=MID):
 
 RELEASES = [
     {"ID": "r100", "Version": 100, "Stable": False, "Status": "complete", "ImageRef": NEW_IMG,
+     "CreatedAt": rfc(T_START - 300),
      "User": {"Email": "owner@example.com", "Name": "Owner"}},
     {"ID": "r99", "Version": 99, "Stable": False, "Status": "complete", "ImageRef": PREV_IMG,
+     "CreatedAt": rfc(T_START - 86400),
      "User": {"Email": "owner@example.com", "Name": "Owner"}},
 ]
 
@@ -167,6 +179,7 @@ class FakeNotifier:
 def ctx(**kw):
     base = dict(app=APP, mode="deploy", expected_sha=NEW_SHA, prev_image=PREV_IMG,
                 prev_digest=PREV_DIG, prev_sha=PREV_SHA, prev_release=99, prev_healthy=True,
+                prev_captured_at=T_START - 600,
                 deploy_outcome="success", rollback_enabled=True, kill_switch=False,
                 modules=["db", "my_tasks", "main"], run_url="https://example.invalid/run/1")
     base.update(kw)
@@ -422,8 +435,9 @@ def test_dm_observes_new_release_not_old_machine():
     fly2 = FakeFly(clock2, status_fn=lambda now: status(
         100, machine(NEW_SHA, NEW_DIG, NEW_IMG, 100, starts=[T0]),
         machine(PREV_SHA, PREV_DIG, PREV_IMG, 99, starts=[T0 - 9999], mid=MID2)))
-    rep2, mon2, _ = run(ctx(rollback_enabled=False), fly2)
-    assert not mon2.obs.reached_started and rep2["status"] == dm.FAILED
+    rep2, mon2, _ = run(ctx(), fly2)
+    assert not mon2.obs.reached_started and rep2["status"] == dm.UNKNOWN, rep2["reasons"]
+    assert not fly2.deploy_calls, "частичная раскатка без признаков сбоя — без отката"
 
 
 # ─── Дополнительно ───────────────────────────────────────────────────────────
@@ -839,6 +853,240 @@ def test_dm_unconfirmed_log_findings_at_end_unknown():
     assert rep["status"] == dm.UNKNOWN and not fly.deploy_calls, rep["reasons"]
 
 
+# ─── Идентификация релиза (ревью ChatGPT: BLOCKED) ───────────────────────────
+
+def _nolabel(now, **kw):
+    return status(100, machine(None, NEW_DIG, NEW_IMG, 100, starts=[T0], **kw))
+
+
+def test_dm_ident_deploy_sha_without_gh_sha_healthy():
+    """Нет GH_SHA, есть явная DEPLOY_SHA == expected → HEALTHY, способ label:DEPLOY_SHA."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: status(100, machine(
+        None, NEW_DIG, NEW_IMG, 100, starts=[T0], deploy_sha=NEW_SHA)))
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] == dm.HEALTHY, rep["reasons"]
+    assert rep["new"]["identified_by"] == "label:DEPLOY_SHA"
+
+
+def test_dm_ident_release_match_without_labels():
+    """Меток нет, релиз v100 (первый после prev) с ImageRef == образу машины → HEALTHY;
+    при FATAL откат разрешён (версия опознана уверенно)."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=_nolabel)
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] == dm.HEALTHY, rep["reasons"]
+    assert rep["new"]["identified_by"] == "release:v100"
+    # совпадение по digest-ссылке тоже засчитывается
+    clock_d = FakeClock()
+    rels_d = [dict(RELEASES[0], ImageRef=f"registry.fly.io/{APP}@{NEW_DIG}"), RELEASES[1]]
+    rep_d, _, _ = run(ctx(), FakeFly(clock_d, status_fn=_nolabel, releases=rels_d))
+    assert rep_d["status"] == dm.HEALTHY and rep_d["new"]["identified_by"] == "release:v100"
+    clock2 = FakeClock()
+    fly2 = FakeFly(clock2, status_fn=_nolabel, logs=[log_entry(T0 + 30, "ModuleNotFoundError: x")])
+    rep2, _, _ = run(ctx(), fly2)
+    assert rep2["status"] == dm.ROLLED_BACK and fly2.deploy_calls == [PREV_IMG], rep2["rollback"]
+    # как в реальной истории (v98 failed между v97 и v99): failed-релиз ПРОШЛОГО запуска
+    # (создан до capture-prev) не мешает — опознаётся релиз этого run
+    clock3 = FakeClock()
+    rels3 = [dict(RELEASES[0], Version=101, ID="r101", CreatedAt=rfc(T_START - 300)),
+             dict(RELEASES[0], Version=100, ID="r100", Status="failed", ImageRef=NEWER_IMG,
+                  CreatedAt=rfc(T_START - 7200)),
+             RELEASES[1]]
+    fly3 = FakeFly(clock3, releases=rels3,
+                   status_fn=lambda now: status(101, machine(None, NEW_DIG, NEW_IMG, 101, starts=[T0])))
+    rep3, _, _ = run(ctx(), fly3)
+    assert rep3["status"] == dm.HEALTHY and rep3["new"]["identified_by"] == "release:v101", rep3["reasons"]
+    # момент capture-prev неизвестен → сопоставление по релизу невозможно → UNKNOWN без отката
+    clock4 = FakeClock()
+    fly4 = FakeFly(clock4, status_fn=_nolabel, logs=[log_entry(T0 + 30, "ModuleNotFoundError: x")])
+    rep4, _, _ = run(ctx(prev_captured_at=None), fly4)
+    assert rep4["status"] == dm.UNKNOWN and not fly4.deploy_calls, rep4["reasons"]
+    out = dm.capture_prev(FakeFly(FakeClock(), status_fn=lambda now: restored_ok(now, 0)))
+    assert out["prev_captured_at"].isdigit(), out
+
+
+def test_dm_ident_unidentifiable_healthy_unknown_no_rollback():
+    """КЛЮЧЕВОЙ: меток нет, релиз не сопоставить, машина здорова → UNKNOWN, без отката."""
+    variants = [
+        dict(releases=[dict(RELEASES[0], ImageRef=NEWER_IMG), RELEASES[1]]),   # ImageRef не тот
+        dict(releases=dm.FlyUnavailable("releases")),                          # releases недоступны
+        dict(releases=[RELEASES[1]]),                                          # нового релиза нет
+        # машина на v101 — не первый релиз после prev (чужой), наш v100 на другом образе
+        dict(releases=[dict(RELEASES[0], Version=101, ImageRef=NEW_IMG, ID="r101"),
+                       dict(RELEASES[0], ImageRef=NEWER_IMG), RELEASES[1]],
+             status_fn=lambda now: status(101, machine(None, NEW_DIG, NEW_IMG, 101, starts=[T0]))),
+    ]
+    for kw in variants:
+        clock = FakeClock()
+        kw = dict(kw)
+        fly = FakeFly(clock, status_fn=kw.pop("status_fn", _nolabel),
+                      logs=[log_entry(T0 + 30, "ModuleNotFoundError: x")], **kw)
+        rep, mon, _ = run(ctx(), fly)
+        assert rep["status"] == dm.UNKNOWN, (kw, rep["reasons"])
+        assert mon.obs.wait_result == "unidentified" and not fly.deploy_calls, kw
+        assert not rep["rollback"]["considered"]
+    # предыдущий релиз неизвестен → сопоставить нельзя → UNKNOWN
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=_nolabel)
+    rep, _, _ = run(ctx(prev_release=None, prev_healthy=False), fly)
+    assert rep["status"] == dm.UNKNOWN and not fly.deploy_calls
+    # deploy success, но машины по-прежнему на предыдущей версии → UNKNOWN «не найдена»
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: status(99, machine(PREV_SHA, PREV_DIG, PREV_IMG, 99)))
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] == dm.UNKNOWN and mon.obs.wait_result == "not_found" and not fly.deploy_calls
+
+
+def test_dm_ident_foreign_deploy_sha_not_counted():
+    """Метка DEPLOY_SHA с чужим SHA → машина не наша (даже если GH_SHA совпадает); сценарий 14."""
+    clock = FakeClock()
+    fly = FakeFly(clock, status_fn=lambda now: status(100, machine(
+        NEW_SHA, NEW_DIG, NEW_IMG, 100, starts=[T0], deploy_sha=NEWER_SHA)))
+    rep, mon, _ = run(ctx(), fly)
+    assert not mon.obs.reached_started and rep["status"] == dm.UNKNOWN, rep["reasons"]
+    assert not fly.deploy_calls
+    # старая машина с DEPLOY_SHA=prev не засчитывается; T0 — старт новой
+    clock2 = FakeClock()
+    t_new = T_START + 85
+
+    def st(now):
+        if now < T_START + 90:
+            return status(99, machine(None, PREV_DIG, PREV_IMG, 99, starts=[T_START - 86400],
+                                      deploy_sha=PREV_SHA))
+        return status(100, machine(None, NEW_DIG, NEW_IMG, 100, starts=[T_START - 86400, t_new],
+                                   deploy_sha=NEW_SHA))
+    rep2, mon2, _ = run(ctx(), FakeFly(clock2, status_fn=st))
+    assert mon2.ctx.t0 == t_new and rep2["status"] == dm.HEALTHY, rep2["reasons"]
+
+
+def test_dm_ident_failed_release_bad_state_failed():
+    """Релиз failed + машина не started → FAILED; без опознания версии — без отката."""
+    clock = FakeClock()
+    rels = [dict(RELEASES[0], Status="failed", ImageRef=NEWER_IMG), RELEASES[1]]
+    fly = FakeFly(clock, releases=rels, status_fn=lambda now: status(100, machine(
+        None, NEW_DIG, NEW_IMG, 100, state="stopped", checks="critical")))
+    rep, mon, _ = run(ctx(), fly)
+    assert rep["status"] == dm.FAILED and mon.obs.wait_result == "failed_evidence", rep["reasons"]
+    assert any("failed" in e for e in mon.obs.wait_evidence)
+    assert not fly.deploy_calls and any("не опознана" in r for r in rep["rollback"]["reasons"])
+    # deploy упал, машина на новом образе в плохом состоянии → FAILED
+    clock2 = FakeClock()
+    fly2 = FakeFly(clock2, releases=[RELEASES[1]], status_fn=lambda now: status(100, machine(
+        None, NEW_DIG, NEW_IMG, 100, state="stopped")))
+    rep2, mon2, _ = run(ctx(deploy_outcome="failure"), fly2)
+    assert rep2["status"] == dm.FAILED and not fly2.deploy_calls
+    assert any("deploy упал" in e for e in mon2.obs.wait_evidence)
+    # машина не started, версия не опознана, релиз complete, deploy success → всё равно FAILED
+    # (production не работает — факт), но без отката
+    clock3 = FakeClock()
+    fly3 = FakeFly(clock3, releases=[dict(RELEASES[0], ImageRef=NEWER_IMG), RELEASES[1]],
+                   status_fn=lambda now: status(100, machine(None, NEW_DIG, NEW_IMG, 100, state="stopped")))
+    rep3, mon3, _ = run(ctx(), fly3)
+    assert rep3["status"] == dm.FAILED and mon3.obs.wait_result == "failed_evidence", rep3["reasons"]
+    assert not fly3.deploy_calls
+    # опознанная версия не started → FAILED и откат (версия опознана)
+    clock4 = FakeClock()
+    fly4 = FakeFly(clock4, status_fn=lambda now: status(100, machine(
+        None, NEW_DIG, NEW_IMG, 100, state="stopped", deploy_sha=NEW_SHA)))
+    rep4, _, _ = run(ctx(), fly4)
+    assert rep4["status"] == dm.ROLLED_BACK and fly4.deploy_calls == [PREV_IMG], rep4["reasons"]
+    # crash-loop: started, но ≥2 старта за время ожидания
+    snap = dm.snapshot_from_status(status(100, machine(NEW_SHA, NEW_DIG, NEW_IMG, 100,
+                                                       starts=[T_START + 10, T_START + 70])))
+    assert dm.Monitor._bad_state(snap.machines[0], T_START)
+    snap = dm.snapshot_from_status(status(100, machine(NEW_SHA, NEW_DIG, NEW_IMG, 100, starts=[T_START + 10])))
+    assert not dm.Monitor._bad_state(snap.machines[0], T_START)
+
+
+def test_dm_sha_prefers_explicit_deploy_sha():
+    """MachineSnap.sha / capture-prev: явная DEPLOY_SHA приоритетнее GH_SHA; без меток — не однозначна."""
+    clock = FakeClock()
+    st = lambda now: status(99, machine("d" * 40, PREV_DIG, PREV_IMG, 99, deploy_sha=PREV_SHA))  # noqa: E731
+    out = dm.capture_prev(FakeFly(clock, status_fn=st))
+    assert out["prev_sha"] == PREV_SHA and out["prev_healthy"] == "true", out
+    st2 = lambda now: status(99, machine(None, PREV_DIG, PREV_IMG, 99))  # noqa: E731
+    out2 = dm.capture_prev(FakeFly(clock, status_fn=st2))
+    assert out2["prev_healthy"] == "false" and out2["prev_reason"] == "no_version_label", out2
+
+
+def test_dm_decide_rollback_requires_identification():
+    """decide_rollback: new_digest без способа опознания → отказ."""
+    clock = FakeClock()
+    fly = FakeFly(clock)
+    mon = dm.Monitor(ctx(), fly, FakeGit(), FakeNotifier(), clock)
+    mon.ctx.new_digest, mon.ctx.new_release, mon.ctx.identified_by = NEW_DIG, 100, ""
+    allowed, reasons = mon.decide_rollback()
+    assert not allowed and any("не опознана" in r for r in reasons), reasons
+    mon.ctx.identified_by = "label:GH_SHA"
+    allowed, reasons = mon.decide_rollback()
+    assert allowed, reasons
+
+
+class _SshFly(FakeFly):
+    """exec_check через настоящий FlyCtl с подменённым runner (без сети)."""
+    def __init__(self, clock, ssh_runner, **kw):
+        super().__init__(clock, **kw)
+        self._ctl = dm.FlyCtl(APP, binary="flyctl", runner=ssh_runner)
+
+    def exec_check(self, mid, modules):
+        self.exec_calls.append((mid, tuple(modules)))
+        return self._ctl.exec_check(mid, modules)
+
+
+def test_dm_ssh_failures_unknown_no_rollback():
+    """ssh: ошибка подключения / нет прав / timeout / нет маркера / FlyUnavailable → UNKNOWN, без отката."""
+    def rc(code, out="", err=""):
+        return lambda a, **k: subprocess.CompletedProcess(a, code, out, err)
+
+    def timeout(a, **k):
+        raise subprocess.TimeoutExpired(a, 120)
+
+    def oserr(a, **k):
+        raise FileNotFoundError("flyctl")
+    runners = {
+        "connection": rc(1, err="Error: error connecting to SSH server: ssh: handshake failed: EOF"),
+        "no_permission": rc(1, err="Error: unauthorized: token has no ssh permission"),
+        "timeout": timeout,
+        "no_marker_rc0": rc(0, out=""),
+        "binary_missing": oserr,
+    }
+    for name, r in runners.items():
+        clock = FakeClock()
+        fly = _SshFly(clock, r)
+        rep, mon, _ = run(ctx(), fly)
+        assert rep["status"] == dm.UNKNOWN, (name, rep["reasons"])
+        assert rep["observation"]["module_check"] == "unavailable", (name, rep["observation"]["module_check"])
+        assert not fly.deploy_calls and not rep["rollback"]["considered"], name
+        assert fly.exec_calls, name
+    clock = FakeClock()
+    fly = FakeFly(clock, exec_result=dm.FlyUnavailable("ssh"))
+    rep, _, _ = run(ctx(), fly)
+    assert rep["status"] == dm.UNKNOWN and not fly.deploy_calls
+
+
+def test_dm_deploy_workflow_passes_explicit_label():
+    """deploy.yml: шаг Deploy передаёт --label DEPLOY_SHA=${GITHUB_SHA} (без ${{ }} в run)."""
+    path = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+        assert not os.environ.get("CI"), "в CI PyYAML обязателен (smoke-tests.yml ставит pyyaml)"
+    if yaml is not None:
+        wf = yaml.safe_load(text)
+        steps = wf["jobs"]["deploy"]["steps"]
+        run_line = next(st["run"] for st in steps if st.get("id") == "deploy")
+    else:
+        lines = text.splitlines()
+        i = next(k for k, ln in enumerate(lines) if ln.strip() == "id: deploy")
+        run_line = next(ln.split("run:", 1)[1] for ln in lines[i:] if ln.strip().startswith("run:"))
+    assert "flyctl deploy --remote-only" in run_line, run_line
+    assert f'--label "{dm.DEPLOY_SHA_LABEL}=${{GITHUB_SHA}}"' in run_line, run_line
+    assert "${{" not in run_line, run_line
+
+
 TESTS = [
     (test_dm_healthy_10_minutes, "Monitor: стабильно 10 мин → HEALTHY"),
     (test_dm_machine_never_starts_failed, "Monitor: машина не стартует → FAILED"),
@@ -873,6 +1121,15 @@ TESTS = [
     (test_dm_verify_restored_requires_checks, "Monitor: откат без health checks не подтверждён"),
     (test_dm_logs_without_status_not_failed_if_superseded, "Monitor: логи без статуса + superseded → UNKNOWN"),
     (test_dm_unconfirmed_log_findings_at_end_unknown, "Monitor: неподтверждённые находки в конце → UNKNOWN"),
+    (test_dm_ident_deploy_sha_without_gh_sha_healthy, "Идентификация: DEPLOY_SHA без GH_SHA → HEALTHY"),
+    (test_dm_ident_release_match_without_labels, "Идентификация: по релизу без меток → HEALTHY"),
+    (test_dm_ident_unidentifiable_healthy_unknown_no_rollback, "Идентификация: не опознана, здорова → UNKNOWN"),
+    (test_dm_ident_foreign_deploy_sha_not_counted, "Идентификация: чужая DEPLOY_SHA не засчитывается"),
+    (test_dm_ident_failed_release_bad_state_failed, "Идентификация: релиз failed + сбой → FAILED"),
+    (test_dm_sha_prefers_explicit_deploy_sha, "Идентификация: DEPLOY_SHA приоритетнее GH_SHA"),
+    (test_dm_decide_rollback_requires_identification, "Откат только для опознанной версии"),
+    (test_dm_ssh_failures_unknown_no_rollback, "ssh: ошибки/нет прав/timeout → UNKNOWN без отката"),
+    (test_dm_deploy_workflow_passes_explicit_label, "deploy.yml передаёт --label DEPLOY_SHA"),
 ]
 
 if __name__ == "__main__":

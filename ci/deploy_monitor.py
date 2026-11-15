@@ -50,6 +50,9 @@ DEFAULT_APP = "calendar-bot-anatolii"
 # `flyctl logs --no-tail` отдаёт хвост буфера (~100 записей). Полный буфер, начинающийся
 # позже T0, означает, что записи между T0 и первым опросом могли быть вытеснены.
 LOG_BUFFER_FULL = 100
+# Явная метка образа, которую deploy.yml ставит через `flyctl deploy --label DEPLOY_SHA=<sha>`.
+DEPLOY_SHA_LABEL = "DEPLOY_SHA"
+RELEASE_CLOCK_SKEW = 60  # с: допуск между часами runner и CreatedAt релиза Fly
 MODULE_CHECK_OK = "DEPLOY_MONITOR_IMPORT_OK"
 
 
@@ -249,6 +252,12 @@ class MachineSnap:
     release: Optional[int]
     checks: list          # [(name, status)]
     events: list          # [(type, status, ts_seconds)]
+    deploy_sha: str = ""  # явная метка образа DEPLOY_SHA (deploy.yml: --label)
+
+    @property
+    def sha(self) -> str:
+        """SHA версии по меткам образа: явная DEPLOY_SHA приоритетнее неявной GH_SHA."""
+        return self.deploy_sha or self.gh_sha
 
     @property
     def checks_failing(self) -> bool:
@@ -290,7 +299,8 @@ def snapshot_from_status(data: dict) -> Snapshot:
             id=str(m.get("id", "")), state=str(m.get("state", "")),
             group=str(md.get("fly_process_group", "")), gh_sha=str(labels.get("GH_SHA", "")),
             digest=str(ir.get("digest", "")), image=str(cfg.get("image", "")),
-            release=rel, checks=checks, events=events))
+            release=rel, checks=checks, events=events,
+            deploy_sha=str(labels.get(DEPLOY_SHA_LABEL, ""))))
     v = data.get("Version")
     return Snapshot(version=int(v) if isinstance(v, (int, float)) else None, machines=machines)
 
@@ -483,6 +493,7 @@ class Context:
     prev_sha: str = ""
     prev_release: Optional[int] = None
     prev_healthy: bool = False
+    prev_captured_at: Optional[float] = None   # epoch: момент capture-prev (до deploy)
     deploy_outcome: str = "success"      # success | failure | skipped
     rollback_enabled: bool = False
     kill_switch: bool = False
@@ -493,6 +504,8 @@ class Context:
     new_image: str = ""
     new_release: Optional[int] = None
     t0: Optional[float] = None
+    identified_by: str = ""              # label:DEPLOY_SHA | label:GH_SHA | release:vN | digest:current
+    monitor_digest: str = ""             # monitor-only: наблюдаемый текущий образ
 
 
 @dataclass
@@ -524,6 +537,9 @@ class Observation:
     early_stop: str = ""
     unconfirmed_findings: int = 0                 # находки логов, не подтверждённые статусом
     deploy_not_applied: bool = False
+    # итог ожидания версии: reached | not_applied | failed_evidence | unidentified | not_found | fly_unavailable
+    wait_result: str = ""
+    wait_evidence: list = field(default_factory=list)
 
     @property
     def coverage(self) -> float:
@@ -576,41 +592,137 @@ class Monitor:
         self._consec_fly_err = 0
         return snap
 
+    # --- Идентификация версии
+    def _first_release_after_prev(self, releases) -> Optional[dict]:
+        """Первый релиз, созданный этим run: Version > prev_release и CreatedAt не раньше
+        момента capture-prev (минус допуск на расхождение часов). Отсекает failed-релизы
+        прошлых запусков (как v96/v98 в истории) и более поздние сторонние релизы.
+        Без prev_release или момента capture-prev сопоставление невозможно."""
+        ctx = self.ctx
+        if not releases or ctx.prev_release is None or ctx.prev_captured_at is None:
+            return None
+        not_before = ctx.prev_captured_at - RELEASE_CLOCK_SKEW
+        later = []
+        for r in releases:
+            created = parse_ts(r.get("CreatedAt"))
+            if (isinstance(r.get("Version"), int) and r["Version"] > ctx.prev_release
+                    and created is not None and created >= not_before):
+                later.append(r)
+        return min(later, key=lambda r: r["Version"]) if later else None
+
+    def classify_machine(self, m: "MachineSnap", releases) -> tuple[str, str]:
+        """→ ("new" | "other" | "unknown", способ). Метка с другим SHA → точно не наша."""
+        ctx = self.ctx
+        if ctx.mode == "monitor-only":
+            return ("new", "digest:current") if m.digest and m.digest == ctx.monitor_digest \
+                else ("other", "digest:current")
+        if m.deploy_sha:
+            return ("new" if m.deploy_sha == ctx.expected_sha else "other"), "label:DEPLOY_SHA"
+        if m.gh_sha:
+            return ("new" if m.gh_sha == ctx.expected_sha else "other"), "label:GH_SHA"
+        if ctx.prev_digest and m.digest == ctx.prev_digest:
+            return "other", "prev_digest"
+        rel = self._first_release_after_prev(releases)
+        if (rel is not None and m.release == rel.get("Version") and m.digest
+                and m.digest != ctx.prev_digest):
+            ref = str(rel.get("ImageRef") or "")
+            if ref and (ref == m.image or ref.endswith("@" + m.digest)):
+                return "new", f"release:v{rel['Version']}"
+        return "unknown", ""
+
+    def _releases_or_none(self):
+        try:
+            return self.fly.releases()
+        except FlyUnavailable:
+            return None
+
+    @staticmethod
+    def _bad_state(m: "MachineSnap", since: float) -> bool:
+        """Положительное доказательство сбоя: не started или crash-loop (≥2 старта за ожидание)."""
+        starts = [t for (ty, st, t) in m.events if ty == "start" and st == "started" and t and t > since]
+        return m.state != "started" or len(starts) >= 2
+
     # --- Шаг 1: дождаться ожидаемой версии
     def wait_for_expected_version(self) -> bool:
-        ctx, cfg = self.ctx, self.cfg
-        deadline = self.clock.now() + cfg.wait_version_timeout
-        self.event(f"ожидание версии {ctx.expected_sha[:7]} (до {int(cfg.wait_version_timeout)} с)")
+        ctx, cfg, obs = self.ctx, self.cfg, self.obs
+        began = self.clock.now()
+        deadline = began + cfg.wait_version_timeout
+        self.event(f"ожидание версии {ctx.expected_sha[:7] or ctx.monitor_digest[:19]} "
+                   f"(до {int(cfg.wait_version_timeout)} с)")
+        last = None          # (apps, classes, releases) последнего успешного опроса
         while True:
             snap = self._status()
-            if snap is None and self.obs.fly_unavailable:
+            if snap is None and obs.fly_unavailable:
+                obs.wait_result = "fly_unavailable"
                 self.event("Fly недоступен при ожидании версии")
                 return False
             if snap is not None:
                 apps = snap.app_machines
                 if (ctx.deploy_outcome == "failure" and apps and ctx.prev_digest
                         and all(m.digest == ctx.prev_digest for m in apps)):
-                    self.obs.deploy_not_applied = True
+                    obs.deploy_not_applied = True
+                    obs.wait_result = "not_applied"
                     self.event("deploy упал, машины на предыдущем образе: production не изменён")
                     return False
-                new = [m for m in apps if m.gh_sha == ctx.expected_sha]
+                releases = self._releases_or_none()
+                classes = [self.classify_machine(m, releases) for m in apps]
+                new = [m for m, (c, _) in zip(apps, classes) if c == "new"]
                 if new:
                     ctx.new_digest = new[0].digest
                     ctx.new_image = new[0].image
                     rels = [m.release for m in new if m.release is not None]
                     ctx.new_release = max(rels) if rels else None
+                    ctx.identified_by = next(how for (c, how) in classes if c == "new")
+                last = (apps, classes, releases)
                 if apps and len(new) == len(apps) and all(m.state == "started" for m in apps):
                     starts = [m.last_start() for m in apps]
-                    starts = [s for s in starts if s is not None]
+                    starts = [x for x in starts if x is not None]
                     ctx.t0 = max(starts) if starts else self.clock.now()
-                    self.obs.reached_started = True
-                    self.event(f"новая версия started (release {ctx.new_release}), T0={iso(ctx.t0)}")
+                    obs.reached_started = True
+                    obs.wait_result = "reached"
+                    self.event(f"новая версия started (release {ctx.new_release}, опознана: "
+                               f"{ctx.identified_by}), T0={iso(ctx.t0)}")
                     return True
             if self.clock.now() >= deadline:
-                self.obs.timed_out = True
-                self.event("таймаут: новая версия не достигла started")
+                obs.timed_out = True
+                self._conclude_wait_timeout(last, began)
                 return False
             self.clock.sleep(cfg.poll)
+
+    def _conclude_wait_timeout(self, last, began: float) -> None:
+        """FAILED только при положительных доказательствах сбоя; иначе UNKNOWN."""
+        ctx, obs = self.ctx, self.obs
+        if last is None:
+            obs.wait_result = "fly_unavailable"
+            self.event("таймаут: ни одного успешного статуса Fly")
+            return
+        apps, classes, releases = last
+        ev = obs.wait_evidence
+        new = [m for m, (c, _) in zip(apps, classes) if c == "new"]
+        bad_new = [m for m in new if self._bad_state(m, began)]
+        bad_any = [m for m in apps if self._bad_state(m, began)]
+        rel = self._first_release_after_prev(releases)
+        if bad_any:
+            # production не работает — это факт независимо от опознания версии;
+            # откат при этом разрешается только для уверенно опознанной версии
+            if bad_new:
+                ev.append(f"опознанная новая версия ({ctx.identified_by}) не started / crash-loop")
+            else:
+                ev.append("машина не started / crash-loop (версия не опознана — без отката)")
+            if rel is not None and rel.get("Status") == "failed":
+                ev.append(f"релиз v{rel.get('Version')} в статусе failed")
+            if (ctx.deploy_outcome == "failure"
+                    and any(m.digest and m.digest != ctx.prev_digest for m in bad_any)):
+                ev.append("шаг deploy упал, машина на новом образе")
+        if ev:
+            obs.wait_result = "failed_evidence"
+            self.event("таймаут: " + "; ".join(ev))
+        elif new or any(c == "unknown" for c, _ in classes):
+            obs.wait_result = "unidentified"
+            self.event("таймаут: версия не опознана уверенно, признаков сбоя нет — UNKNOWN")
+        else:
+            obs.wait_result = "not_found"
+            self.event("таймаут: наблюдаемая версия на машинах не найдена — UNKNOWN")
 
     # --- Шаг 2: наблюдение
     def _record_log(self, sev: str, cat: str, exc: Optional[str]) -> None:
@@ -789,12 +901,19 @@ class Monitor:
         if o.deploy_not_applied:
             r.append("deploy завершился ошибкой, production остался на предыдущем образе — откат не требуется")
             return FAILED
-        if o.fly_unavailable and not o.reached_started:
-            r.append("Fly.io недоступен — нет достоверных данных")
-            return UNKNOWN
         if not o.reached_started:
-            r.append("новая версия не достигла состояния started за отведённое время")
-            return FAILED
+            if o.wait_result == "failed_evidence":
+                r.append("новая версия не запустилась: " + "; ".join(o.wait_evidence))
+                return FAILED
+            if o.wait_result == "unidentified":
+                r.append("версия не опознана уверенно (нет меток DEPLOY_SHA/GH_SHA, релиз не "
+                         "сопоставлен или раскатана не на все машины), признаков сбоя нет")
+            elif o.wait_result == "not_found":
+                r.append("наблюдаемая версия не найдена на машинах (deploy не применён или "
+                         "вышел другой релиз)")
+            else:
+                r.append("Fly.io недоступен — нет достоверных данных")
+            return UNKNOWN
         if o.fatal:
             r.append("критичные ошибки в логах после T0: " + ", ".join(sorted(o.fatal)))
             return FAILED
@@ -870,8 +989,8 @@ class Monitor:
         if not (ctx.prev_healthy and ctx.prev_image and ctx.prev_digest and ctx.prev_sha
                 and ctx.prev_release is not None):
             deny("предыдущая версия не определена однозначно")
-        if not ctx.new_digest:
-            deny("новая версия не обнаружена на машинах — откатывать нечего")
+        if not ctx.new_digest or not ctx.identified_by:
+            deny("новая версия не опознана уверенно (DEPLOY_SHA/GH_SHA/релиз) — откатывать нельзя")
         elif ctx.new_release is None:
             deny("номер релиза новой версии неизвестен — защита от гонок невозможна")
         if ctx.prev_digest and ctx.new_digest and ctx.prev_digest == ctx.new_digest:
@@ -931,7 +1050,7 @@ class Monitor:
                 snap = snapshot_from_status(self.fly.status())
                 consec_err = 0
                 apps = snap.app_machines
-                on_prev = bool(apps) and all(m.gh_sha == ctx.prev_sha and m.digest == ctx.prev_digest
+                on_prev = bool(apps) and all(m.sha == ctx.prev_sha and m.digest == ctx.prev_digest
                                              for m in apps)
                 started = on_prev and all(m.state == "started" for m in apps)
                 if started and not restored_seen:
@@ -961,12 +1080,15 @@ class Monitor:
         ctx = self.ctx
         if ctx.mode == "monitor-only":
             snap = self._status() or self._status() or self._status()
-            shas = {m.gh_sha for m in snap.app_machines} if snap else set()
-            if snap is None or len(shas) != 1 or not next(iter(shas)):
+            digests = {m.digest for m in snap.app_machines} if snap else set()
+            if snap is None or len(digests) != 1 or not next(iter(digests)):
                 self.verdict_reasons.append("monitor-only: не удалось однозначно определить текущую версию")
                 return self.finish(UNKNOWN)
-            ctx.expected_sha = next(iter(shas))
-            self.event(f"monitor-only: текущая версия {ctx.expected_sha[:7]}")
+            ctx.monitor_digest = next(iter(digests))
+            shas = {m.sha for m in snap.app_machines}
+            ctx.expected_sha = next(iter(shas)) if len(shas) == 1 else ""
+            self.event(f"monitor-only: текущий образ {ctx.monitor_digest[:19]}, "
+                       f"версия {ctx.expected_sha[:7] or 'без метки'}")
         if not self.wait_for_expected_version():
             status = self.verdict()
             if status == FAILED and not self.obs.deploy_not_applied:
@@ -1010,6 +1132,7 @@ class Monitor:
             "mode": ctx.mode,
             "deploy_outcome": ctx.deploy_outcome,
             "new": {"sha": ctx.expected_sha, "release": ctx.new_release,
+                    "identified_by": ctx.identified_by,
                     "digest": ctx.new_digest[:19] if ctx.new_digest else ""},
             "previous": {"sha": ctx.prev_sha, "release": ctx.prev_release,
                          "digest": ctx.prev_digest[:19] if ctx.prev_digest else "",
@@ -1017,7 +1140,8 @@ class Monitor:
             "t0": iso(ctx.t0),
             "reasons": list(self.verdict_reasons),
             "observation": {
-                "reached_started": o.reached_started, "ticks": o.ticks,
+                "reached_started": o.reached_started, "wait_result": o.wait_result,
+                "wait_evidence": list(o.wait_evidence), "ticks": o.ticks,
                 "expected_ticks": o.expected_ticks, "status_coverage": round(o.coverage, 3),
                 "logs_coverage": round(o.logs_coverage, 3), "log_gaps": o.log_gaps,
                 "logs_start_missing": o.logs_start_missing,
@@ -1065,7 +1189,8 @@ def render_markdown(r: dict) -> str:
         f"## Deploy Monitor: **{r['status']}**",
         "",
         f"- Приложение: `{r['app']}`, режим: `{r['mode']}`, шаг deploy: `{r['deploy_outcome']}`",
-        f"- Новая версия: `{(r['new']['sha'] or '-')[:12]}` release `v{r['new']['release']}`",
+        f"- Новая версия: `{(r['new']['sha'] or '-')[:12]}` release `v{r['new']['release']}`, "
+        f"опознана: `{r['new']['identified_by'] or 'нет'}`",
         f"- Предыдущая версия: `{(r['previous']['sha'] or '-')[:12]}` release "
         f"`v{r['previous']['release']}` (однозначна: {'да' if r['previous']['healthy'] else 'нет'})",
         f"- T0 (старт новой версии): {r['t0']}",
@@ -1104,7 +1229,7 @@ def render_markdown(r: dict) -> str:
 
 def capture_prev(fly) -> dict:
     out = {"prev_image": "", "prev_digest": "", "prev_sha": "", "prev_release": "",
-           "prev_healthy": "false", "prev_reason": ""}
+           "prev_healthy": "false", "prev_reason": "", "prev_captured_at": str(int(time.time()))}
     try:
         snap = snapshot_from_status(fly.status())
     except FlyUnavailable:
@@ -1115,14 +1240,14 @@ def capture_prev(fly) -> dict:
         out["prev_reason"] = f"app_machines={len(apps)}"
         return out
     m = apps[0]
-    out.update(prev_image=m.image, prev_digest=m.digest, prev_sha=m.gh_sha,
+    out.update(prev_image=m.image, prev_digest=m.digest, prev_sha=m.sha,
                prev_release=str(m.release or ""))
     if m.state != "started":
         out["prev_reason"] = "not_started"
     elif not m.checks or m.checks_failing:
         out["prev_reason"] = "checks_not_passing"
-    elif not _RE_SHA.match(m.gh_sha or ""):
-        out["prev_reason"] = "no_gh_sha"
+    elif not _RE_SHA.match(m.sha or ""):
+        out["prev_reason"] = "no_version_label"
     elif not m.digest or not m.release:
         out["prev_reason"] = "no_digest_or_release"
     else:
@@ -1148,6 +1273,13 @@ def _default_modules() -> list[str]:
         return []
 
 
+def _float_or_none(v: str) -> Optional[float]:
+    try:
+        return float(v) if v and v.strip() else None
+    except ValueError:
+        return None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deploy Monitor для Fly.io")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1165,6 +1297,7 @@ def main(argv=None) -> int:
     rp.add_argument("--prev-sha", default="")
     rp.add_argument("--prev-release", default="")
     rp.add_argument("--prev-healthy", default="false")
+    rp.add_argument("--prev-captured-at", default="")
     rp.add_argument("--deploy-outcome", default="success")
     rp.add_argument("--report-json", default="deploy-monitor-report.json")
     rp.add_argument("--run-url", default="")
@@ -1198,6 +1331,7 @@ def main(argv=None) -> int:
         prev_image=args.prev_image.strip(), prev_digest=args.prev_digest.strip(),
         prev_sha=args.prev_sha.strip(), prev_release=prev_release,
         prev_healthy=args.prev_healthy.strip().lower() == "true",
+        prev_captured_at=_float_or_none(args.prev_captured_at),
         deploy_outcome=args.deploy_outcome.strip() or "success",
         rollback_enabled=os.environ.get("AUTO_ROLLBACK_ENABLED", "").lower() == "true",
         kill_switch=os.environ.get("AUTO_ROLLBACK_DISABLED", "").lower() == "true",

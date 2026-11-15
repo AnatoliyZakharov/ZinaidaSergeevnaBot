@@ -75,7 +75,8 @@ import json,sys
 d=json.load(sys.stdin); print('app version', d.get('Version'))
 for m in d['Machines']:
     ir=m.get('image_ref') or {}; md=(m.get('config') or {}).get('metadata') or {}
-    print(m['id'], m['state'], 'GH_SHA', (ir.get('labels') or {}).get('GH_SHA','')[:12],
+    lb=ir.get('labels') or {}
+    print(m['id'], m['state'], 'DEPLOY_SHA', lb.get('DEPLOY_SHA','')[:12], 'GH_SHA', lb.get('GH_SHA','')[:12],
           'digest', ir.get('digest','')[:19], 'release', md.get('fly_release_version'),
           'checks', [c.get('status') for c in m.get('checks') or []])"
 flyctl releases --app calendar-bot-anatolii --json --image | python3 -c "
@@ -84,8 +85,9 @@ for r in json.load(sys.stdin)[:3]: print(r['Version'], r['Status'], r['CreatedAt
 ```
 
 Сверка:
-- `HEALTHY` в артефакте → на машинах `GH_SHA` == merge-SHA, digest совпадает с `new.digest`, state `started`, checks `passing`.
-- `ROLLED_BACK` → на машинах `GH_SHA` == `previous.sha`, digest == `previous.digest`, state `started`.
+- Версия на машине = метка `DEPLOY_SHA` (явная, ставит deploy.yml через `--label`), иначе `GH_SHA` (неявная, ставит flyctl в Actions). Если меток нет — сверка по `new.identified_by` из артефакта (`release:vN`: `fly_release_version` машины == N и ImageRef релиза == образу машины).
+- `HEALTHY` в артефакте → версия на машинах == merge-SHA (или релиз совпадает с `new.release`), digest совпадает с `new.digest`, state `started`, checks `passing`.
+- `ROLLED_BACK` → версия на машинах == `previous.sha`, digest == `previous.digest`, state `started`.
 - Любое противоречие артефакта и текущего состояния (например, артефакт `HEALTHY`, а машина на другом образе или checks `critical`) → `UNKNOWN` с описанием противоречия.
 - flyctl недоступен → итог не выше статуса артефакта, но `HEALTHY` допустим только если артефакт `HEALTHY` и run завершён успешно; отметить «перепроверка Fly не выполнена».
 
@@ -108,12 +110,12 @@ for r in json.load(sys.stdin)[:3]: print(r['Version'], r['Status'], r['CreatedAt
 
 - Merge-SHA: <sha 12>; PR: #<N>
 - Deploy run: <url>; conclusion: <success/failure>
-- Новая версия: release v<N>, digest <sha256:12>; T0: <UTC>
+- Новая версия: release v<N>, digest <sha256:12>, опознана: <label:DEPLOY_SHA | label:GH_SHA | release:vN>; T0: <UTC>
 - Предыдущая версия: <sha 12>, release v<N>
 - Наблюдение: <опросов>/<ожидалось>, рестартов после T0: <N>, failing checks: <N>,
   FATAL: <категории или "нет">, ERROR: <категории или "нет">, импорт модулей: <ok/failed/unavailable>
 - Откат: <не требовался / выполнен → результат / запрещён: причины>
-- Перепроверка Fly (read-only): GH_SHA <совпадает/нет>, digest <совпадает/нет>, state <...>, checks <...>
+- Перепроверка Fly (read-only): версия (DEPLOY_SHA/GH_SHA/релиз) <совпадает/нет>, digest <совпадает/нет>, state <...>, checks <...>
 - Incident issue: <ссылка или "нет">
 
 ### Вывод

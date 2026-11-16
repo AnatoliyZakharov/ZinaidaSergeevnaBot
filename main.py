@@ -56,17 +56,51 @@ import mymeet_sync
 from mymeet_sync import sync_to_sheets_async, fetch_workspaces, verify_token_and_get_workspace, MymeetTokenError
 
 # ─── Логирование ─────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# HTTP-клиенты на INFO пишут полный URL запроса, а в URL Telegram Bot API
+# входит токен бота (#33).  Их INFO не нужен — только предупреждения и ошибки.
+_QUIET_HTTP_LOGGERS = ("httpx", "httpcore")
+# Токен бота: <id бота>:<секрет 35 символов>; отдельно или внутри URL
+# («…/bot<id>:<секрет>/…» — перед цифрами буква, поэтому без \b)
+_BOT_TOKEN_RE = re.compile(r"(?:(?<=bot)|(?<![A-Za-z0-9_-]))\d{6,}:[A-Za-z0-9_-]{30,}")
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Маскирует секреты в готовой строке лога — в сообщении, аргументах и
+    traceback (исключения сети могут содержать URL с токеном)."""
+
+    def __init__(self, fmt: str, secrets=()):
+        super().__init__(fmt)
+        # Короткие значения не маскируем: слишком велик риск задеть обычный текст
+        self._secrets = sorted({s for s in secrets if s and len(s) >= 8}, key=len,
+                               reverse=True)
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        for secret in self._secrets:
+            text = text.replace(secret, "<redacted>")
+        return _BOT_TOKEN_RE.sub("<redacted>", text)
+
+
+def _configure_log_security(*secrets) -> None:
+    """INFO HTTP-клиентов выключен; секреты маскируются во всех обработчиках
+    корневого логгера.  Повторный вызов безопасен."""
+    for name in _QUIET_HTTP_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    formatter = _RedactingFormatter(LOG_FORMAT, secrets)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
 
 # ─── Конфиг ──────────────────────────────────────────────────
 TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 YANDEX_API_KEY        = os.environ["YANDEX_API_KEY"]
 YANDEX_FOLDER         = os.environ["YANDEX_FOLDER_ID"]
 YANDEX_TELEMOST_TOKEN = os.environ.get("YANDEX_TELEMOST_TOKEN", "")
+_configure_log_security(TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_TELEMOST_TOKEN,
+                        os.environ.get("GOOGLE_CLIENT_SECRET", ""))
 DEFAULT_TZ            = os.environ.get("TIMEZONE", "Europe/Moscow")
 DEFAULT_WORK_START    = int(os.environ.get("WORK_START", "9"))
 DEFAULT_WORK_END      = int(os.environ.get("WORK_END", "19"))

@@ -764,6 +764,7 @@ def _format_analytics(d: dict, tz_name: str = ANALYTICS_REPORT_TZ) -> str:
     mau = d["mau"]
     lines = ["<b>📊 Аналитика бота</b>", "",
              "Период: последние 30 дней",
+             "Календарные периоды: UTC",
              f"Аналитика собирается с {since}", "",
              "<b>Аудитория</b>",
              f"• DAU: {d['dau']}", f"• WAU: {d['wau']}", f"• MAU: {mau}",

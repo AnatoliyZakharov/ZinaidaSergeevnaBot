@@ -420,6 +420,91 @@ def test_new_users_from_registration_date():
         assert (d["new_users_30d"], d["total_users"]) == (2, 3), d
 
 
+def test_returning_after_cleanup_not_new():
+    """PO #1: впервые активен > 396 дней назад, события очищены, вернулся —
+    не новый пользователь (нет user_started) и не новая когорта retention."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        ns = _main(db, admin=99)
+        t0 = T("2025-01-10 10:00")
+        db.analytics_record(1, "user_started", now=t0)
+        db.analytics_record(1, "user_active", now=t0)
+        db.analytics_record(1, "user_active", now=t0 + DAY)
+        back = t0 + 420 * DAY
+        assert db.analytics_cleanup(now=back) == 3                    # сырые события удалены
+        assert _rows(db, "SELECT first_active_day FROM analytics_users WHERE user_id=1") == [
+            ("2025-01-10",)]                                          # истинная дата цела
+        # Возвращается: пользователя нет в users (писал только текст) — худший случай
+        assert db.get_user(1) is None
+        asyncio.run(ns["_track_activity"](_upd(1, "привет"), None))
+        assert _rows(db, "SELECT COUNT(*) FROM analytics_events WHERE event_type='user_started'"
+                     )[0][0] == 0, "вернувшийся стал «новым»"
+        assert not db.analytics_record(1, "user_started", now=back + 60)
+        # Новый пользователь в тот же день — для сравнения
+        asyncio.run(ns["_track_activity"](_upd(2, "привет"), None))
+        later = datetime.now(timezone.utc).timestamp() + 2 * DAY
+        db.analytics_record(1, "user_active", now=later)              # «D1» от возвращения
+        d = db.analytics_report_data(now=later + DAY)
+        assert d["funnel"][0] == 1                                     # только пользователь 2
+        # Пользователь 1 не образует новую когорту: в D1 только пользователь 2
+        assert d["retention"][1][1] == 1, d["retention"]
+        assert _rows(db, "SELECT first_active_day FROM analytics_users WHERE user_id=1") == [
+            ("2025-01-10",)]
+
+
+def test_first_active_is_minimum_even_out_of_order():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        db.analytics_record(1, "user_active", now=T("2026-03-10 10:00"))
+        db.analytics_record(1, "user_active", now=T("2026-03-05 10:00"))   # позже записано
+        assert _rows(db, "SELECT first_active_day FROM analytics_users") == [("2026-03-05",)]
+
+
+def test_delete_user_removes_first_active():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        db.analytics_record(1, "user_active", now=T("2026-03-10 10:00"))
+        db.analytics_record(2, "user_active", now=T("2026-03-10 10:00"))
+        db.analytics_delete_user(1)
+        assert [r[0] for r in _rows(db, "SELECT user_id FROM analytics_users")] == [2]
+        assert [r[0] for r in _rows(db, "SELECT user_id FROM analytics_events")] == [2]
+
+
+def test_migration_backfills_first_active():
+    """БД с событиями, но без analytics_users (как до исправления) — заполняется
+    минимальной датой; повторная миграция ничего не меняет."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        db.analytics_record(1, "user_active", now=T("2026-03-10 10:00"))
+        db.analytics_record(1, "user_active", now=T("2026-03-12 10:00"))
+        db.analytics_record(1, "tasks_used", now=T("2026-03-01 10:00"))   # не активность
+        c = sqlite3.connect(db.DB_PATH)
+        c.execute("DROP TABLE analytics_users")
+        c.commit()
+        c.close()
+        db.init_db()
+        assert _rows(db, "SELECT user_id, first_active_day FROM analytics_users") == [
+            (1, "2026-03-10")]
+        db.init_db()
+        assert _rows(db, "SELECT COUNT(*) FROM analytics_users")[0][0] == 1
+        assert _rows(db, "SELECT COUNT(*) FROM analytics_events")[0][0] == 3
+
+
+def test_new_users_upper_bound_and_utc_label():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        c = sqlite3.connect(db.DB_PATH)
+        c.executemany("INSERT INTO users (telegram_id, created_at) VALUES (?, ?)",
+                      [(1, "2026-03-20 23:59:59"), (2, "2026-03-21 00:00:00"),
+                       (3, "2027-01-01 00:00:00")])                    # будущие даты
+        c.commit()
+        c.close()
+        d = db.analytics_report_data(now=T("2026-03-20 12:00"))
+        assert d["new_users_30d"] == 1, d
+        text = _main(db)["_format_analytics"](d)
+        assert "Календарные периоды: UTC" in text
+
+
 TESTS = [
     (test_dau_wau_mau_unique_users, "Аналитика: DAU/WAU/MAU — уникальные пользователи"),
     (test_day_and_month_boundaries, "Аналитика: границы суток и месяцев"),
@@ -437,6 +522,13 @@ TESTS = [
     (test_migration_preserves_data_and_start_date, "Аналитика: миграция сохраняет данные"),
     (test_cleanup_and_user_deletion_scope, "Аналитика: очистка и удаление — только события"),
     (test_new_users_from_registration_date, "Аналитика: новые пользователи по регистрации"),
+    (test_returning_after_cleanup_not_new,
+     "Аналитика: вернувшийся после очистки — не новый и не новая когорта"),
+    (test_first_active_is_minimum_even_out_of_order, "Аналитика: дата первой активности — минимум"),
+    (test_delete_user_removes_first_active, "Аналитика: удаление пользователя — и дата первой активности"),
+    (test_migration_backfills_first_active, "Аналитика: миграция заполняет дату первой активности"),
+    (test_new_users_upper_bound_and_utc_label,
+     "Аналитика: верхняя граница новых пользователей, подпись UTC"),
 ]
 
 

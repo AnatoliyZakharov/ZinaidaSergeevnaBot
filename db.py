@@ -144,6 +144,16 @@ def init_db() -> None:
                 ON analytics_events(created_at);
             CREATE INDEX IF NOT EXISTS idx_analytics_user
                 ON analytics_events(user_id, event_type);
+            -- Истинная дата первой активности: не очищается вместе с сырыми
+            -- событиями (иначе после очистки пользователь стал бы «новым»)
+            CREATE TABLE IF NOT EXISTS analytics_users (
+                user_id          INTEGER PRIMARY KEY,   -- = users.telegram_id
+                first_active_day TEXT    NOT NULL,      -- UTC-дата YYYY-MM-DD
+                first_active_ts  REAL    NOT NULL
+            );
+            INSERT OR IGNORE INTO analytics_users (user_id, first_active_day, first_active_ts)
+                SELECT user_id, MIN(day), MIN(created_at) FROM analytics_events
+                WHERE event_type = 'user_active' GROUP BY user_id;
             CREATE TABLE IF NOT EXISTS analytics_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -1016,12 +1026,25 @@ def analytics_record(user_id: int, event_type: str, *, source: Optional[str] = N
     meta = '{"source": "%s"}' % source if source else None
     with _lock:
         conn = _connect()
+        if event_type == "user_started" and conn.execute(
+                "SELECT 1 FROM analytics_users WHERE user_id = ?", (int(user_id),)).fetchone():
+            # уже был активен (возможно, его ранние события удалены очисткой) —
+            # не «новый» пользователь
+            conn.close()
+            return False
         cur = conn.execute(
             "INSERT OR IGNORE INTO analytics_events "
             "(user_id, event_type, created_at, day, metadata, dedup_key) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (int(user_id), event_type, ts, day, meta, dedup),
         )
+        if event_type == "user_active":
+            conn.execute(
+                "INSERT INTO analytics_users (user_id, first_active_day, first_active_ts) "
+                "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "first_active_day = MIN(first_active_day, excluded.first_active_day), "
+                "first_active_ts = MIN(first_active_ts, excluded.first_active_ts)",
+                (int(user_id), day, ts))
         conn.commit()
         added = cur.rowcount == 1
         conn.close()
@@ -1042,7 +1065,8 @@ def analytics_started_at() -> Optional[float]:
 
 def analytics_cleanup(now: Optional[float] = None,
                       days: int = ANALYTICS_RETENTION_DAYS) -> int:
-    """Удаляет сырые события старше days.  Только analytics_events."""
+    """Удаляет сырые события старше days.  Только analytics_events:
+    analytics_users (дата первой активности) сохраняется."""
     cutoff = (time.time() if now is None else float(now)) - days * 86400
     with _lock:
         conn = _connect()
@@ -1054,12 +1078,14 @@ def analytics_cleanup(now: Optional[float] = None,
 
 
 def analytics_delete_user(user_id: int) -> int:
-    """Удаляет все аналитические события пользователя (при удалении его данных)."""
+    """Удаляет все аналитические данные пользователя (при удалении его данных):
+    события и дату первой активности.  Возвращает число удалённых событий."""
     with _lock:
         conn = _connect()
         cur = conn.execute("DELETE FROM analytics_events WHERE user_id = ?", (int(user_id),))
-        conn.commit()
         n = cur.rowcount
+        conn.execute("DELETE FROM analytics_users WHERE user_id = ?", (int(user_id),))
+        conn.commit()
         conn.close()
     return n
 
@@ -1094,11 +1120,12 @@ def analytics_report_data(now: Optional[float] = None) -> dict:
 
         dau, wau, mau = uniq("user_active", today), uniq("user_active", d7), uniq("user_active", d30)
         features = {e: uniq(e, d30) for e in ("tasks_used", "mymeet_used", "connect_completed")}
-        new_users = q("SELECT COUNT(*) FROM users WHERE created_at >= ?",
-                      (d30 + " 00:00:00",)).fetchone()[0]
+        new_users = q("SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?",
+                      (d30 + " 00:00:00", _shift_day(today, 1) + " 00:00:00")).fetchone()[0]
         total_users = q("SELECT COUNT(*) FROM users").fetchone()[0]
         active_days = q("SELECT user_id, day FROM analytics_events "
                         "WHERE event_type = 'user_active'").fetchall()
+        first_active = dict(q("SELECT user_id, first_active_day FROM analytics_users"))
         firsts = {}
         for et in ("user_started", "connect_started", "connect_completed", "first_value"):
             firsts[et] = {}
@@ -1111,11 +1138,16 @@ def analytics_report_data(now: Optional[float] = None) -> dict:
     days_by_user: dict = {}
     for uid, day in active_days:
         days_by_user.setdefault(uid, set()).add(day)
+    # Когорта — истинная дата первой активности (analytics_users).  Когорты,
+    # чьи события уже могли быть удалены очисткой, в расчёт не входят.
+    oldest_kept = _shift_day(today, -ANALYTICS_RETENTION_DAYS + 1)
     retention = {}
     for n in (1, 7, 30):
         cohort = returned = 0
-        for days in days_by_user.values():
-            first = min(days)
+        for uid, first in first_active.items():
+            if first < oldest_kept:
+                continue
+            days = days_by_user.get(uid, set())
             target = _shift_day(first, n)
             if target < today:                 # день когорта+n полностью завершён
                 cohort += 1

@@ -314,12 +314,13 @@ def test_missed_evening_and_first_run():
           "last_success_ts": datetime(2026, 11, 15, 19, 0, tzinfo=MSK).timestamp()}
     assert ms.auto_due(st, morning, morning.timestamp()) == "2026-11-17"
     days, trunc = ms.auto_window_days(st, morning.timestamp())
-    assert days == 5 and not trunc, days                      # 2.6 дня → 3 + запас 2
+    assert days == 6 and not trunc, days                      # 2.6 дня → 3 + запас 3
     assert ms.auto_due(None, morning, morning.timestamp()) == "2026-11-17"  # без истории
     assert ms.auto_window_days(None, morning.timestamp()) == (ms.AUTO_INITIAL_DAYS, False)
-    # Обычный вечер: окно не меньше 3 дней (задержанные протоколы)
+    # Обычный вечер: от прошлого успеха минус 3 дня (задержанные протоколы)
     ts = time.time()
-    assert ms.auto_window_days({"last_success_ts": ts - 86400}, ts) == (3, False)
+    assert ms.auto_window_days({"last_success_ts": ts - 86400}, ts) == (4, False)
+    assert ms.auto_window_days({"last_success_ts": ts - 60}, ts) == (4, False)
     # Долгий простой: окно ограничено
     days, trunc = ms.auto_window_days({"last_success_ts": ts - 40 * 86400}, ts)
     assert days == ms.AUTO_MAX_DAYS and trunc
@@ -552,6 +553,38 @@ def test_existing_rows_without_registry_not_duplicated():
         assert env.book().task_rows() == [("Старый лист", "Отчёт", ME, "Выполнено")]
 
 
+def test_sheet_name_collision_keeps_all_rows():
+    """QA B-1: «Синк 1:1» и «Синк 1/1» → один лист «Синк 1-1»; ни одна строка
+    не затирается, № продолжаются, повтор без дублей.  Также регулярная
+    встреча с именем листа разовых встреч."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        n = _now()
+        env.books["sheet-1"] = Book({"Синк 1-1": [
+            PROTO_HDR, ["1", "01.01.2024", "old", ME, "", "В работе", "m-old"]]})
+        env.mm.add("a1", "Синк 1:1", n - timedelta(hours=5), [("A1", ME, False)])
+        env.mm.add("a2", "Синк 1:1", n - timedelta(hours=4), [("A2", ME, False)])
+        env.mm.add("b1", "Синк 1/1", n - timedelta(hours=3), [("B1", ME, False)])
+        env.mm.add("b2", "Синк 1/1", n - timedelta(hours=2), [("B2", ME, False)])
+        name = env.ms.ONE_TIME_SHEET_NAME
+        env.mm.add("r1", name, n - timedelta(hours=6), [("R1", ME, False)])
+        env.mm.add("r2", name, n - timedelta(hours=1), [("R2", ME, False)])
+        env.mm.add("o1", "Разовая", n - timedelta(hours=1), [("O1", ME, False)])
+        for _ in range(2):
+            env.force_due()
+            env.tick()
+            assert env.db.mymeet_sync_get(1)["last_outcome"] == "ok"
+        b = env.book()
+        sync = [r[1] for r in b.task_rows("Синк 1-1")]
+        assert sorted(sync) == ["A1", "A2", "B1", "B2", "old"], b.data["Синк 1-1"]
+        nums = [r[0] for r in b.data["Синк 1-1"][1:]]
+        assert nums == ["1", 2, 3, 4, 5] or [str(x) for x in nums] == ["1", "2", "3", "4", "5"], nums
+        ot = sorted(r[1] for r in b.task_rows(name))
+        assert ot == ["O1", "R1", "R2"], b.data[name]
+        made = [c.kwargs.get("title") for c in b.ss.add_worksheet.call_args_list]
+        assert made.count(name) == 1 and "Синк 1-1" not in made, made
+
+
 def test_volume_guard_writes_nothing():
     with tempfile.TemporaryDirectory() as tmp:
         env = Env(tmp)
@@ -665,6 +698,7 @@ TESTS = [
      "MYmeet авто: удалённая/перенесённая строка не возвращается"),
     (test_existing_rows_without_registry_not_duplicated,
      "MYmeet авто: старые строки (до реестра) не дублируются"),
+    (test_sheet_name_collision_keeps_all_rows, "MYmeet авто: одно имя листа у разных встреч"),
     (test_volume_guard_writes_nothing, "MYmeet авто: лимит объёма — ничего не записано"),
     (test_dedup_read_failure_writes_nothing, "MYmeet авто: нет чтения листов — нет записи"),
     (test_parallel_jobs_serialized_by_user_lock, "MYmeet авто: параллельные задания по очереди"),

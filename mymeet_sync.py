@@ -104,6 +104,13 @@ _WRITE_MAX     = 50     # requests per window (keep some head-room)
 _write_times: list = [] # timestamps of recent writes (module-level, single-threaded)
 
 
+def _err_brief(e: BaseException) -> str:
+    """Для логов: тип исключения и HTTP-статус — без текста (в нём бывают
+    названия листов с ФИО и фрагменты данных)."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__}" + (f" HTTP {code}" if code else "")
+
+
 def _throttle():
     """Block until another write is allowed by the rate limit."""
     now = time.monotonic()
@@ -276,7 +283,7 @@ def _apply_full_format(
         _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
         msg = f"batch_update: {e}"
-        logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         fmt_warnings.append(msg)
 
     # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
@@ -294,7 +301,7 @@ def _apply_full_format(
             }]})
         except Exception as e:
             msg = f"auto-resize: {e}"
-            logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             fmt_warnings.append(msg)
     return fmt_warnings
 
@@ -1039,7 +1046,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             }]})
         except Exception as e:
             msg = f"{title} (защита листа): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
     all_data = [MY_TASKS_HEADER_ROW_V2 if editable else MY_TASKS_HEADER_ROW] + rows
@@ -1058,7 +1065,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
                 _my_tasks_link_request(ws.id, rows, link_spans)]})
         except Exception as e:
             msg = f"{title} (ссылки на письма): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     # Clear leftovers of a previous (longer) run only after a successful write.
     if cur_rows > need_rows:
@@ -1066,7 +1073,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             _gs_call(ws.batch_clear, [f"A{need_rows + 1}:H{cur_rows}"])
         except Exception as e:
             msg = f"{title} (очистка старых строк): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
     warnings.extend(_apply_full_format(
@@ -1091,7 +1098,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
         }]})
     except Exception as e:
         msg = f"{title} (фильтр): {e}"
-        logger.warning("Sheet formatting error (%s): %s", title, msg)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         warnings.append(msg)
     return ws
 
@@ -1264,7 +1271,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                     warnings.append(f"{my_title} (защита листа): {e}")
             except Exception as e:
                 msg = f"{my_title}: {e}"
-                logger.warning("Sheet formatting error (%s): %s", my_title, msg)
+                logger.warning("Sheet formatting error: %s", _err_brief(e))
                 warnings.append(msg)
 
     if color_targets:
@@ -1272,7 +1279,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
             _ensure_status_colors(spreadsheet, meta, color_targets)
         except Exception as e:
             msg = f"цвета статусов: {e}"
-            logger.warning("Sheet formatting error (status colors): %s", msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     return warnings, my_count, my_title
 
@@ -1345,9 +1352,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         name = (m.get("name") or m.get("title") or m.get("meetingName") or "Без названия").strip()
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
         protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
-        if protocol is None:
-            st["protocols_missing"] += 1   # ещё не готов (404) — догонится позже
         return {
+            "missing": protocol is None,   # ещё не готов (404) — догонится позже
             "id":    mid,
             "name":  name,
             "date":  _fmt_date(date),
@@ -1359,7 +1365,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
         for fut in as_completed(futures):
             try:
-                all_meetings.append(fut.result())
+                res_m = fut.result()
+                if res_m.pop("missing", False):
+                    st["protocols_missing"] += 1
+                all_meetings.append(res_m)
             except Exception as e:
                 st["protocols_failed"] += 1
                 logger.warning("Protocol fetch error: %s", type(e).__name__)
@@ -1409,8 +1418,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                 reg_known = registry.known(candidate_keys)
                 st["skipped_known"] = len(reg_known - known_keys)
                 known_keys |= reg_known
-    # Отложенные записи append-режима: (sheet_name, ws|None, existing, rows)
-    pending_recurring: list = []
+    # Отложенные записи append-режима: sheet_name -> [ws|None, existing, start_row, rows].
+    # Разные названия встреч могут дать одно имя листа (_safe_sheet_name) —
+    # тогда строки копятся в одной записи плана, а не перетирают друг друга.
+    pending_recurring: dict = {}
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
@@ -1470,17 +1481,22 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         else:
             # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
             # existing rows on repeated daily runs; preserve manually-changed statuses.
-            existing = _gs_call(ws.get_all_values) if ws is not None else []
-            ex_keys  = (_existing_keys(existing) if existing else set()) | known_keys
+            if sheet_name in pending_recurring:
+                ws, existing, start_row, rows = pending_recurring[sheet_name]
+            else:
+                existing = _gs_call(ws.get_all_values) if ws is not None else []
+                start_row = (len(existing) + 1) if existing else 2
+                rows = []
+                pending_recurring[sheet_name] = [ws, existing, start_row, rows]
+            planned = [[str(c) for c in r] for r in rows]
+            ex_keys  = ((_existing_keys(existing) if existing else set())
+                        | _existing_keys([[]] + planned) | known_keys)
 
             # Determine next sequential №
             last_num = 0
-            for row in (existing[1:] if existing else []):
+            for row in (existing[1:] if existing else []) + planned:
                 if row and str(row[0]).strip().isdigit():
                     last_num = max(last_num, int(row[0]))
-
-            start_row = (len(existing) + 1) if existing else 2
-            rows = []
             idx  = last_num + 1
             seen_in_run_app: set[str] = set()
             for m in sorted(meetings, key=lambda x: x["date"]):
@@ -1503,8 +1519,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     ])
                     idx += 1
 
-            pending_recurring.append((sheet_name, ws, existing, start_row, rows))
-            continue   # запись — после планирования всех листов
+            continue   # запись — после планирования всех листов (rows уже в плане)
         sheets_written += 1
         # No explicit sleep — rate limiter in _gs_call handles quota
 
@@ -1539,6 +1554,15 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             _k = _task_key(_row)
             if _k and len(_row) >= 6 and str(_row[5]).strip():
                 manual_statuses_ot[_k] = str(_row[5]).strip()
+    elif ot_name in pending_recurring:
+        # Регулярная встреча с именем листа разовых: пишем после её строк
+        _pw, _pex, _ps, _prows = pending_recurring[ot_name]
+        existing_ot = ([list(r) for r in _pex] if _pex else [list(HEADER_ROW)]) + \
+            [[str(c) for c in r] for r in _prows]
+        manual_statuses_ot = {}
+        new_sheet  = False
+        start_row = len(existing_ot) + 1
+        start_idx = start_row
     else:
         existing_ot = _gs_call(ws.get_all_values) if ws is not None else []
         manual_statuses_ot = {}
@@ -1611,13 +1635,13 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     if append:
         # ── Проверка объёма до первой записи ────────────────────────────────
-        new_rows = (sum(len(p[4]) for p in pending_recurring)
+        new_rows = (sum(len(p[3]) for p in pending_recurring.values())
                     + sum(1 for r in all_rows if isinstance(r[0], int)))
         st["new_rows"] = new_rows
         limit = cfg.get("max_new_rows")
         if limit is not None and new_rows > int(limit):
             raise ImportVolumeError(new_rows, int(limit))
-        for sheet_name, rws, existing, start_row_r, rows in pending_recurring:
+        for sheet_name, (rws, existing, start_row_r, rows) in pending_recurring.items():
             if rws is None:
                 rws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
             if not existing:
@@ -1630,7 +1654,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             all_fmt_warnings.extend(_apply_full_format(spreadsheet, rws, data_rows=total_data_rows))
             sheets_written += 1
         if ws is None:
-            ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
+            try:   # мог быть создан выше как лист регулярной встречи
+                ws = _gs_call(spreadsheet.worksheet, ot_name)
+            except gspread.WorksheetNotFound:
+                ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
     if new_sheet:
         write_data = [HEADER_ROW] + all_rows
@@ -1672,7 +1699,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
         except Exception as e:
-            logger.warning("Sheet formatting error (grouper rows): %s", e)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
 
     # Все записи прошли — запоминаем импортированные ключи (повтор не создаст
     # дублей, даже если строку удалят или перенесут вручную).
@@ -1693,7 +1720,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             spreadsheet, full_name, rows_builder=cfg.get("my_tasks_builder"))
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
-        logger.warning("Sheet formatting error (Мои задачи / цвета): %s", e)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         all_fmt_warnings.append(f"Мои задачи / цвета статусов: {e}")
     if not full_name:
         my_tasks_line = (f"\n👤 Лист «{MY_TASKS_SHEET_PREFIX}ФИО» не создан. "
@@ -1752,9 +1779,11 @@ def _all_protocol_keys(spreadsheet) -> set:
     titles = [t for t in titles if t and not _is_my_tasks_title(t)]
     if not titles:
         return set()
-    resp = _gs_call(spreadsheet.values_batch_get,
-                    [_quote_sheet_title(t) + "!A:G" for t in titles])
-    vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+    vranges: list = []
+    for i in range(0, len(titles), 20):   # GET-запрос: не раздуваем URL
+        resp = _gs_call(spreadsheet.values_batch_get,
+                        [_quote_sheet_title(t) + "!A:G" for t in titles[i:i + 20]])
+        vranges += (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
     keys: set = set()
     for vr in vranges:
         rows = (vr or {}).get("values") or []
@@ -1787,7 +1816,7 @@ class ImportRegistry:
 
 
 AUTO_HOUR = 19                     # слот автоимпорта — 19:00 по поясу пользователя
-AUTO_LOOKBACK_DAYS = 3             # всегда пересматриваем 3 дня: протоколы с задержкой
+AUTO_LOOKBACK_DAYS = 3             # окно начинается за 3 дня до прошлого успеха: протоколы с задержкой
 AUTO_INITIAL_DAYS = 7              # первый запуск без истории
 AUTO_MAX_DAYS = 14                 # потолок догона после простоя
 AUTO_MAX_NEW_ROWS = 300            # больше — стоп без записи, уведомление
@@ -1834,7 +1863,7 @@ def auto_window_days(state: dict | None, now_ts: float) -> tuple:
     if not last:
         return AUTO_INITIAL_DAYS, False
     gap_days = max(0.0, now_ts - float(last)) / 86400
-    want = math.ceil(gap_days) + AUTO_LOOKBACK_DAYS - 1
+    want = math.ceil(gap_days) + AUTO_LOOKBACK_DAYS   # от прошлого успеха минус 3 дня
     days = max(AUTO_LOOKBACK_DAYS, want)
     return min(days, AUTO_MAX_DAYS), days > AUTO_MAX_DAYS
 

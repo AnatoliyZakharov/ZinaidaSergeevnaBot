@@ -120,16 +120,19 @@ def test_warnings_and_tracebacks_redacted():
 
 def test_other_secrets_and_unknown_tokens_masked():
     ns = _load_log_config()
-    token, other = _fake_token(), _fake_token()
+    token, other, other2 = _fake_token(), _fake_token(), _fake_token()
     api_key = "AQVN" + secrets.token_urlsafe(24)
     with _Capture() as cap:
         ns["_configure_log_security"](token, api_key, "", "short")
         lg = logging.getLogger("t33")
         lg.info("key=%s", api_key)
         lg.info("чужой токен %s", other)                     # не передан — по шаблону
+        lg.info("url https://api.telegram.org/bot%s/getMe", other2)   # внутри URL
+        lg.info("file https://api.telegram.org/file/bot%s/v.oga", other2)
         lg.info("Встреча в 10:30, id 12345, short слово")    # обычный текст не трогаем
     out = cap.text
     assert api_key not in out and other not in out, out
+    assert other2.split(":")[1] not in out and out.count("bot<redacted>") == 2, out
     assert "Встреча в 10:30, id 12345, short слово" in out, out
 
 

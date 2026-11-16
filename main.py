@@ -63,8 +63,9 @@ logger = logging.getLogger(__name__)
 # HTTP-клиенты на INFO пишут полный URL запроса, а в URL Telegram Bot API
 # входит токен бота (#33).  Их INFO не нужен — только предупреждения и ошибки.
 _QUIET_HTTP_LOGGERS = ("httpx", "httpcore")
-# Токен бота: <id бота>:<секрет 35 символов> (в URL — после «bot»)
-_BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}")
+# Токен бота: <id бота>:<секрет 35 символов>; отдельно или внутри URL
+# («…/bot<id>:<секрет>/…» — перед цифрами буква, поэтому без \b)
+_BOT_TOKEN_RE = re.compile(r"(?:(?<=bot)|(?<![A-Za-z0-9_-]))\d{6,}:[A-Za-z0-9_-]{30,}")
 
 
 class _RedactingFormatter(logging.Formatter):
@@ -98,7 +99,8 @@ TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 YANDEX_API_KEY        = os.environ["YANDEX_API_KEY"]
 YANDEX_FOLDER         = os.environ["YANDEX_FOLDER_ID"]
 YANDEX_TELEMOST_TOKEN = os.environ.get("YANDEX_TELEMOST_TOKEN", "")
-_configure_log_security(TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_TELEMOST_TOKEN)
+_configure_log_security(TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_TELEMOST_TOKEN,
+                        os.environ.get("GOOGLE_CLIENT_SECRET", ""))
 DEFAULT_TZ            = os.environ.get("TIMEZONE", "Europe/Moscow")
 DEFAULT_WORK_START    = int(os.environ.get("WORK_START", "9"))
 DEFAULT_WORK_END      = int(os.environ.get("WORK_END", "19"))

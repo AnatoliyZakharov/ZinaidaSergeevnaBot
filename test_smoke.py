@@ -1609,6 +1609,9 @@ if __name__ == "__main__":
     # issue #33: токен бота не попадает в логи (httpx INFO, traceback)
     from test_log_security import TESTS as _LOG_SECURITY_TESTS
     tests += _LOG_SECURITY_TESTS
+    # issue #46: продуктовая аналитика /analytics
+    from test_analytics import TESTS as _ANALYTICS_TESTS
+    tests += _ANALYTICS_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

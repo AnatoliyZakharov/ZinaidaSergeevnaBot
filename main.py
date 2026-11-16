@@ -39,7 +39,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler,
+    filters, ContextTypes, CallbackQueryHandler, TypeHandler,
 )
 from telegram.request import HTTPXRequest
 
@@ -102,6 +102,18 @@ YANDEX_TELEMOST_TOKEN = os.environ.get("YANDEX_TELEMOST_TOKEN", "")
 _configure_log_security(TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_TELEMOST_TOKEN,
                         os.environ.get("GOOGLE_CLIENT_SECRET", ""))
 DEFAULT_TZ            = os.environ.get("TIMEZONE", "Europe/Moscow")
+
+
+def _parse_admin_id(raw: str | None) -> int | None:
+    """Telegram user ID администратора (только число; username не используется)."""
+    try:
+        v = int(str(raw or "").strip())
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+ADMIN_TELEGRAM_ID = _parse_admin_id(os.environ.get("ADMIN_TELEGRAM_ID"))
 DEFAULT_WORK_START    = int(os.environ.get("WORK_START", "9"))
 DEFAULT_WORK_END      = int(os.environ.get("WORK_END", "19"))
 WEBHOOK_HOST          = os.environ.get("WEBHOOK_HOST", "")   # напр. https://bot.example.com
@@ -643,6 +655,7 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
             None, lambda: create_calendar_event(telegram_id, title, dt, duration, telemost_link)
         )
         event_id = created["id"]
+        _track(telegram_id, "first_value", source="calendar_event")
         tz = pytz.timezone(tz_name)
         if dt.tzinfo is None:
             dt = tz.localize(dt)
@@ -676,6 +689,138 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
 
 
 # ─── Handlers ────────────────────────────────────────────────
+
+# ─── Продуктовая аналитика (#46) ─────────────────────────────
+# События пишутся только из обработчиков действий пользователя.  Фоновые
+# задания (scheduler, автоимпорт, сверка), health check и Deploy Monitor
+# функции _track не вызывают.  Ошибка аналитики не ломает команду.
+
+ANALYTICS_EXCLUDED_COMMANDS = ("analytics",)
+ANALYTICS_REPORT_TZ = DEFAULT_TZ
+
+
+def _track(user_id, event_type: str, source: str | None = None) -> None:
+    try:
+        db.analytics_record(user_id, event_type, source=source)
+    except Exception as e:
+        logger.warning("analytics: запись события не удалась: %s", type(e).__name__)
+
+
+def _is_excluded_command(update: Update) -> bool:
+    msg = update.effective_message
+    text = (getattr(msg, "text", None) or "") if msg is not None else ""
+    if not text.startswith("/"):
+        return False
+    cmd = text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower() if len(text) > 1 else ""
+    return cmd in ANALYTICS_EXCLUDED_COMMANDS
+
+
+async def _track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Группа -1: на каждое сообщение / нажатие кнопки пользователя —
+    user_active (не чаще раза в день) и user_started для нового пользователя.
+    /analytics не считается.  Никогда не прерывает обработку."""
+    try:
+        user = update.effective_user
+        if user is None or user.is_bot:
+            return
+        if update.message is None and update.callback_query is None:
+            return
+        if _is_excluded_command(update):
+            return
+        if db.get_user(user.id) is None:
+            _track(user.id, "user_started")
+        _track(user.id, "user_active")
+    except Exception as e:
+        logger.warning("analytics: учёт активности не удался: %s", type(e).__name__)
+
+
+def _ru_users(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        w = "пользователь"
+    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        w = "пользователя"
+    else:
+        w = "пользователей"
+    return f"{n} {w}"
+
+
+def _pct(num: int, den: int, digits: int = 1) -> str:
+    if not den:
+        return "н/д"
+    v = round(num * 100 / den, digits)
+    s = f"{v:.{digits}f}" if digits else f"{int(v)}"
+    return s.replace(".", ",") + "%"
+
+
+def _format_analytics(d: dict, tz_name: str = ANALYTICS_REPORT_TZ) -> str:
+    """Текстовый отчёт /analytics (HTML; только числа и фиксированные подписи)."""
+    try:
+        tz = pytz.timezone(tz_name)
+    except Exception:
+        tz = pytz.timezone("Europe/Moscow")
+    started = d.get("started_at")
+    since = (datetime.fromtimestamp(started, tz).strftime("%d.%m.%Y")
+             if started else "—")
+    mau = d["mau"]
+    lines = ["<b>📊 Аналитика бота</b>", "",
+             "Период: последние 30 дней",
+             "Календарные периоды: UTC",
+             f"Аналитика собирается с {since}", "",
+             "<b>Аудитория</b>",
+             f"• DAU: {d['dau']}", f"• WAU: {d['wau']}", f"• MAU: {mau}",
+             f"• DAU/MAU: {_pct(d['dau'], mau)}",
+             f"• Новые пользователи за 30 дней: {d['new_users_30d']} "
+             f"(по дате регистрации; всего {d['total_users']})", "",
+             "<b>Удержание</b>"]
+    for n in (1, 7, 30):
+        ret, cohort = d["retention"][n]
+        val = (f"{_pct(ret, cohort, 0)} ({ret} из {cohort})" if cohort
+               else "недостаточно данных")
+        lines.append(f"• D{n} retention: {val}")
+    f = d["features"]
+    lines += ["", "<b>Популярные функции</b> (30 дней, доля от MAU)"]
+    for key, label in (("tasks_used", "Задачи"), ("mymeet_used", "MYmeet"),
+                       ("connect_completed", "Google Connect")):
+        lines.append(f"• {label}: {_ru_users(f[key])} ({_pct(f[key], mau)})")
+    steps = d["funnel"]
+    labels = ("Начали", "Запустили /connect", "Успешно подключили Google",
+              "Совершили первое полезное действие")
+    lines += ["", "<b>Воронка подключения</b> (пришли за 30 дней)"]
+    for i, (label, n) in enumerate(zip(labels, steps)):
+        if i == 0:
+            lines.append(f"• {label}: {n}")
+        else:
+            lines.append(f"• {label}: {n} — от предыдущего {_pct(n, steps[i - 1])}, "
+                         f"от начала {_pct(n, steps[0])}")
+    if d.get("funnel_recent"):
+        lines.append(f"<i>Из них {d['funnel_recent']} пришли менее 7 дней назад — "
+                     f"наблюдение неполное</i>")
+    return "\n".join(lines)
+
+
+async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/analytics — продуктовая аналитика, только для ADMIN_TELEGRAM_ID."""
+    user = update.effective_user
+    if ADMIN_TELEGRAM_ID is None or user is None or user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Команда недоступна")
+        return
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, db.analytics_report_data)
+    except Exception as e:
+        logger.error("analytics report failed: %s", type(e).__name__)
+        await update.message.reply_text("⚠️ Не удалось построить отчёт. Попробуйте позже.")
+        return
+    await update.message.reply_text(_format_analytics(data), parse_mode="HTML")
+
+
+async def scheduled_analytics_cleanup():
+    """Раз в сутки: удаляем сырые события аналитики старше 13 месяцев."""
+    try:
+        n = await asyncio.get_event_loop().run_in_executor(None, db.analytics_cleanup)
+        logger.info("analytics cleanup: удалено событий %d", n)
+    except Exception as e:
+        logger.warning("analytics cleanup failed: %s", type(e).__name__)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
@@ -711,6 +856,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     db.upsert_user(telegram_id, update.effective_user.username)
+    _track(telegram_id, "connect_started")
 
     url = auth.get_auth_url(telegram_id)
     keyboard = InlineKeyboardMarkup([[
@@ -1069,6 +1215,7 @@ async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         telegram_id = update.effective_user.id
         db.upsert_user(telegram_id, update.effective_user.username)
+        _track(telegram_id, "mymeet_used", source="setup_mymeet")
         db.reset_mymeet_config(telegram_id)
         db.set_mymeet_setup_in_progress(telegram_id, True)
         context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
@@ -1461,6 +1608,7 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Запусти: /setup_mymeet"
             )
             return
+        _track(telegram_id, "mymeet_used", source="sync_mymeet")
 
         # Fetch GCal organizer data -- abort sync if GCal unavailable
         gcal_data_1d = await asyncio.get_event_loop().run_in_executor(
@@ -1479,6 +1627,7 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             async with _user_lock(telegram_id):
                 result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
+            _track(telegram_id, "first_value", source="sync_mymeet")
             await msg.edit_text(result)
         except Exception as e:
             logger.error("MYmeet sync error: %s", e, exc_info=True)
@@ -1509,6 +1658,7 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Запусти: /setup_mymeet"
             )
             return
+        _track(telegram_id, "mymeet_used", source="sync_mymeet_full")
 
         # Парсим аргумент — количество дней
         days = 30
@@ -1735,6 +1885,7 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("😔 Не удалось сохранить задачу. Попробуй ещё раз.")
         return
     db.log_event(telegram_id, "my_task_forward")
+    _track(telegram_id, "tasks_used", source="forward")
     if info["album"] and not created:
         return          # другая часть того же альбома — задача уже есть
     title = info["title"] if len(info["title"]) <= 120 else info["title"][:117] + "…"
@@ -1786,10 +1937,12 @@ async def cmd_sync_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_google_connected(telegram_id):
         await update.message.reply_text("🔑 Сначала подключи Google: /connect")
         return
+    _track(telegram_id, "tasks_used", source="sync_tasks")
     msg = await update.message.reply_text("⏳ Синхронизирую Google Tasks ↔ «Мои задачи»...")
     try:
         res = await _run_my_tasks_sync(telegram_id, with_gtasks=True)
         if res["outcome"] == my_tasks.OUT_OK:
+            _track(telegram_id, "first_value", source="sync_tasks")
             slot = my_tasks.daily_slot(datetime.now(timezone.utc).astimezone(_tz(user)))
             db.my_tasks_sync_save(telegram_id, last_success_slot=slot, fail_count=0,
                                   next_attempt_ts=0, last_outcome=res["outcome"])
@@ -1874,6 +2027,7 @@ async def oauth_callback(request: web.Request) -> web.Response:
         )
 
     telegram_id, granted = result
+    _track(telegram_id, "connect_completed")
     text = _oauth_granted_text(granted)
     # Уведомляем пользователя в Telegram (обычный текст, без Markdown)
     if _bot:
@@ -1972,6 +2126,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_google_connected(telegram_id):
         await update.message.reply_text("🔑 Сначала подключи Google: /connect")
         return
+    _track(telegram_id, "tasks_used", source="tasks")   # как в /sync_tasks: после проверки Google
 
     tasks, err = await asyncio.get_event_loop().run_in_executor(
         None, lambda: gtasks.list_all_tasks(telegram_id)
@@ -1984,6 +2139,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["tasks"] = tasks
     await update.message.reply_text(_format_tasks(tasks), parse_mode="MarkdownV2")
+    _track(telegram_id, "first_value", source="tasks")
 
 
 async def cmd_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2059,6 +2215,8 @@ async def run_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
     _bot = app.bot
 
+    # Аналитика (#46): группа -1 — раньше всех обработчиков, обработку не прерывает
+    app.add_handler(TypeHandler(Update, _track_activity), group=-1)
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("connect",      cmd_connect))
     app.add_handler(CommandHandler("disconnect",   cmd_disconnect))
@@ -2070,6 +2228,7 @@ async def run_bot():
     app.add_handler(CommandHandler("add_contact",  cmd_add_contact))
     app.add_handler(CommandHandler("del_contact",  cmd_del_contact))
     app.add_handler(CommandHandler("tasks",         cmd_tasks))
+    app.add_handler(CommandHandler("analytics",     cmd_analytics))
     app.add_handler(CommandHandler("sync_tasks",    cmd_sync_tasks))
     app.add_handler(CommandHandler("sync_mymeet",      cmd_sync_mymeet))
     app.add_handler(CommandHandler("sync_mymeet_full", cmd_sync_mymeet_full))
@@ -2130,6 +2289,15 @@ async def run_bot():
         replace_existing=True,
         max_instances=1,      # тики не накладываются друг на друга
         coalesce=True,
+        timezone="UTC",
+    )
+    scheduler.add_job(
+        scheduled_analytics_cleanup,
+        "cron",
+        hour=3,
+        minute=30,
+        id="analytics_cleanup",
+        replace_existing=True,
         timezone="UTC",
     )
     scheduler.start()

@@ -109,6 +109,31 @@ def init_db() -> None:
                 telegram_id     INTEGER PRIMARY KEY,
                 last_daily_date TEXT
             );
+
+            -- Ежедневный автоимпорт MYmeet (19:00 по поясу пользователя)
+            CREATE TABLE IF NOT EXISTS mymeet_sync_state (
+                telegram_id       INTEGER PRIMARY KEY,
+                last_success_slot TEXT,     -- дата вечера, импортированного полностью
+                last_success_ts   REAL,     -- момент, до которого окно покрыто
+                attempt_slot      TEXT,
+                slot_attempts     INTEGER DEFAULT 0,
+                fail_count        INTEGER DEFAULT 0,
+                next_attempt_ts   REAL,
+                last_attempt_ts   REAL,
+                last_outcome      TEXT,
+                last_reason       TEXT,     -- код причины, без деталей
+                notified_reason   TEXT,
+                notified_ts       REAL
+            );
+
+            -- Задачи MYmeet, уже импортированные в таблицу: только sha256 ключа
+            -- (таблица|встреча|дата|задача|ответственный) — без содержимого.
+            CREATE TABLE IF NOT EXISTS mymeet_imported (
+                telegram_id   INTEGER NOT NULL,
+                key_hash      TEXT    NOT NULL,
+                first_seen_ts REAL    DEFAULT (unixepoch()),
+                PRIMARY KEY (telegram_id, key_hash)
+            );
         """)
         conn.commit()
         # Миграция: добавляем MYmeet-поля если их ещё нет
@@ -845,6 +870,91 @@ def my_tasks_sync_save(telegram_id: int, **fields) -> None:
             f"ON CONFLICT(telegram_id) DO UPDATE SET "
             + ", ".join(f"{c} = excluded.{c}" for c in cols),
             [telegram_id] + [fields[c] for c in cols],
+        )
+        conn.commit()
+        conn.close()
+
+
+# ─── Автоимпорт MYmeet: состояние и реестр ───────────────────
+
+_MYMEET_STATE_FIELDS = ("last_success_slot", "last_success_ts", "attempt_slot",
+                        "slot_attempts", "fail_count", "next_attempt_ts",
+                        "last_attempt_ts", "last_outcome", "last_reason",
+                        "notified_reason", "notified_ts")
+
+
+def get_mymeet_user_rows() -> list:
+    """Пользователи с настроенным MYmeet — строки как есть (токен зашифрован;
+    расшифровка — там же, где у ручной /sync_mymeet)."""
+    with _lock:
+        conn = _connect()
+        rows = conn.execute("""
+            SELECT * FROM users
+            WHERE mymeet_setup_done = 1
+              AND mymeet_token IS NOT NULL
+              AND is_active = 1
+        """).fetchall()
+        conn.close()
+    return rows
+
+
+def mymeet_sync_get(telegram_id: int) -> Optional[dict]:
+    with _lock:
+        conn = _connect()
+        row = conn.execute(
+            f"SELECT {', '.join(_MYMEET_STATE_FIELDS)} FROM mymeet_sync_state "
+            f"WHERE telegram_id = ?", (telegram_id,),
+        ).fetchone()
+        conn.close()
+    return dict(row) if row else None
+
+
+def mymeet_sync_save(telegram_id: int, **fields) -> None:
+    """Обновляет состояние автоимпорта (только переданные известные поля)."""
+    fields = {k: v for k, v in fields.items() if k in _MYMEET_STATE_FIELDS}
+    if not fields:
+        return
+    cols = list(fields)
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            f"INSERT INTO mymeet_sync_state (telegram_id, {', '.join(cols)}) "
+            f"VALUES (?, {', '.join('?' for _ in cols)}) "
+            f"ON CONFLICT(telegram_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in cols),
+            [telegram_id] + [fields[c] for c in cols],
+        )
+        conn.commit()
+        conn.close()
+
+
+def mymeet_imported_known(telegram_id: int, hashes: list) -> set:
+    """Какие из хэшей уже есть в реестре импорта."""
+    found: set = set()
+    hashes = list(hashes)
+    with _lock:
+        conn = _connect()
+        for i in range(0, len(hashes), 500):
+            chunk = hashes[i:i + 500]
+            rows = conn.execute(
+                f"SELECT key_hash FROM mymeet_imported WHERE telegram_id = ? "
+                f"AND key_hash IN ({', '.join('?' for _ in chunk)})",
+                [telegram_id] + chunk,
+            ).fetchall()
+            found.update(r[0] for r in rows)
+        conn.close()
+    return found
+
+
+def mymeet_imported_add(telegram_id: int, hashes: list) -> None:
+    """Добавляет хэши в реестр (повтор — без изменений)."""
+    if not hashes:
+        return
+    with _lock:
+        conn = _connect()
+        conn.executemany(
+            "INSERT OR IGNORE INTO mymeet_imported (telegram_id, key_hash) VALUES (?, ?)",
+            [(telegram_id, h) for h in hashes],
         )
         conn.commit()
         conn.close()

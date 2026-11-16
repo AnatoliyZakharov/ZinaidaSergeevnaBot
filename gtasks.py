@@ -3,11 +3,13 @@ gtasks.py — Google Tasks API.
 
 Позволяет читать задачи, менять их статус и адресно удалять одну задачу
 (только по ручной отмене в «Мои задачи», см. my_tasks.py).  Задачи не создаются.
-Использует те же Google Credentials, что и calendar (auth.get_credentials).
+Использует те же Google Credentials, что и calendar (auth.get_credentials_checked).
 
-Важно: для работы нужен scope https://www.googleapis.com/auth/tasks.
-Пользователи, подключившиеся до добавления этого scope, должны
-переподключиться через /connect.
+Ошибки классифицируются auth.classify_google_error: no_auth / token_invalid /
+insufficient_scope / api_disabled / transient / api_error.  Переподключение
+(/connect) помогает только при no_auth / token_invalid / insufficient_scope;
+api_disabled — Google Tasks API не включён в GCP-проекте бота.
+В лог пишутся только категория, HTTP-статус и reason.
 """
 
 import logging
@@ -23,11 +25,17 @@ logger = logging.getLogger(__name__)
 
 
 def _get_service(telegram_id: int):
-    """Возвращает Tasks API service или None если нет авторизации."""
-    creds = auth.get_credentials(telegram_id)
+    """Возвращает (service, None) или (None, категория ошибки авторизации)."""
+    creds, reason = auth.get_credentials_checked(telegram_id)
     if not creds:
-        return None
-    return build("tasks", "v1", credentials=creds)
+        return None, reason or "no_auth"
+    return build("tasks", "v1", credentials=creds), None
+
+
+def _classify(where: str, telegram_id, e) -> str:
+    err = auth.classify_google_error(e)
+    auth.log_google_error(where, telegram_id, err)
+    return err.category
 
 
 def list_all_tasks(telegram_id: int) -> tuple[list[dict], str | None]:
@@ -36,19 +44,16 @@ def list_all_tasks(telegram_id: int) -> tuple[list[dict], str | None]:
 
     Возвращает (tasks, error):
       - tasks: список задач (каждая содержит _listId, _listTitle)
-      - error: строка с ошибкой или None
+      - error: категория auth.classify_google_error / no_auth или None
     """
-    service = _get_service(telegram_id)
+    service, reason = _get_service(telegram_id)
     if not service:
-        return [], "no_auth"
+        return [], reason
 
     try:
         lists_result = service.tasklists().list(maxResults=10).execute()
-    except HttpError as e:
-        if e.resp.status == 403:
-            return [], "no_scope"
-        logger.error("Tasks: ошибка получения списков: %s", e)
-        return [], "api_error"
+    except Exception as e:
+        return [], _classify("tasks.tasklists.list", telegram_id, e)
 
     task_lists = lists_result.get("items", [])
     all_tasks: list[dict] = []
@@ -66,8 +71,8 @@ def list_all_tasks(telegram_id: int) -> tuple[list[dict], str | None]:
                 t["_listId"]    = tl["id"]
                 t["_listTitle"] = tl.get("title", "Мои задачи")
             all_tasks.extend(tasks)
-        except HttpError as e:
-            logger.error("Tasks: ошибка списка %s: %s", tl["id"], e)
+        except Exception as e:
+            _classify("tasks.tasks.list", telegram_id, e)
 
     # Сортируем: задачи с дедлайном вперёд, потом по порядку в списке
     all_tasks.sort(key=lambda t: (t.get("due", "z"), t.get("position", "")))
@@ -95,10 +100,11 @@ def list_all_tasks_full(telegram_id: int, service=None):
       list_ids — id всех полученных списков (задачи «чужих»/исчезнувших
       списков не трактуются как удалённые).
     """
+    reason = None
     if service is None:
-        service = _get_service(telegram_id)
+        service, reason = _get_service(telegram_id)
     if not service:
-        return [], "no_auth", False, []
+        return [], reason or "no_auth", False, []
 
     task_lists: list[dict] = []
     page = None
@@ -109,12 +115,8 @@ def list_all_tasks_full(telegram_id: int, service=None):
             page = res.get("nextPageToken")
             if not page:
                 break
-    except HttpError as e:
-        code = _status_code(e)
-        if code in (401, 403):
-            return [], "no_scope", False, []
-        logger.error("Tasks: ошибка получения списков: HTTP %s", code)
-        return [], "api_error", False, []
+    except Exception as e:
+        return [], _classify("tasks_full.tasklists.list", telegram_id, e), False, []
 
     all_tasks: list[dict] = []
     complete = True
@@ -126,8 +128,8 @@ def list_all_tasks_full(telegram_id: int, service=None):
                     tasklist=tl["id"], showCompleted=True, showHidden=True,
                     showDeleted=False, maxResults=100, pageToken=page,
                 ).execute()
-            except HttpError as e:
-                logger.error("Tasks: ошибка чтения списка: HTTP %s", _status_code(e))
+            except Exception as e:
+                _classify("tasks_full.tasks.list", telegram_id, e)
                 complete = False
                 break
             for t in res.get("items", []):
@@ -172,7 +174,7 @@ def get_task_state(telegram_id: int, list_id: str, task_id: str, service=None) -
     if not list_id or not task_id:
         return "error"
     if service is None:
-        service = _get_service(telegram_id)
+        service, _ = _get_service(telegram_id)
     if not service:
         return "error"
     try:
@@ -194,7 +196,7 @@ def delete_task(telegram_id: int, list_id: str, task_id: str, service=None) -> s
     if not list_id or not task_id:
         return "error"
     if service is None:
-        service = _get_service(telegram_id)
+        service, _ = _get_service(telegram_id)
     if not service:
         return "error"
     try:
@@ -219,7 +221,7 @@ def set_task_status(telegram_id: int, list_id: str, task_id: str, gt_status: str
     if gt_status not in ("completed", "needsAction") or not list_id or not task_id:
         return False
     if service is None:
-        service = _get_service(telegram_id)
+        service, _ = _get_service(telegram_id)
     if not service:
         return False
     body = {"status": gt_status}
@@ -236,7 +238,7 @@ def set_task_status(telegram_id: int, list_id: str, task_id: str, gt_status: str
 
 def complete_task(telegram_id: int, task_id: str, list_id: str) -> bool:
     """Отмечает задачу выполненной. Возвращает True при успехе."""
-    service = _get_service(telegram_id)
+    service, _ = _get_service(telegram_id)
     if not service:
         return False
     try:
@@ -247,5 +249,5 @@ def complete_task(telegram_id: int, task_id: str, list_id: str) -> bool:
         ).execute()
         return True
     except HttpError as e:
-        logger.error("Tasks: ошибка закрытия %s/%s: %s", list_id, task_id, e)
+        _classify("tasks.complete", telegram_id, e)
         return False

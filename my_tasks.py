@@ -1175,11 +1175,34 @@ _HEADINGS = {
 }
 
 
+# Тексты ошибок Google Tasks по категориям auth.classify_google_error
+# (общие для /sync_tasks, ежедневной сверки и /tasks).  Обычный текст, без Markdown.
+GT_ERROR_TEXT = {
+    "no_auth": "Google Tasks: Google не подключён — /connect",
+    "token_invalid": "Google Tasks: Доступ к Google истёк или отозван — подключите заново: /connect",
+    "insufficient_scope": "Google Tasks: При подключении не выдано разрешение на Google Tasks — "
+                          "/connect и отметьте галочку Google Tasks",
+    "api_disabled": "Google Tasks: Google Tasks API не включён в проекте бота — переподключение "
+                    "не поможет, обратитесь к администратору бота",
+    "transient": "Google Tasks: Временная ошибка Google — повторю позже",
+    "api_error": "Google Tasks: Ошибка Google API — задачи не синхронизированы, повторю позже",
+}
+# Нужно действие (пользователя или администратора) — повтор сам не поможет
+GT_CONFIG_ERRORS = frozenset({"no_auth", "token_invalid", "insufficient_scope", "api_disabled"})
+_HEADING_ADMIN = "🛠 Синхронизация не выполнена — требуется действие администратора"
+
+
+def gt_error_text(err: str) -> str:
+    """Текст для категории ошибки Google Tasks (неизвестная → api_error)."""
+    return GT_ERROR_TEXT.get(err) or GT_ERROR_TEXT["api_error"]
+
+
 def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
              ms=None) -> dict:
     """Сверка «Мои задачи»: Google Tasks (если with_gtasks) + лист.
 
-    Возвращает {"outcome", "text", "warnings", "stats", "sheet_count"}.
+    Возвращает {"outcome", "text", "warnings", "stats", "sheet_count", "gt_error"}.
+    gt_error — категория ошибки Google Tasks (см. GT_ERROR_TEXT) или None.
     outcome == "ok" только если все обязательные шаги выполнены: импорт GT
     полный и (если таблица настроена) лист записан.
     """
@@ -1191,7 +1214,7 @@ def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
     warnings: list = []
     outcome = OUT_OK
 
-    gt_data, gt_complete = None, True
+    gt_data, gt_complete, gt_error = None, True, None
     if with_gtasks:
         if gt is None:
             import gtasks as gt   # noqa: F811 — ленивый импорт (googleapiclient)
@@ -1200,12 +1223,10 @@ def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
         except Exception as e:
             logger.warning("gtasks list failed for %s: %s", telegram_id, type(e).__name__)
             items, err, complete, list_ids = [], "api_error", False, []
-        if err in ("no_scope", "no_auth"):
-            outcome = OUT_CONFIG
-            warnings.append("Google Tasks: нет доступа — переподключите Google: /connect")
-        elif err:
-            outcome = OUT_TRANSIENT
-            warnings.append("Google Tasks: ошибка API — задачи не синхронизированы")
+        if err:
+            gt_error = err if err in GT_ERROR_TEXT else "api_error"
+            outcome = OUT_CONFIG if gt_error in GT_CONFIG_ERRORS else OUT_TRANSIENT
+            warnings.append(gt_error_text(gt_error))
         else:
             gt_data, gt_complete = (items, complete, list_ids), complete
 
@@ -1240,7 +1261,7 @@ def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
               or s.get("gtasks_confirm_failed")):
             outcome = OUT_PARTIAL
 
-    lines = [_HEADINGS[outcome]]
+    lines = [_HEADING_ADMIN if gt_error == "api_disabled" else _HEADINGS[outcome]]
     if with_gtasks and gt_data is not None:
         lines.append(
             f"Google Tasks: получено {len(gt_data[0])}, новых {s.get('gtasks_new', 0)}, "
@@ -1258,7 +1279,8 @@ def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
         lines.append("Лист «Мои задачи» не обновлён")
     lines.extend(f"• {w}" for w in warnings)
     return {"outcome": outcome, "text": "\n".join(lines), "warnings": warnings,
-            "stats": s, "sheet_count": sheet_count if builder.committed else None}
+            "stats": s, "sheet_count": sheet_count if builder.committed else None,
+            "gt_error": gt_error}
 
 
 def add_forwarded(telegram_id: int, info: dict, *, dbm=None) -> bool:

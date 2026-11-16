@@ -29,6 +29,8 @@ jobs:
           pip install --quiet python-telegram-bot==21.6 cryptography==43.0.3
           # проверка deploy.yml в test_deploy_monitor (явная метка DEPLOY_SHA)
           pip install --quiet pyyaml
+          # issue #32: настоящий oauthlib — тест granular consent («Scope has changed»)
+          pip install --quiet google-auth-oauthlib==1.2.1
 
       - name: Run smoke tests
         run: python test_smoke.py

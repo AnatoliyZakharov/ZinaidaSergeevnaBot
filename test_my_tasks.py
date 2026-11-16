@@ -1056,8 +1056,10 @@ def test_run_sync_outcomes_and_retry_no_duplicates():
         assert res["outcome"] == mt.OUT_OK and "/setup_mymeet" in res["text"]
         assert res["outcome"] == mt.run_sync(1, dbm=db, gt=_FakeGT([_gt("a")]), ms=never)["outcome"]
         assert len(db.my_tasks_load(1)) == 1
-        r = mt.run_sync(1, dbm=db, gt=_FakeGT(err="no_scope"), ms=never)
+        r = mt.run_sync(1, dbm=db, gt=_FakeGT(err="insufficient_scope"), ms=never)
         assert r["outcome"] == mt.OUT_CONFIG and "/connect" in r["text"] and "✅" not in r["text"]
+        r = mt.run_sync(1, dbm=db, gt=_FakeGT(err="api_disabled"), ms=never)
+        assert r["outcome"] == mt.OUT_CONFIG and "/connect" not in r["text"]
         r = mt.run_sync(1, dbm=db, gt=_FakeGT(err="api_error"), ms=never)
         assert r["outcome"] == mt.OUT_TRANSIENT and "✅" not in r["text"]
         r = mt.run_sync(1, dbm=db, gt=_FakeGT([_gt("a")], complete=False), ms=never)
@@ -1168,8 +1170,9 @@ def test_user_lock_serializes_runs():
 
 def _load_gtasks():
     class HttpError(Exception):
-        def __init__(self, status):
+        def __init__(self, status, content=b""):
             self.resp = NS(status=status)
+            self.content = content
     fake = {
         "googleapiclient": types.ModuleType("googleapiclient"),
         "googleapiclient.discovery": types.ModuleType("googleapiclient.discovery"),
@@ -1178,7 +1181,11 @@ def _load_gtasks():
     }
     fake["googleapiclient.discovery"].build = lambda *a, **k: None
     fake["googleapiclient.errors"].HttpError = HttpError
-    fake["auth"].get_credentials = lambda tid: None
+    from test_google_errors import load_auth      # настоящий классификатор (issue #32)
+    real_auth = load_auth()
+    fake["auth"].get_credentials_checked = lambda tid: (None, "no_auth")
+    fake["auth"].classify_google_error = real_auth.classify_google_error
+    fake["auth"].log_google_error = real_auth.log_google_error
     saved = {k: sys.modules.get(k) for k in fake}
     sys.modules.update(fake)
     try:

@@ -104,6 +104,13 @@ _WRITE_MAX     = 50     # requests per window (keep some head-room)
 _write_times: list = [] # timestamps of recent writes (module-level, single-threaded)
 
 
+def _err_brief(e: BaseException) -> str:
+    """Для логов: тип исключения и HTTP-статус — без текста (в нём бывают
+    названия листов с ФИО и фрагменты данных)."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__}" + (f" HTTP {code}" if code else "")
+
+
 def _throttle():
     """Block until another write is allowed by the rate limit."""
     now = time.monotonic()
@@ -276,7 +283,7 @@ def _apply_full_format(
         _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
         msg = f"batch_update: {e}"
-        logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         fmt_warnings.append(msg)
 
     # 5. Auto-resize row heights (separate call; must run after data is in the sheet)
@@ -294,7 +301,7 @@ def _apply_full_format(
             }]})
         except Exception as e:
             msg = f"auto-resize: {e}"
-            logger.warning("Sheet formatting error (%s): %s", ws.title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             fmt_warnings.append(msg)
     return fmt_warnings
 
@@ -450,18 +457,28 @@ def _fetch_meetings(days: int = 30, token: str | None = None, ws_id: str | None 
     return meetings
 
 
+class ProtocolFetchError(Exception):
+    """Протокол не загружен (сеть, 5xx, 401/403, битый JSON) — в отличие от
+    404 «протокол ещё не готов».  Текст — только категория, без содержимого."""
+
+
 def _fetch_protocol(meeting_id: str, token: str | None = None) -> dict | None:
+    """Протокол встречи или None, если его ещё нет (404).
+    Прочие сбои — ProtocolFetchError (синк считает их и повторяет позже)."""
     url    = f"{MYMEET_BASE}/api/storage/download"
     params = {"meeting_id": meeting_id, "format": "json"}
     try:
         resp = requests.get(url, headers=_mymeet_headers(token), params=params, timeout=30)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.debug("Protocol fetch failed for %s: %s", meeting_id, e)
+    except requests.RequestException as e:
+        raise ProtocolFetchError(type(e).__name__) from None
+    if resp.status_code == 404:
         return None
+    if resp.status_code >= 400:
+        raise ProtocolFetchError(f"HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except ValueError:
+        raise ProtocolFetchError("invalid JSON") from None
 
 
 def _extract_tasks(protocol: dict | None) -> list:
@@ -723,6 +740,9 @@ def _build_user_config(user_config: dict | None) -> dict:
         "full_name": cfg.get("mymeet_full_name") or "",          # ФИО for «Мои задачи»
         # my_tasks.MyTasksBuilder (или None — прежний режим только протоколов)
         "my_tasks_builder": cfg.get("my_tasks_builder"),
+        # Автоимпорт (#39): реестр импортированных ключей и лимит новых строк
+        "import_registry": cfg.get("import_registry"),
+        "max_new_rows": cfg.get("max_new_rows"),
     }
 
 
@@ -1026,7 +1046,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             }]})
         except Exception as e:
             msg = f"{title} (защита листа): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
     all_data = [MY_TASKS_HEADER_ROW_V2 if editable else MY_TASKS_HEADER_ROW] + rows
@@ -1045,7 +1065,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
                 _my_tasks_link_request(ws.id, rows, link_spans)]})
         except Exception as e:
             msg = f"{title} (ссылки на письма): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     # Clear leftovers of a previous (longer) run only after a successful write.
     if cur_rows > need_rows:
@@ -1053,7 +1073,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             _gs_call(ws.batch_clear, [f"A{need_rows + 1}:H{cur_rows}"])
         except Exception as e:
             msg = f"{title} (очистка старых строк): {e}"
-            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
     warnings.extend(_apply_full_format(
@@ -1078,7 +1098,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
         }]})
     except Exception as e:
         msg = f"{title} (фильтр): {e}"
-        logger.warning("Sheet formatting error (%s): %s", title, msg)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         warnings.append(msg)
     return ws
 
@@ -1127,7 +1147,7 @@ def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -
         vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
         fresh = (vranges[0] or {}).get("values") or [] if vranges else []
     except Exception as e:
-        logger.warning("My tasks: re-read failed (%s): %s", title, type(e).__name__)
+        logger.warning("My tasks: re-read failed: %s", type(e).__name__)
         return False
     return rows_builder.sheet_unchanged(before_rows, fresh)
 
@@ -1190,8 +1210,10 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
         if my_title in protocol_titles:
             msg = (f"Лист «{my_title}» занят протоколом встречи с таким "
                    f"же названием — личный лист не обновлён")
-            logger.warning("My tasks: %s", msg)
+            logger.warning("My tasks: personal sheet name taken by a protocol sheet")   # без названия листа (ФИО)
             warnings.append(msg)
+            if rows_builder is not None:
+                rows_builder.blocked("name_taken")   # само не пройдёт — нужна правка таблицы
         else:
             try:
                 proto = {t: values[t] for t in protocol_titles}
@@ -1212,7 +1234,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                f"удаления)")
                         rows = None
                         rows_builder.blocked("shrink")
-                        logger.warning("My tasks: %s", msg)
+                        logger.warning("My tasks: mass-shrink guard, sheet not rewritten")   # без названия листа (ФИО)
                         warnings.append(msg)
                     elif exists and not _my_tasks_sheet_stable(
                             spreadsheet, my_title, my_rows, rows_builder):
@@ -1222,7 +1244,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                f"запись отложена, повторю")
                         rows = None
                         rows_builder.blocked("conflict")
-                        logger.warning("My tasks: %s", msg)
+                        logger.warning("My tasks: sheet changed during sync, not rewritten")   # без названия листа (ФИО)
                         warnings.append(msg)
                 if rows is not None:
                     # Запись сразу после повторного чтения — окно гонки = 1 запрос
@@ -1251,7 +1273,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                     warnings.append(f"{my_title} (защита листа): {e}")
             except Exception as e:
                 msg = f"{my_title}: {e}"
-                logger.warning("Sheet formatting error (%s): %s", my_title, msg)
+                logger.warning("Sheet formatting error: %s", _err_brief(e))
                 warnings.append(msg)
 
     if color_targets:
@@ -1259,7 +1281,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
             _ensure_status_colors(spreadsheet, meta, color_targets)
         except Exception as e:
             msg = f"цвета статусов: {e}"
-            logger.warning("Sheet formatting error (status colors): %s", msg)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     return warnings, my_count, my_title
 
@@ -1275,16 +1297,30 @@ def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder) -> tuple
 
 # ── Core sync ─────────────────────────────────────────────────────────────────
 
-def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | None = None) -> str:
+def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | None = None,
+                   stats: dict | None = None) -> str:
     """
     Fetch MYmeet data and write to Google Sheets.
 
-    days=30, append=False  — full overwrite (manual /sync_mymeet command)
-    days=1,  append=True   — append yesterday's new tasks (daily scheduler)
+    days=30, append=False  — full overwrite (/sync_mymeet_full)
+    days=N,  append=True   — append new tasks of the last N days (/sync_mymeet,
+                             daily auto-import with catch-up window)
     user_config            — per-user dict with mymeet_token, mymeet_ws_id,
-                             mymeet_spreadsheet_id, mymeet_organizer_email
+                             mymeet_spreadsheet_id, mymeet_organizer_email,
+                             gcal_organizer_data; optional import_registry
+                             (ImportRegistry) and max_new_rows (append only)
+    stats                  — optional dict filled with counters (no content)
+
+    Append mode never clears a sheet and checks duplicates across ALL protocol
+    sheets of the spreadsheet plus the import registry, so a wider window is
+    safe to repeat.  All rows are planned before the first write; if
+    max_new_rows is exceeded, ImportVolumeError is raised with nothing written.
     """
     cfg = _build_user_config(user_config)
+    st = stats if stats is not None else {}
+    st.update(fetched=0, after_date=0, after_org=0, protocols_failed=0,
+              protocols_missing=0, total_tasks=0, new_rows=0, skipped_known=0,
+              protocols_written=False, registry="skipped", my_tasks="skipped")
     logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
 
     raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
@@ -1309,6 +1345,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         )
     raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
     _after_org_count = len(raw_meetings)
+    st.update(fetched=_fetched_count, after_date=_after_date_count, after_org=_after_org_count)
     logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
                 len(_gcal_data.get("ids", set())), len(_gcal_data.get("times", set())), _after_org_count)
 
@@ -1319,6 +1356,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
         protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
         return {
+            "missing": protocol is None,   # ещё не готов (404) — догонится позже
             "id":    mid,
             "name":  name,
             "date":  _fmt_date(date),
@@ -1330,12 +1368,18 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
         for fut in as_completed(futures):
             try:
-                all_meetings.append(fut.result())
+                res_m = fut.result()
+                if res_m.pop("missing", False):
+                    st["protocols_missing"] += 1
+                all_meetings.append(res_m)
             except Exception as e:
-                logger.debug("Protocol fetch error: %s", e)
+                st["protocols_failed"] += 1
+                logger.warning("Protocol fetch error: %s", type(e).__name__)
 
     total_tasks = sum(len(m["tasks"]) for m in all_meetings)
-    logger.info("Total tasks: %d", total_tasks)
+    st["total_tasks"] = total_tasks
+    logger.info("Total tasks: %d (protocols failed=%d, not ready=%d)", total_tasks,
+                st["protocols_failed"], st["protocols_missing"])
 
     name_counts   = Counter(m["name"] for m in all_meetings)
     recurring_set = {n for n, c in name_counts.items() if c > 1}
@@ -1358,6 +1402,30 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     HEADER_ROW = list(PROTOCOL_HEADER_ROW)
 
+    # Append: дубли ищем по всем листам протоколов и по реестру импорта —
+    # встреча может попасть в другой лист (регулярная/разовая) при другом окне,
+    # а удалённую вручную строку не воскрешаем.
+    registry = cfg.get("import_registry") if append else None
+    candidate_keys: list[str] = []
+    known_keys: set[str] = set()
+    if append:
+        for m in all_meetings:
+            for task in m["tasks"]:
+                k = _task_key([None, m["date"], task["name"], task["assignee"],
+                               None, None, m["id"]])
+                if k:
+                    candidate_keys.append(k)
+        if candidate_keys:
+            known_keys = _all_protocol_keys(spreadsheet)
+            if registry is not None:
+                reg_known = registry.known(candidate_keys)
+                st["skipped_known"] = len(reg_known - known_keys)
+                known_keys |= reg_known
+    # Отложенные записи append-режима: sheet_name -> [ws|None, existing, start_row, rows].
+    # Разные названия встреч могут дать одно имя листа (_safe_sheet_name) —
+    # тогда строки копятся в одной записи плана, а не перетирают друг друга.
+    pending_recurring: dict = {}
+
     # ── Recurring meetings — one sheet per name ───────────────────────────────
     for meeting_name, meetings in sorted(recurring.items()):
         sheet_name = _safe_sheet_name(meeting_name)
@@ -1371,7 +1439,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     existing_full = []
                 _gs_call(ws.clear)
         except gspread.WorksheetNotFound:
-            ws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
+            # append: лист создаётся только на этапе записи (после проверки объёма)
+            ws = None if append else _gs_call(spreadsheet.add_worksheet, title=sheet_name,
+                                              rows=1000, cols=10)
             existing_full = []
 
         if not append:
@@ -1414,17 +1484,22 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         else:
             # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
             # existing rows on repeated daily runs; preserve manually-changed statuses.
-            existing = _gs_call(ws.get_all_values)
-            ex_keys  = _existing_keys(existing) if existing else set()
+            if sheet_name in pending_recurring:
+                ws, existing, start_row, rows = pending_recurring[sheet_name]
+            else:
+                existing = _gs_call(ws.get_all_values) if ws is not None else []
+                start_row = (len(existing) + 1) if existing else 2
+                rows = []
+                pending_recurring[sheet_name] = [ws, existing, start_row, rows]
+            planned = [[str(c) for c in r] for r in rows]
+            ex_keys  = ((_existing_keys(existing) if existing else set())
+                        | _existing_keys([[]] + planned) | known_keys)
 
             # Determine next sequential №
             last_num = 0
-            for row in (existing[1:] if existing else []):
+            for row in (existing[1:] if existing else []) + planned:
                 if row and str(row[0]).strip().isdigit():
                     last_num = max(last_num, int(row[0]))
-
-            start_row = (len(existing) + 1) if existing else 2
-            rows = []
             idx  = last_num + 1
             seen_in_run_app: set[str] = set()
             for m in sorted(meetings, key=lambda x: x["date"]):
@@ -1447,15 +1522,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     ])
                     idx += 1
 
-            if not existing:
-                all_data = [HEADER_ROW] + rows
-                _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
-            elif rows:
-                _gs_call(ws.update, f"A{start_row}:G{start_row - 1 + len(rows)}", rows)
-
-            # Always (re-)apply formatting so existing sheets get widths/wrap/dropdown too
-            total_data_rows = (len(existing) - 1 if existing else 0) + len(rows)
-            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=total_data_rows))
+            continue   # запись — после планирования всех листов (rows уже в плане)
         sheets_written += 1
         # No explicit sleep — rate limiter in _gs_call handles quota
 
@@ -1475,7 +1542,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         else:
             existing_ot_before = []
     except gspread.WorksheetNotFound:
-        ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
+        ws = None if append else _gs_call(spreadsheet.add_worksheet, title=ot_name,
+                                          rows=2000, cols=10)
         existing_ot_before = []
 
     if not append:
@@ -1489,8 +1557,17 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             _k = _task_key(_row)
             if _k and len(_row) >= 6 and str(_row[5]).strip():
                 manual_statuses_ot[_k] = str(_row[5]).strip()
+    elif ot_name in pending_recurring:
+        # Регулярная встреча с именем листа разовых: пишем после её строк
+        _pw, _pex, _ps, _prows = pending_recurring[ot_name]
+        existing_ot = ([list(r) for r in _pex] if _pex else [list(HEADER_ROW)]) + \
+            [[str(c) for c in r] for r in _prows]
+        manual_statuses_ot = {}
+        new_sheet  = False
+        start_row = len(existing_ot) + 1
+        start_idx = start_row
     else:
-        existing_ot = _gs_call(ws.get_all_values)
+        existing_ot = _gs_call(ws.get_all_values) if ws is not None else []
         manual_statuses_ot = {}
         if not existing_ot:
             start_idx = 1
@@ -1503,6 +1580,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     # Dedup keys for one-time sheet (append mode)
     ex_keys_ot = _existing_keys(existing_ot) if (append and existing_ot) else set()
+    if append:
+        ex_keys_ot |= known_keys
 
     # Determine next sequential №
     last_num_ot = 0
@@ -1526,7 +1605,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             if rkey in seen_in_run_ot:
                 continue   # intra-run duplicate
             seen_in_run_ot.add(rkey)
-            if append and existing_ot:
+            if append:
                 key = _task_key([None, m["date"], task["name"], task["assignee"], None, None, m["id"]])
                 if key and key in ex_keys_ot:
                     continue  # skip — already in sheet, status may have been edited manually
@@ -1556,6 +1635,32 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                 m["id"],
             ])
             idx += 1
+
+    if append:
+        # ── Проверка объёма до первой записи ────────────────────────────────
+        new_rows = (sum(len(p[3]) for p in pending_recurring.values())
+                    + sum(1 for r in all_rows if isinstance(r[0], int)))
+        st["new_rows"] = new_rows
+        limit = cfg.get("max_new_rows")
+        if limit is not None and new_rows > int(limit):
+            raise ImportVolumeError(new_rows, int(limit))
+        for sheet_name, (rws, existing, start_row_r, rows) in pending_recurring.items():
+            if rws is None:
+                rws = _gs_call(spreadsheet.add_worksheet, title=sheet_name, rows=1000, cols=10)
+            if not existing:
+                all_data = [HEADER_ROW] + rows
+                _gs_call(rws.update, f"A1:G{len(all_data)}", all_data)
+            elif rows:
+                _gs_call(rws.update, f"A{start_row_r}:G{start_row_r - 1 + len(rows)}", rows)
+            # Always (re-)apply formatting so existing sheets get widths/wrap/dropdown too
+            total_data_rows = (len(existing) - 1 if existing else 0) + len(rows)
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, rws, data_rows=total_data_rows))
+            sheets_written += 1
+        if ws is None:
+            try:   # мог быть создан выше как лист регулярной встречи
+                ws = _gs_call(spreadsheet.worksheet, ot_name)
+            except gspread.WorksheetNotFound:
+                ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
     if new_sheet:
         write_data = [HEADER_ROW] + all_rows
@@ -1597,27 +1702,60 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         try:
             _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
         except Exception as e:
-            logger.warning("Sheet formatting error (grouper rows): %s", e)
+            logger.warning("Sheet formatting error: %s", _err_brief(e))
+
+    # Все записи прошли — запоминаем импортированные ключи (повтор не создаст
+    # дублей, даже если строку удалят или перенесут вручную).
+    # Реестр не влияет на «Мои задачи»: личный лист строится из всех
+    # протокольных листов таблицы, поэтому повтор после сбоя доставит задачи
+    # даже для ключей, уже записанных в реестр.
+    st["protocols_written"] = True
+    if registry is not None and candidate_keys:
+        try:
+            registry.record(candidate_keys)
+            st["registry"] = "ok"
+        except Exception as e:
+            # Дубли всё равно отсекаются по листам; исход станет partial
+            st["registry"] = "failed"
+            logger.warning("MYmeet import registry write failed: %s", type(e).__name__)
 
     # ── Status colours + personal «Мои задачи» sheet ──────────────────────────
     # Must never break the main sync: any failure becomes a warning.
     full_name = (cfg.get("full_name") or "").strip()
     my_tasks_count = None
     my_tasks_title = None
+    _builder = cfg.get("my_tasks_builder")
     try:
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name, rows_builder=cfg.get("my_tasks_builder"))
+            spreadsheet, full_name, rows_builder=_builder)
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
-        logger.warning("Sheet formatting error (Мои задачи / цвета): %s", e)
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
         all_fmt_warnings.append(f"Мои задачи / цвета статусов: {e}")
+    # Итог доставки в личный лист — отдельно от записи протоколов
+    if not full_name:
+        st["my_tasks"] = "no_name"          # личного листа нет по настройке
+    elif my_tasks_count is not None and (_builder is None
+                                         or getattr(_builder, "committed", True)):
+        st["my_tasks"] = "ok"
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "shrink":
+        st["my_tasks"] = "guard"            # защита от массового удаления
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "conflict":
+        st["my_tasks"] = "conflict"         # пользователь правил лист — повтор
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "name_taken":
+        st["my_tasks"] = "name_taken"       # имя личного листа занято протоколом
+    elif _builder is not None and getattr(_builder, "anomaly", None):
+        st["my_tasks"] = "anomaly"          # защита builder-а (расшифровка, массовая отмена)
+    else:
+        st["my_tasks"] = "failed"           # ошибка записи / Sheets / имя занято
     if not full_name:
         my_tasks_line = (f"\n👤 Лист «{MY_TASKS_SHEET_PREFIX}ФИО» не создан. "
                          f"Укажите ФИО: /setname Имя Фамилия")
-    elif my_tasks_count is not None:
+    elif st["my_tasks"] == "ok":
         my_tasks_line = f"\n👤 Лист «{my_tasks_title}»: {my_tasks_count} задач"
     else:
-        my_tasks_line = ""
+        my_tasks_line = ("\n⚠️ Лист «Мои задачи» не обновлён — протоколы записаны, "
+                         "повторите синхронизацию позже")
 
     fmt_warn_text = (
         f"\n⚠️ Ошибки форматирования ({len(all_fmt_warnings)}):\n"
@@ -1632,11 +1770,215 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         f"📝 Разовые встречи: {len(one_time)} встреч\n"
         f"📅 Период: {_diag_from.strftime('%d.%m.%Y')} — {_diag_now.strftime('%d.%m.%Y')}\n"
         f"🔍 API {_fetched_count} → дата {_after_date_count} → организатор {_after_org_count}"
+        + (f"\n🆕 Новых строк: {st['new_rows']}" if append else "")
+        + (f"\n⚠️ Не загрузились протоколы: {st['protocols_failed']} — повторите позже"
+           if st["protocols_failed"] else "")
         + my_tasks_line
         + fmt_warn_text
     )
-    logger.info("MYmeet sync done: %s", result.replace('\n', ' | '))
+    # В лог — только счётчики (без названий листов, ФИО и текста задач)
+    logger.info("MYmeet sync done: days=%d append=%s tasks=%d new_rows=%d sheets=%d "
+                "proto_failed=%d proto_missing=%d protocols_written=%s registry=%s "
+                "my_tasks=%s fmt_warnings=%d", days, append,
+                total_tasks, st["new_rows"], sheets_written, st["protocols_failed"],
+                st["protocols_missing"], st["protocols_written"], st["registry"],
+                st["my_tasks"], len(all_fmt_warnings))
     return result
+
+
+# ── Ежедневный автоимпорт: дедупликация, реестр, расписание ──────────────────
+
+class ImportVolumeError(Exception):
+    """Append-синк нашёл больше новых строк, чем разрешено — ничего не записано."""
+
+    def __init__(self, count: int, limit: int):
+        super().__init__(f"{count} новых строк > лимита {limit}")
+        self.count = count
+        self.limit = limit
+
+
+def _all_protocol_keys(spreadsheet) -> set:
+    """Ключи задач со всех листов протоколов таблицы (одно чтение метаданных и
+    один batchGet).  Ошибка чтения пробрасывается: без полной картины дублей
+    append-синк не пишет ничего."""
+    meta = _gs_call(spreadsheet.fetch_sheet_metadata,
+                    params={"fields": "sheets(properties(sheetId,title))"})
+    titles = [((sh or {}).get("properties") or {}).get("title")
+              for sh in ((meta or {}).get("sheets") or [])] if isinstance(meta, dict) else []
+    titles = [t for t in titles if t and not _is_my_tasks_title(t)]
+    if not titles:
+        return set()
+    vranges: list = []
+    for i in range(0, len(titles), 20):   # GET-запрос: не раздуваем URL
+        resp = _gs_call(spreadsheet.values_batch_get,
+                        [_quote_sheet_title(t) + "!A:G" for t in titles[i:i + 20]])
+        vranges += (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+    keys: set = set()
+    for vr in vranges:
+        rows = (vr or {}).get("values") or []
+        if rows and _is_protocol_header(rows[0]):
+            keys |= _existing_keys(rows)
+    return keys
+
+
+class ImportRegistry:
+    """Реестр задач, уже импортированных в таблицу (только хэши ключей —
+    без текста задач и ФИО).  Привязан к таблице: новая таблица — чистый лист.
+    store — модуль db (или фейк) с mymeet_imported_known / mymeet_imported_add."""
+
+    def __init__(self, store, telegram_id: int, sheet_id: str):
+        self.store = store
+        self.telegram_id = telegram_id
+        self.sheet_id = str(sheet_id or "")
+
+    def _h(self, key: str) -> str:
+        import hashlib
+        return hashlib.sha256(f"{self.sheet_id}|{key}".encode("utf-8")).hexdigest()
+
+    def known(self, keys) -> set:
+        by_hash = {self._h(k): k for k in keys}
+        found = self.store.mymeet_imported_known(self.telegram_id, list(by_hash))
+        return {by_hash[h] for h in found if h in by_hash}
+
+    def record(self, keys) -> None:
+        self.store.mymeet_imported_add(self.telegram_id, sorted({self._h(k) for k in keys}))
+
+
+AUTO_HOUR = 19                     # слот автоимпорта — 19:00 по поясу пользователя
+AUTO_LOOKBACK_DAYS = 3             # окно начинается за 3 дня до прошлого успеха: протоколы с задержкой
+AUTO_INITIAL_DAYS = 7              # первый запуск без истории
+AUTO_MAX_DAYS = 14                 # потолок догона после простоя
+AUTO_MAX_NEW_ROWS = 300            # больше — стоп без записи, уведомление
+AUTO_MAX_SLOT_ATTEMPTS = 6         # попыток на один вечер
+AUTO_BACKOFF_MIN = (15, 30, 60, 120)
+AUTO_NOTIFY_AFTER_FAILS = 3        # временные сбои — сообщаем после 3 подряд
+AUTO_RENOTIFY_SEC = 3 * 86400      # та же причина — не чаще раза в 3 дня
+
+AUTO_OK, AUTO_PARTIAL, AUTO_TRANSIENT, AUTO_CONFIG, AUTO_VOLUME = (
+    "ok", "partial", "transient", "config", "volume")
+
+
+def auto_slot(local_dt: datetime) -> str:
+    """Дата вечера, к которому относится момент: до 19:00 — ещё вчерашний."""
+    d = local_dt.date() if local_dt.hour >= AUTO_HOUR else local_dt.date() - timedelta(days=1)
+    return d.isoformat()
+
+
+def auto_due(state: dict | None, local_dt: datetime, now_ts: float) -> str | None:
+    """Слот, который пора импортировать, или None.
+
+    Пропущенный вечер (простой, деплой, сбой) догоняется на ближайшем тике —
+    в том числе утром.  Повторы — с паузой next_attempt_ts и не более
+    AUTO_MAX_SLOT_ATTEMPTS за слот (дальше ждём следующего вечера, окно
+    импорта при этом расширится)."""
+    st = state or {}
+    slot = auto_slot(local_dt)
+    last = st.get("last_success_slot")
+    if last and last >= slot:
+        return None
+    if (st.get("attempt_slot") == slot
+            and int(st.get("slot_attempts") or 0) >= AUTO_MAX_SLOT_ATTEMPTS):
+        return None
+    if now_ts < float(st.get("next_attempt_ts") or 0):
+        return None
+    return slot
+
+
+def auto_window_days(state: dict | None, now_ts: float) -> tuple:
+    """(дней, обрезано ли): с последнего успешного импорта + запас на
+    задержку протоколов, в пределах [AUTO_LOOKBACK_DAYS, AUTO_MAX_DAYS]."""
+    import math
+    last = (state or {}).get("last_success_ts")
+    if not last:
+        return AUTO_INITIAL_DAYS, False
+    gap_days = max(0.0, now_ts - float(last)) / 86400
+    want = math.ceil(gap_days) + AUTO_LOOKBACK_DAYS   # от прошлого успеха минус 3 дня
+    days = max(AUTO_LOOKBACK_DAYS, want)
+    return min(days, AUTO_MAX_DAYS), days > AUTO_MAX_DAYS
+
+
+def auto_next_delay(fail_count: int) -> int:
+    i = max(0, min(fail_count, len(AUTO_BACKOFF_MIN)) - 1)
+    return AUTO_BACKOFF_MIN[i] * 60
+
+
+def classify_sync_error(exc: BaseException) -> tuple:
+    """(outcome, reason) для исключения синка.  reason — код без деталей."""
+    if isinstance(exc, ImportVolumeError):
+        return AUTO_VOLUME, "volume"
+    if isinstance(exc, MymeetTokenError):
+        return AUTO_CONFIG, "mymeet_token"
+    if isinstance(exc, ValueError) and "MYmeet-токен" in str(exc):
+        return AUTO_CONFIG, "mymeet_token"
+    if isinstance(exc, requests.HTTPError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in (401, 403):
+            return AUTO_CONFIG, "mymeet_token"
+        return AUTO_TRANSIENT, "mymeet_api"
+    if isinstance(exc, requests.RequestException):
+        return AUTO_TRANSIENT, "mymeet_unavailable"
+    if isinstance(exc, gspread.SpreadsheetNotFound):
+        return AUTO_CONFIG, "sheet_access"
+    if isinstance(exc, gspread.exceptions.APIError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in (403, 404):
+            return AUTO_CONFIG, "sheet_access"
+        return AUTO_TRANSIENT, "sheets_api"
+    return AUTO_TRANSIENT, "internal"
+
+
+def auto_outcome(stats: dict) -> dict:
+    """Исход успешно завершившегося sync_to_sheets: полный успех — только если
+    протоколы загружены и записаны, реестр сохранён и личный лист «Мои задачи»
+    обновлён (или его нет по настройке — нет ФИО).  Иначе слот не закрывается
+    и повторяется; личный лист при повторе строится заново из протокольных
+    листов, поэтому задачи доставляются и для ключей из реестра."""
+    if stats.get("protocols_failed"):
+        return {"outcome": AUTO_PARTIAL, "reason": "protocols"}
+    if not stats.get("protocols_written"):
+        return {"outcome": AUTO_TRANSIENT, "reason": "internal"}
+    mt = stats.get("my_tasks")
+    # Постоянные причины — нужна проверка человеком, повтор сам не поможет
+    if mt == "guard":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_guard"}
+    if mt == "name_taken":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_name_taken"}
+    if mt == "anomaly":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_anomaly"}
+    if mt not in ("ok", "no_name"):
+        return {"outcome": AUTO_PARTIAL, "reason": "my_tasks_sheet"}
+    if stats.get("registry") == "failed":
+        return {"outcome": AUTO_PARTIAL, "reason": "registry"}
+    return {"outcome": AUTO_OK, "reason": None}
+
+
+def auto_record(state: dict | None, slot: str, outcome: str, reason: str | None,
+                now_ts: float, window_end_ts: float) -> tuple:
+    """(поля состояния для сохранения, уведомлять ли пользователя).
+
+    Успех: слот закрыт, окно следующего запуска считается от window_end_ts.
+    Неудача: last_success_* не двигаются (окно расширится), пауза растёт.
+    Уведомление: настройка/объём — сразу, временные — после 3 сбоев подряд;
+    одна и та же причина — не чаще раза в 3 дня; успех сбрасывает признак."""
+    st = state or {}
+    attempts = (int(st.get("slot_attempts") or 0) + 1
+                if st.get("attempt_slot") == slot else 1)
+    fields = {"attempt_slot": slot, "slot_attempts": attempts, "last_attempt_ts": now_ts,
+              "last_outcome": outcome, "last_reason": reason}
+    if outcome == AUTO_OK:
+        fields.update(last_success_slot=slot, last_success_ts=window_end_ts, fail_count=0,
+                      next_attempt_ts=0, notified_reason=None, notified_ts=None)
+        return fields, False
+    fails = int(st.get("fail_count") or 0) + 1
+    fields.update(fail_count=fails, next_attempt_ts=now_ts + auto_next_delay(fails))
+    urgent = outcome in (AUTO_CONFIG, AUTO_VOLUME)
+    wanted = urgent or fails >= AUTO_NOTIFY_AFTER_FAILS
+    recent_same = (st.get("notified_reason") == reason
+                   and now_ts - float(st.get("notified_ts") or 0) < AUTO_RENOTIFY_SEC)
+    notify = wanted and not recent_same
+    if notify:
+        fields.update(notified_reason=reason, notified_ts=now_ts)
+    return fields, notify
 
 
 # ── Async wrapper ─────────────────────────────────────────────────────────────
@@ -1645,9 +1987,11 @@ async def sync_to_sheets_async(
     days: int = 30,
     append: bool = False,
     user_config: dict | None = None,
+    stats: dict | None = None,
 ) -> str:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        lambda: sync_to_sheets(days=days, append=append, user_config=user_config),
+        lambda: sync_to_sheets(days=days, append=append, user_config=user_config,
+                               stats=stats),
     )

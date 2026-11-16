@@ -52,6 +52,7 @@ import auth
 import my_tasks
 import crypto as _crypto
 from crypto import CryptoDecryptError
+import mymeet_sync
 from mymeet_sync import sync_to_sheets_async, fetch_workspaces, verify_token_and_get_workspace, MymeetTokenError
 
 # ─── Логирование ─────────────────────────────────────────────
@@ -1296,8 +1297,32 @@ def _get_gcal_organizer_data(telegram_id: int, days: int) -> dict | None:
       times -- same events' start times, UTC, minute-rounded, in ms
     Returns None when Google Calendar is unavailable (caller must abort sync).
     """
+    return _get_gcal_organizer_data_checked(telegram_id, days)[0]
+
+
+# Причина недоступности Calendar → (исход автоимпорта, код причины)
+_GCAL_REASONS = {
+    "no_auth":            ("config", "google_not_connected"),
+    "token_invalid":      ("config", "google_token_invalid"),
+    "insufficient_scope": ("config", "google_scope"),
+    "api_disabled":       ("config", "google_api_disabled"),
+}
+
+
+def _get_gcal_organizer_data_checked(telegram_id: int, days: int) -> tuple:
+    """Как _get_gcal_organizer_data, но (data | None, причина | None).
+    Причина — категория auth.classify_google_error / «no_auth»."""
     try:
-        service = get_calendar_service(telegram_id)
+        creds, reason = auth.get_credentials_checked(telegram_id)
+    except Exception as exc:
+        reason = auth.classify_google_error(exc).category
+        creds = None
+    if not creds:
+        logger.warning("_get_gcal_organizer_data: no credentials for user %s (%s)",
+                       telegram_id, reason)
+        return None, reason or "no_auth"
+    try:
+        service = build("calendar", "v3", credentials=creds)
         user = db.get_user(telegram_id)
         cal_id = _get_calendar_id(user)
         now = datetime.now(timezone.utc)
@@ -1329,10 +1354,12 @@ def _get_gcal_organizer_data(telegram_id: int, days: int) -> dict | None:
                     pass
         logger.info("_get_gcal_organizer_data: %d organizer events for user %s",
                     len(organizer_ids), telegram_id)
-        return {"ids": organizer_ids, "times": organizer_times}
+        return {"ids": organizer_ids, "times": organizer_times}, None
     except Exception as exc:
-        logger.warning("_get_gcal_organizer_data failed for user %s: %s", telegram_id, exc)
-        return None  # signals GCal unavailable -- caller must abort sync
+        err = auth.classify_google_error(exc)
+        logger.warning("_get_gcal_organizer_data failed for user %s: %s (%s)",
+                       telegram_id, type(exc).__name__, err.category)
+        return None, err.category  # GCal unavailable -- caller must abort sync
 
 
 def _user_row_to_mymeet_config(user) -> dict | None:
@@ -1412,6 +1439,8 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         user_config["gcal_organizer_data"] = gcal_data_1d
+        user_config["import_registry"] = mymeet_sync.ImportRegistry(
+            db, telegram_id, user_config.get("mymeet_spreadsheet_id"))
         msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
         try:
             async with _user_lock(telegram_id):
@@ -1488,21 +1517,136 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
 
-async def scheduled_mymeet_sync():
-    """Ежедневно в 19:00 MSK: синхронизируем MYmeet → Google Sheets для всех пользователей."""
-    users = await asyncio.get_event_loop().run_in_executor(None, db.get_mymeet_users)
-    logger.info("Scheduled MYmeet sync: %d users", len(users))
-    for user in users:
-        user_config = _user_row_to_mymeet_config(user)
-        if not user_config:
-            continue
+# Автоимпорт: причина → текст для пользователя (без технических деталей)
+MYMEET_AUTO_REASON_TEXT = {
+    "mymeet_token": "MYmeet отклоняет токен. Подключите заново: /reset_mymeet, затем /setup_mymeet.",
+    "token_undecryptable": "Сохранённый токен MYmeet не читается. Введите его заново: /setup_mymeet.",
+    "mymeet_api": "MYmeet отвечает ошибкой. Повторю автоматически.",
+    "mymeet_unavailable": "MYmeet временно недоступен. Повторю автоматически.",
+    "protocols": "Часть протоколов MYmeet не загрузилась. Повторю автоматически.",
+    "my_tasks_sheet": "Задачи записаны в листы протоколов, но лист «Мои задачи» не "
+                      "обновился. Повторю автоматически.",
+    "my_tasks_guard": "Лист «Мои задачи» не обновлён: сработала защита от массового "
+                      "удаления строк. Нужна проверка таблицы.",
+    "my_tasks_name_taken": "Лист «Мои задачи» не обновлён: лист с таким именем занят "
+                           "протоколом встречи. Переименуйте тот лист протокола.",
+    "my_tasks_anomaly": "Лист «Мои задачи» не обновлён: сработала защита данных "
+                        "(например, массовая отмена задач). Нужен администратор.",
+    "registry": "Задачи записаны, но не удалось сохранить отметку об импорте. "
+                "Повторю автоматически.",
+    "google_not_connected": "Google не подключён — он нужен, чтобы отобрать встречи, "
+                            "где вы организатор. Подключите: /connect",
+    "google_token_invalid": "Доступ к Google истёк или отозван. Переподключите: /connect",
+    "google_scope": "У бота нет доступа к Google Calendar. Переподключите /connect "
+                    "и отметьте доступ к календарю.",
+    "google_api_disabled": "Google Calendar API выключен в проекте бота — нужен администратор.",
+    "google_calendar": "Google Calendar временно недоступен. Повторю автоматически.",
+    "sheet_access": "Нет доступа к Google Таблице MYmeet. Проверьте, что таблица из "
+                    "/setup_mymeet открыта для бота на редактирование.",
+    "sheets_api": "Google Sheets временно недоступен. Повторю автоматически.",
+    "volume": "Найдено необычно много новых задач — импорт остановлен без изменений "
+              "в таблице. Сообщите администратору.",
+    "internal": "Внутренняя ошибка. Повторю автоматически.",
+}
+
+
+def _mymeet_auto_notice(reason: str, state: dict | None, tz) -> str:
+    text = MYMEET_AUTO_REASON_TEXT.get(reason, MYMEET_AUTO_REASON_TEXT["internal"])
+    last = (state or {}).get("last_success_ts")
+    when = (datetime.fromtimestamp(float(last), tz).strftime("%d.%m %H:%M")
+            if last else "ещё не было")
+    return ("Автоимпорт задач MYmeet (19:00)\n\n"
+            "⚠️ Новые задачи из протоколов не добавлены в таблицу.\n"
+            f"{text}\n\nПоследний успешный импорт: {when}.\n"
+            "Вручную за сегодня: /sync_mymeet")
+
+
+async def _run_mymeet_auto(user, state: dict | None, now_ts: float) -> dict:
+    """Один автоимпорт пользователя.  Те же проверки, что у /sync_mymeet:
+    токен MYmeet, данные организатора из Google Calendar, append без clear.
+    Возвращает {"outcome", "reason", "days", "truncated", "stats"}."""
+    telegram_id = user["telegram_id"]
+    days, truncated = mymeet_sync.auto_window_days(state, now_ts)
+    res = {"outcome": mymeet_sync.AUTO_OK, "reason": None, "days": days,
+           "truncated": truncated, "stats": {}}
+    user_config = _user_row_to_mymeet_config(user)
+    if not user_config:
+        res.update(outcome=mymeet_sync.AUTO_CONFIG, reason="token_undecryptable")
+        return res
+    loop = asyncio.get_event_loop()
+    gcal, gerr = await loop.run_in_executor(
+        None, lambda: _get_gcal_organizer_data_checked(telegram_id, days))
+    if gcal is None:
+        outcome, reason = _GCAL_REASONS.get(gerr, ("transient", "google_calendar"))
+        res.update(outcome=outcome, reason=reason)
+        return res
+    user_config["gcal_organizer_data"] = gcal
+    user_config["import_registry"] = mymeet_sync.ImportRegistry(
+        db, telegram_id, user_config.get("mymeet_spreadsheet_id"))
+    user_config["max_new_rows"] = mymeet_sync.AUTO_MAX_NEW_ROWS
+    try:
+        async with _user_lock(telegram_id):
+            await sync_to_sheets_async(days=days, append=True, user_config=user_config,
+                                       stats=res["stats"])
+    except Exception as e:
+        outcome, reason = mymeet_sync.classify_sync_error(e)
+        res.update(outcome=outcome, reason=reason)
+        return res
+    res.update(mymeet_sync.auto_outcome(res["stats"]))
+    return res
+
+
+async def scheduled_mymeet_sync(bot: Bot):
+    """Каждые 15 минут: автоимпорт MYmeet → Google Sheets / «Мои задачи».
+
+    Слот — 19:00 по поясу пользователя.  Пропущенный вечер догоняется на
+    ближайшем тике, окно — от последнего успешного импорта плюс 3 дня на
+    задержку протоколов (не больше 14).  Неудача — повтор с паузой
+    15→30→60→120 мин (до 6 попыток за вечер), уведомление без спама."""
+    rows = await asyncio.get_event_loop().run_in_executor(None, db.get_mymeet_user_rows)
+    now_utc = datetime.now(timezone.utc)
+    now_ts = now_utc.timestamp()
+    for user in rows:
+        telegram_id = user["telegram_id"]
         try:
-            async with _user_lock(user["telegram_id"]):
-                result = await sync_to_sheets_async(days=1, append=True,
-                                                    user_config=user_config)
-            logger.info("MYmeet sync [%s]: %s", user["telegram_id"], result.replace("\n", " | "))
+            tz = _tz(user)
+            local = now_utc.astimezone(tz)
+        except Exception:
+            tz = pytz.timezone(DEFAULT_TZ)
+            local = now_utc.astimezone(tz)
+        try:
+            state = db.mymeet_sync_get(telegram_id)
+            slot = mymeet_sync.auto_due(state, local, now_ts)
+            if not slot:
+                continue
+            try:
+                res = await _run_mymeet_auto(user, state, now_ts)
+            except Exception as e:
+                logger.error("MYmeet auto [%s] error: %s", telegram_id, type(e).__name__)
+                res = {"outcome": mymeet_sync.AUTO_TRANSIENT, "reason": "internal",
+                       "days": None, "truncated": False, "stats": {}}
+            fields, notify = mymeet_sync.auto_record(
+                state, slot, res["outcome"], res["reason"], time_module.time(), now_ts)
+            db.mymeet_sync_save(telegram_id, **fields)
+            st = res["stats"]
+            logger.info(
+                "MYmeet auto [%s] slot=%s window=%sd%s outcome=%s reason=%s attempt=%s "
+                "fetched=%s organizer=%s tasks=%s new_rows=%s proto_failed=%s "
+                "proto_missing=%s protocols_written=%s registry=%s my_tasks=%s",
+                telegram_id, slot, res["days"],
+                " (truncated)" if res["truncated"] else "", res["outcome"],
+                res["reason"] or "-", fields["slot_attempts"], st.get("fetched", "-"),
+                st.get("after_org", "-"), st.get("total_tasks", "-"),
+                st.get("new_rows", "-"), st.get("protocols_failed", "-"),
+                st.get("protocols_missing", "-"), st.get("protocols_written", "-"),
+                st.get("registry", "-"), st.get("my_tasks", "-"))
+            if notify:
+                await bot.send_message(chat_id=telegram_id,
+                                       text=_mymeet_auto_notice(res["reason"], state, tz),
+                                       disable_notification=True)
         except Exception as e:
-            logger.error("MYmeet sync error [%s]: %s", user["telegram_id"], e, exc_info=True)
+            logger.error("MYmeet auto [%s] record/notify error: %s", telegram_id,
+                         type(e).__name__)
 
 
 # ─── «Мои задачи»: Google Tasks + пересланные сообщения ───────
@@ -1935,10 +2079,12 @@ async def run_bot():
     scheduler.add_job(
         scheduled_mymeet_sync,
         "cron",
-        hour=16,       # 19:00 MSK = 16:00 UTC
-        minute=0,
+        minute="*/15",   # 19:00 по поясу пользователя + догон пропущенных вечеров
+        args=[app.bot],
         id="mymeet_daily_sync",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
         timezone="UTC",
     )
     scheduler.add_job(

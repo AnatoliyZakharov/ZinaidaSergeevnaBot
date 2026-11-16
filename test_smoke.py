@@ -804,7 +804,11 @@ def test_sync_my_tasks_exception_does_not_break_sync():
     """Исключение шага «Мои задачи» не роняет sync и попадает в предупреждения."""
     mod = _load_mymeet()
     for append in (False, True):
-        _mock_sync_env(mod, meta_exc=RuntimeError("boom-meta"))
+        ss, _ = _mock_sync_env(mod, meta_exc=RuntimeError("boom-meta"))
+        if append:
+            # append сначала читает листы для поиска дублей (#39) — это чтение
+            # проходит, падает только шаг «Мои задачи»
+            ss.fetch_sheet_metadata.side_effect = [{"sheets": []}, RuntimeError("boom-meta")]
         res = mod.sync_to_sheets(days=1, append=append,
                                  user_config={"gcal_organizer_data": _GCAL,
                                               "mymeet_spreadsheet_id": "x",
@@ -1596,6 +1600,9 @@ if __name__ == "__main__":
     # issue #32: диагностика отказа Google Tasks и проверка выданных scopes
     from test_google_errors import TESTS as _GOOGLE_ERRORS_TESTS
     tests += _GOOGLE_ERRORS_TESTS
+    # issue #39: ежедневный автоимпорт MYmeet (догон, дедупликация, уведомления)
+    from test_mymeet_daily import TESTS as _MYMEET_DAILY_TESTS
+    tests += _MYMEET_DAILY_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

@@ -808,7 +808,9 @@ def test_sync_my_tasks_exception_does_not_break_sync():
         if append:
             # append сначала читает листы для поиска дублей (#39) — это чтение
             # проходит, падает только шаг «Мои задачи»
-            ss.fetch_sheet_metadata.side_effect = [{"sheets": []}, RuntimeError("boom-meta")]
+            # + чтение объединений для заголовков встреч (#41)
+            ss.fetch_sheet_metadata.side_effect = [{"sheets": []}, {"sheets": []},
+                                                   RuntimeError("boom-meta")]
         res = mod.sync_to_sheets(days=1, append=append,
                                  user_config={"gcal_organizer_data": _GCAL,
                                               "mymeet_spreadsheet_id": "x",
@@ -1603,6 +1605,9 @@ if __name__ == "__main__":
     # issue #39: ежедневный автоимпорт MYmeet (догон, дедупликация, уведомления)
     from test_mymeet_daily import TESTS as _MYMEET_DAILY_TESTS
     tests += _MYMEET_DAILY_TESTS
+    # issue #41: заголовки встреч «Разовые встречи» (объединение A:F)
+    from test_grouper_format import TESTS as _GROUPER_TESTS
+    tests += _GROUPER_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

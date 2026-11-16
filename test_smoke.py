@@ -1584,6 +1584,9 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    # issue #32: диагностика отказа Google Tasks и проверка выданных scopes
+    from test_google_errors import TESTS as _GOOGLE_ERRORS_TESTS
+    tests += _GOOGLE_ERRORS_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

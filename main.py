@@ -18,6 +18,7 @@ ZinaidaSergeevnaBot — мультипользовательский голос�
 """
 
 import asyncio
+import html as html_lib
 import os
 import json
 import logging
@@ -655,8 +656,9 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🔗 Войти через Google", url=url)
     ]])
     await update.message.reply_text(
-        "Нажми кнопку ниже и авторизуйся через Google.\n"
-        "После этого бот получит доступ только к твоему Календарю.",
+        "Нажми кнопку ниже и авторизуйся через Google. Бот запросит доступ к "
+        "Google Календарю и Google Tasks — отметь обе галочки, иначе часть функций "
+        "не будет работать.",
         reply_markup=keyboard,
     )
 
@@ -1646,30 +1648,58 @@ async def oauth_callback(request: web.Request) -> web.Response:
             content_type="text/html",
         )
 
-    telegram_id = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: auth.exchange_code(code, state)
-    )
-    if not telegram_id:
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: auth.exchange_code(code, state)
+        )
+    except Exception as e:
+        # Не 500: state уже израсходован — пользователю нужна новая ссылка.
+        # В лог — только тип и классификация (без текста исключения).
+        err = auth.classify_google_error(e)
+        logger.error("OAuth: обмен кода не удался: %s category=%s status=%s reason=%s",
+                     type(e).__name__, err.category, err.status, err.reason)
+        return web.Response(
+            text="<h2>Ошибка авторизации</h2>"
+                 "<p>Не удалось завершить авторизацию, запросите ссылку заново: /connect</p>",
+            content_type="text/html",
+        )
+    if not result:
         return web.Response(
             text="<h2>Неверный или просроченный state</h2><p>Запроси ссылку заново: /connect</p>",
             content_type="text/html",
         )
 
-    # Уведомляем пользователя в Telegram
+    telegram_id, granted = result
+    text = _oauth_granted_text(granted)
+    # Уведомляем пользователя в Telegram (обычный текст, без Markdown)
     if _bot:
         try:
-            await _bot.send_message(
-                chat_id=telegram_id,
-                text="✅ *Google Календарь подключён!*\n\nТеперь можешь спрашивать про свободные слоты голосом или текстом.",
-                parse_mode="Markdown",
-            )
+            await _bot.send_message(chat_id=telegram_id, text=text)
         except Exception as e:
-            logger.error("Не удалось отправить сообщение после OAuth: %s", e)
+            logger.error("Не удалось отправить сообщение после OAuth: %s", type(e).__name__)
 
     return web.Response(
-        text="<h2>✅ Готово!</h2><p>Google Календарь подключён. Можешь вернуться в Telegram.</p>",
+        text=f"<h2>Готово</h2><p>{html_lib.escape(text)}</p><p>Можешь вернуться в Telegram.</p>",
         content_type="text/html",
     )
+
+
+def _oauth_granted_text(granted) -> str:
+    """Сообщение после OAuth — только по фактически выданным scopes."""
+    if granted is None:
+        return "✅ Google подключён"
+    cal = auth.SCOPE_CALENDAR in granted
+    tasks = auth.SCOPE_TASKS in granted
+    if cal and tasks:
+        return "✅ Подключены Google Календарь и Google Tasks"
+    if cal:
+        return ("⚠️ Календарь подключён. Доступ к Google Tasks не выдан — "
+                "/connect и отметьте Google Tasks")
+    if tasks:
+        return ("⚠️ Google Tasks подключены. Доступ к Календарю не выдан — слоты и встречи "
+                "работать не будут; /connect и отметьте Календарь")
+    return ("⚠️ Google подключён, но доступ к Календарю и Google Tasks не выдан — "
+            "/connect и отметьте обе галочки")
 
 
 # ─── Запуск ──────────────────────────────────────────────────
@@ -1736,22 +1766,16 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает открытые задачи из Google Tasks."""
     telegram_id = update.effective_user.id
     if not db.is_google_connected(telegram_id):
-        await update.message.reply_text("🔑 Сначала подключи Google Calendar: /connect")
+        await update.message.reply_text("🔑 Сначала подключи Google: /connect")
         return
 
     tasks, err = await asyncio.get_event_loop().run_in_executor(
         None, lambda: gtasks.list_all_tasks(telegram_id)
     )
 
-    if err == "no_scope":
-        await update.message.reply_text(
-            "⚠️ Нет доступа к Google Tasks\.\n\n"
-            "Переподключи аккаунт: /connect",
-            parse_mode="MarkdownV2",
-        )
-        return
     if err:
-        await update.message.reply_text("⚠️ Не удалось загрузить задачи\. Попробуй позже\.", parse_mode="MarkdownV2")
+        # Обычный текст (без MarkdownV2): причина — из общего словаря my_tasks
+        await update.message.reply_text("⚠️ " + my_tasks.gt_error_text(err))
         return
 
     context.user_data["tasks"] = tasks

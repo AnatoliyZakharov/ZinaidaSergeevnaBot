@@ -2122,10 +2122,10 @@ async def _handle_pending_tasks(
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает открытые задачи из Google Tasks."""
     telegram_id = update.effective_user.id
-    _track(telegram_id, "tasks_used", source="tasks")
     if not db.is_google_connected(telegram_id):
         await update.message.reply_text("🔑 Сначала подключи Google: /connect")
         return
+    _track(telegram_id, "tasks_used", source="tasks")   # как в /sync_tasks: после проверки Google
 
     tasks, err = await asyncio.get_event_loop().run_in_executor(
         None, lambda: gtasks.list_all_tasks(telegram_id)

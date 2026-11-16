@@ -202,6 +202,7 @@ def test_hooks_registered_in_handlers():
     b = body("cmd_tasks")
     assert b.index('"first_value"') > b.index("_format_tasks(tasks)")
     assert b.index('"first_value"') > b.index("if err:")
+    assert b.index('"tasks_used"') > b.index("is_google_connected")
 
 
 # ── 3. Retention ─────────────────────────────────────────────────────────────

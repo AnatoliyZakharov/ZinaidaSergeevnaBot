@@ -1212,6 +1212,8 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                    f"же названием — личный лист не обновлён")
             logger.warning("My tasks: personal sheet name taken by a protocol sheet")   # без названия листа (ФИО)
             warnings.append(msg)
+            if rows_builder is not None:
+                rows_builder.blocked("name_taken")   # само не пройдёт — нужна правка таблицы
         else:
             try:
                 proto = {t: values[t] for t in protocol_titles}
@@ -1740,8 +1742,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         st["my_tasks"] = "guard"            # защита от массового удаления
     elif _builder is not None and getattr(_builder, "block_reason", None) == "conflict":
         st["my_tasks"] = "conflict"         # пользователь правил лист — повтор
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "name_taken":
+        st["my_tasks"] = "name_taken"       # имя личного листа занято протоколом
     elif _builder is not None and getattr(_builder, "anomaly", None):
-        st["my_tasks"] = "anomaly"
+        st["my_tasks"] = "anomaly"          # защита builder-а (расшифровка, массовая отмена)
     else:
         st["my_tasks"] = "failed"           # ошибка записи / Sheets / имя занято
     if not full_name:
@@ -1934,8 +1938,13 @@ def auto_outcome(stats: dict) -> dict:
     if not stats.get("protocols_written"):
         return {"outcome": AUTO_TRANSIENT, "reason": "internal"}
     mt = stats.get("my_tasks")
+    # Постоянные причины — нужна проверка человеком, повтор сам не поможет
     if mt == "guard":
         return {"outcome": AUTO_CONFIG, "reason": "my_tasks_guard"}
+    if mt == "name_taken":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_name_taken"}
+    if mt == "anomaly":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_anomaly"}
     if mt not in ("ok", "no_name"):
         return {"outcome": AUTO_PARTIAL, "reason": "my_tasks_sheet"}
     if stats.get("registry") == "failed":

@@ -717,12 +717,32 @@ def test_partial_protocol_write_then_retry_no_dupes():
         assert sorted(_my_task_names(env)) == ["A1", "A2", "O1"]
 
 
+def test_my_tasks_name_taken_is_config():
+    """Имя личного листа занято протоколом: протоколы записаны, исход config,
+    уведомление сразу и без обещания «повторю автоматически»."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.books["sheet-1"] = Book({MY_TITLE: [PROTO_HDR]})
+        env.mm.add("m1", "Стратсессия", _now() - timedelta(hours=3), [("Отчёт", ME, False)])
+        env.force_due()
+        bot = env.tick()
+        st = env.db.mymeet_sync_get(1)
+        assert (st["last_outcome"], st["last_reason"]) == ("config", "my_tasks_name_taken"), st
+        assert [r[1] for r in env.book().task_rows(env.ms.ONE_TIME_SHEET_NAME)] == ["Отчёт"]
+        assert len(bot.sent) == 1 and "Повторю" not in bot.sent[0][1], bot.sent
+        assert ME not in bot.sent[0][1]
+
+
 def test_auto_outcome_matrix():
     ms = _ms()
     base = {"protocols_written": True, "registry": "ok", "my_tasks": "ok"}
     assert ms.auto_outcome(base) == {"outcome": "ok", "reason": None}
     assert ms.auto_outcome({**base, "my_tasks": "no_name"})["outcome"] == "ok"
-    for mt in ("failed", "conflict", "anomaly", "skipped"):
+    assert ms.auto_outcome({**base, "my_tasks": "name_taken"}) == {
+        "outcome": "config", "reason": "my_tasks_name_taken"}
+    assert ms.auto_outcome({**base, "my_tasks": "anomaly"}) == {
+        "outcome": "config", "reason": "my_tasks_anomaly"}
+    for mt in ("failed", "conflict", "skipped"):
         assert ms.auto_outcome({**base, "my_tasks": mt}) == {
             "outcome": "partial", "reason": "my_tasks_sheet"}, mt
     assert ms.auto_outcome({**base, "my_tasks": "guard"})["outcome"] == "config"
@@ -852,6 +872,7 @@ TESTS = [
     (test_registry_failure_is_partial_no_loss, "MYmeet авто: сбой реестра → partial, без потерь"),
     (test_partial_protocol_write_then_retry_no_dupes,
      "MYmeet авто: частичная запись протоколов → повтор без дублей"),
+    (test_my_tasks_name_taken_is_config, "MYmeet авто: имя «Мои задачи» занято → config"),
     (test_auto_outcome_matrix, "MYmeet авто: матрица исходов протоколы/реестр/«Мои задачи»"),
     (test_volume_guard_writes_nothing, "MYmeet авто: лимит объёма — ничего не записано"),
     (test_dedup_read_failure_writes_nothing, "MYmeet авто: нет чтения листов — нет записи"),

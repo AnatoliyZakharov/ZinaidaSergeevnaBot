@@ -125,6 +125,8 @@ _MY_TASKS_NEW_COLS = [
     ("prev_status",       "TEXT"),               # статус до удаления в GT
     ("sheet_fields",      "TEXT"),               # что бот записал в ячейки (enc JSON)
     ("overrides",         "TEXT"),               # ручные правки ячеек (enc JSON)
+    ("gtasks_parent_id",  "TEXT"),               # Tasks API parent (подзадача)
+    ("gtasks_position",   "TEXT"),               # Tasks API position (порядок)
 ]
 _MY_TASKS_SYNC_NEW_COLS = [
     ("last_success_slot", "TEXT"),     # дата слота 19:00, выполненного полностью
@@ -666,6 +668,7 @@ _MY_TASK_FIELDS = (
     "status", "verified", "sheet_status", "ext_status", "ext_synced_status",
     "gtasks_list_id", "gtasks_task_id", "missing_since",
     "link", "gt_delete_pending", "prev_status", "sheet_fields", "overrides",
+    "gtasks_parent_id", "gtasks_position",
 )
 # Пользовательский текст — шифруется (Fernet, тот же ENCRYPTION_KEY, что у
 # MYmeet-токенов).  Префикс отличает шифротекст от старого открытого текста.

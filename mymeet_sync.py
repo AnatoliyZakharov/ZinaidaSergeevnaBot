@@ -67,7 +67,7 @@ MY_TASKS_PROTECTION_EDITABLE = (
 # Защита от массового удаления: не перезаписываем лист, если строк стало
 # меньше половины (при ≥ MY_TASKS_SHRINK_MIN строках в листе).
 MY_TASKS_SHRINK_MIN = 10
-MY_TASKS_COL_WIDTHS_PX = [50, 110, 220, 420, 180, 120, 190]  # A–G
+MY_TASKS_COL_WIDTHS_PX = [70, 110, 220, 420, 180, 120, 190]  # A–G (A: «↳ 2.1»)
 MY_TASKS_STATUS_COL = 6                                      # G (0-based)
 MY_TASKS_MTG_ID_COL = 7                                      # H — hidden
 MY_TASKS_HIDDEN_STATUSES = ["Выполнено", "Отменено"]         # hidden by filter
@@ -952,8 +952,46 @@ def _ensure_status_colors(spreadsheet, metadata: dict, targets: dict) -> None:
         _gs_call(spreadsheet.batch_update, {"requests": reqs})
 
 
+MY_TASKS_TASK_COL = 3                                        # D (0-based)
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _my_tasks_link_request(sheet_id: int, rows: list, link_spans: dict) -> dict:
+    """updateCells: rich-text ссылка на письмо поверх текста ячейки D
+    (textFormatRuns).  Текст ячейки не меняется (он записан RAW).  Строки без
+    ссылки получают [] — старые ссылки после смены порядка строк снимаются."""
+    out = []
+    for r in rows:
+        key = r[MY_TASKS_MTG_ID_COL] if len(r) > MY_TASKS_MTG_ID_COL else None
+        text = r[MY_TASKS_TASK_COL] if len(r) > MY_TASKS_TASK_COL else ""
+        text = text if isinstance(text, str) else str(text or "")
+        runs = []
+        span = (link_spans or {}).get(key)
+        if span:
+            start, end, url = span
+            n = _utf16_len(text)
+            if 0 <= start < end <= n:
+                if start > 0:
+                    runs.append({"startIndex": 0})
+                runs.append({"startIndex": start, "format": {"link": {"uri": url}}})
+                if end < n:
+                    runs.append({"startIndex": end})
+        out.append({"values": [{"textFormatRuns": runs}]})
+    return {"updateCells": {
+        "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": len(rows) + 1,
+                  "startColumnIndex": MY_TASKS_TASK_COL,
+                  "endColumnIndex": MY_TASKS_TASK_COL + 1},
+        "rows": out,
+        "fields": "textFormatRuns",
+    }}
+
+
 def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
-                          warnings: list, editable: bool = False):
+                          warnings: list, editable: bool = False,
+                          link_spans: dict | None = None):
     """Get-or-add the user's «Мои задачи — ФИО» sheet, overwrite its data,
     format it, set the filter.  Returns the worksheet.
 
@@ -964,6 +1002,9 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     (A1:H{n}), and only after a successful update the tail of old rows below
     is cleared.  If update fails, the old content stays and the exception
     propagates (caller turns it into a warning).
+
+    link_spans (editable mode): {key: (start, end, url)} — ссылки на письма в
+    D ставятся одним updateCells после успешной записи; ошибка → warning.
     """
     if exists:
         ws = _gs_call(spreadsheet.worksheet, title)
@@ -998,6 +1039,14 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
     if need_rows > cur_rows or need_cols > cur_cols:
         _gs_call(ws.resize, rows=max(need_rows, cur_rows), cols=max(need_cols, cur_cols))
     _gs_call(ws.update, values=all_data, range_name=f"A1:H{need_rows}")
+    if editable and link_spans is not None and rows:
+        try:
+            _gs_call(spreadsheet.batch_update, {"requests": [
+                _my_tasks_link_request(ws.id, rows, link_spans)]})
+        except Exception as e:
+            msg = f"{title} (ссылки на письма): {e}"
+            logger.warning("Sheet formatting error (%s): %s", title, msg)
+            warnings.append(msg)
     # Clear leftovers of a previous (longer) run only after a successful write.
     if cur_rows > need_rows:
         try:
@@ -1179,7 +1228,9 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                     # Запись сразу после повторного чтения — окно гонки = 1 запрос
                     ws = _write_my_tasks_sheet(
                         spreadsheet, my_title, exists, rows, warnings,
-                        editable=rows_builder is not None)
+                        editable=rows_builder is not None,
+                        link_spans=(getattr(rows_builder, "link_spans", None)
+                                    if rows_builder is not None else None))
                     color_targets[ws.id] = MY_TASKS_STATUS_COL
                     my_count = len(rows)
                     if rows_builder is not None:

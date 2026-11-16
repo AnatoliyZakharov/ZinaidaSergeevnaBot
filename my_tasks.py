@@ -809,7 +809,10 @@ def reconcile_gtasks(records: dict, items: list, complete: bool, list_ids,
         for field, val in (("title", title[:TITLE_MAX_LEN]), ("origin", origin),
                            ("assignee", full_name or ""), ("deadline", _gt_due(it)),
                            ("link", _gt_email_link(it)),
-                           ("gtasks_list_id", it["_listId"]), ("gtasks_task_id", it["id"])):
+                           ("gtasks_list_id", it["_listId"]), ("gtasks_task_id", it["id"]),
+                           # Иерархия (подзадачи): пусто → None, чтобы не было лишних dirty
+                           ("gtasks_parent_id", str(it.get("parent") or "") or None),
+                           ("gtasks_position", str(it.get("position") or "") or None)):
             if rec.get(field) != val:
                 rec[field] = val
                 rec["_dirty"] = True
@@ -886,10 +889,55 @@ def _deadline_key(d: str):
         return (1, datetime.max)
 
 
+TREE_MAX_DEPTH = 10      # глубже — строки выводятся на уровне лимита
+
+
+def _tree_order(roots: list, kids_of: dict, all_keys: list) -> list:
+    """Обход в глубину: [(key, path)], path — номера по уровням (1, 2, 1).
+    Каждый ключ выводится ровно один раз (visited).  Узлы глубже
+    TREE_MAX_DEPTH выводятся на уровне лимита.  Узлы, недостижимые из корней
+    (циклы parent), после обхода поднимаются в корни (в порядке all_keys)."""
+    out: list = []
+    visited: set = set()
+    root_cnt = [0]
+
+    def run(start: list) -> None:
+        stack = [(k, (), root_cnt) for k in reversed(start)]
+        while stack:
+            key, ppath, cnt = stack.pop()
+            if key in visited:
+                continue
+            visited.add(key)
+            cnt[0] += 1
+            path = ppath + (cnt[0],)
+            out.append((key, path))
+            kids = [c for c in kids_of.get(key, ()) if c not in visited]
+            if len(path) - 1 < TREE_MAX_DEPTH:
+                sub = [0]
+                stack.extend((c, path, sub) for c in reversed(kids))
+            else:                      # лимит глубины: потомки — на этом же уровне
+                stack.extend((c, ppath, cnt) for c in reversed(kids))
+
+    run(roots)
+    for k in all_keys:                 # циклы: первый по порядку узел — корень
+        if k not in visited:
+            run([k])
+    return out
+
+
+def _row_number(path: tuple):
+    """Колонка A: корень — int (как раньше), потомок — «↳ 2.1»."""
+    return path[0] if len(path) == 1 else "↳ " + ".".join(str(n) for n in path)
+
+
 def build_sheet_rows(records: dict, active_protocol: list) -> list:
     """Строки листа: все gtasks/telegram + активные протокольные.
     [№, Дата, Источник, Задача, Ответственный, Срок, Статус, H=ключ, ключ]
-    Значения — с учётом ручных правок пользователя (display_values)."""
+    Значения — с учётом ручных правок пользователя (display_values).
+
+    Подзадачи Google Tasks (gtasks_parent_id) выводятся сразу под родителем,
+    по gtasks_position; набор строк от иерархии не зависит — меняются только
+    порядок и номер в колонке A.  Родитель вне листа → строка в корне."""
     rows = []
     active = set(active_protocol)
     for key, r in records.items():
@@ -899,9 +947,76 @@ def build_sheet_rows(records: dict, active_protocol: list) -> list:
         rows.append([None, v["task_date"], v["origin"], v["title"], v["assignee"],
                      v["deadline"], r.get("status") or ST_IN_WORK, key, key])
     rows.sort(key=lambda x: (_deadline_key(x[5]), _deadline_key(x[1]), x[3]))
-    for i, x in enumerate(rows, 1):
-        x[0] = i
-    return rows
+    by_key = {x[8]: x for x in rows}
+    parent_of: dict = {}
+    for x in rows:
+        r = records[x[8]]
+        pid = r.get("gtasks_parent_id")
+        if r.get("source") != SRC_GTASKS or not pid or not r.get("gtasks_list_id"):
+            continue
+        pkey = gt_key(r["gtasks_list_id"], pid)
+        if pkey in by_key and pkey != x[8]:
+            parent_of[x[8]] = pkey
+    if not parent_of:                  # плоский список — как раньше
+        for i, x in enumerate(rows, 1):
+            x[0] = i
+        return rows
+    kids_of: dict = {}
+    for k, pk in parent_of.items():
+        kids_of.setdefault(pk, []).append(k)
+    for lst in kids_of.values():
+        lst.sort(key=lambda k: (records[k].get("gtasks_position") is None,
+                                records[k].get("gtasks_position") or "",
+                                records[k].get("gtasks_task_id") or "", k))
+    order = [x[8] for x in rows]
+    roots = [k for k in order if k not in parent_of]
+    out = []
+    for key, path in _tree_order(roots, kids_of, order):
+        x = by_key[key]
+        x[0] = _row_number(path)
+        out.append(x)
+    return out
+
+
+# ── Ссылки на письма (rich text поверх RAW-текста ячейки «Задача») ──────────
+
+_MAIL_URL_RE = re.compile(r"https://mail\.google\.com/\S+\Z")
+_URL_BAD_CHARS = frozenset('"\'<>\\`')
+
+
+def utf16_len(s: str) -> int:
+    """Длина строки в UTF-16 code units (индексы textFormatRuns в Sheets API)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _safe_mail_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+    if any(ch in _URL_BAD_CHARS or ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+           or (0x80 <= ord(ch) <= 0x9F) for ch in url):
+        return False
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return False
+    return u.scheme == "https" and u.netloc == "mail.google.com"
+
+
+def email_link_span(cell_text, rec_link):
+    """(start, end, url) ссылки на письмо в тексте ячейки D или None.
+
+    url — https://mail.google.com/… в конце rec["link"]; span ставится, только
+    если показываемый текст ячейки заканчивается ровно этим link.  Индексы — в
+    UTF-16 code units (эмодзи ✉️ = 2)."""
+    if not isinstance(cell_text, str) or not isinstance(rec_link, str) or not rec_link:
+        return None
+    if not cell_text.endswith(rec_link):
+        return None
+    m = _MAIL_URL_RE.search(rec_link)
+    if not m or not _safe_mail_url(m.group(0)):
+        return None
+    url = m.group(0)
+    end = utf16_len(cell_text)
+    return (end - utf16_len(url), end, url)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -946,6 +1061,7 @@ class MyTasksBuilder:
         self._records: dict = {}
         self._plan: GTPlan | None = None
         self._written: dict = {}
+        self.link_spans: dict = {}        # key → (start, end, url) в ячейке D
 
     def _store(self):
         return self.dbm or _db()
@@ -1082,6 +1198,15 @@ class MyTasksBuilder:
         self._save(list(records.values()))
         rows = build_sheet_rows(records, active)
         self._written = {r[8]: (r[6], {f: r[idx] for f, idx in EDIT_FIELDS}) for r in rows}
+        self.link_spans = {}
+        for r in rows:
+            rec = records[r[8]]
+            # Текст «Задача» правился пользователем → ссылку не ставим
+            if not rec.get("link") or "title" in _json(rec.get("overrides")):
+                continue
+            span = email_link_span(r[3], rec["link"])
+            if span:
+                self.link_spans[r[8]] = span
         return [r[:8] for r in rows]
 
     def sheet_unchanged(self, before_rows, fresh_rows) -> bool:

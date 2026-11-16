@@ -1539,13 +1539,6 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             except Exception:
                 existing_ot_before = []
             _gs_call(ws.clear)
-            # clear() снимает только значения: старые объединения A:F после
-            # перезаписи легли бы на строки задач и скрыли их данные
-            try:
-                _gs_call(spreadsheet.batch_update,
-                         {"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]})
-            except Exception as e:
-                logger.warning("Sheet formatting error: %s", _err_brief(e))
         else:
             existing_ot_before = []
     except gspread.WorksheetNotFound:
@@ -1684,8 +1677,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         if existing_ot:
             all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1))
 
-    # Строки-заголовки встреч: A:F объединены, жирный шрифт, серый фон — и для
-    # новых, и для уже существующих строк (в т.ч. созданных до исправления).
+    # Строки-заголовки встреч — ПОСЛЕ общего формата листа (он ставит WRAP):
+    # OVERFLOW_CELL, жирный шрифт, серый фон A:F — для новых и уже существующих
+    # заголовков, в обычном и полном режимах одинаково.
     if ws is not None:
         if append and not new_sheet:
             final_rows = list(existing_ot) + all_rows
@@ -1789,20 +1783,17 @@ class ImportVolumeError(Exception):
 
 # ── «Разовые встречи»: строки-заголовки встреч ───────────────────────────────
 
-GROUPER_NCOLS = 6                   # A:F — ширина заголовка встречи
-GROUPER_FORMAT_FIELDS = "userEnteredFormat.textFormat,userEnteredFormat.backgroundColor"
-GROUPER_LINE_CHARS = 150            # ≈ символов в строке объединённой A:F
-GROUPER_LINE_PX = 21
+GROUPER_NCOLS = 6                   # A:F — жирный шрифт и серая заливка
+# Заголовок «перекрывает соседние ячейки» (пустые B:F), как до 0db9d26: общий
+# формат листа ставит WRAP на все строки, поэтому заголовкам OVERFLOW_CELL
+# возвращается после него на каждом синке.  Объединения ячеек не используются.
+GROUPER_FORMAT_FIELDS = ("userEnteredFormat.textFormat,userEnteredFormat.backgroundColor,"
+                         "userEnteredFormat.wrapStrategy")
 
 
 def _blank(c) -> bool:
-    """Пусто строго: None или "".  Пробел — тоже значение (MERGE_ALL удалил бы его)."""
+    """Пусто строго: None или "" (пробел — значение)."""
     return c is None or c == ""
-
-
-def _cell(rows, r, c):
-    row = rows[r] if 0 <= r < len(rows) else []
-    return row[c] if c < len(row) else ""
 
 
 def _is_grouper_row(row) -> bool:
@@ -1814,123 +1805,45 @@ def _is_grouper_row(row) -> bool:
     return all(_blank(c) for c in list(row[1:GROUPER_NCOLS]))
 
 
-def _grouper_requests(sheet_id: int, rows: list, merges: list | None,
-                      known: set = frozenset()) -> tuple:
-    """(requests, stats) для заголовков встреч листа «Разовые встречи».
+def _grouper_requests(sheet_id: int, rows: list, known: set = frozenset()) -> tuple:
+    """(requests, число заголовков) для листа «Разовые встречи».
 
-    rows — значения листа целиком (строка 0 — шапка).  Только форматирование:
-    значения ячеек не меняются.
-      • объединение A:F — только если B:F строки пусты и строку не задевает
-        другое объединение; уже объединённая A:F строка не трогается;
-      • объединение, под которым скрыты непустые ячейки (например, старое,
-        съехавшее на строку задачи), снимается — данные снова видны;
-      • прочие чужие объединения не трогаются, конфликтный заголовок
-        остаётся без объединения;
-      • формат: жирный, серый фон (маска textFormat/backgroundColor — перенос
-        и выравнивание листа сохраняются); длинным — высота строки.
-    merges=None — метаданные не прочитаны: только формат, объединения не
-    меняются.
-    """
-    stats = {"groupers": 0, "merged": 0, "already": 0, "conflicts": 0,
-             "unmerged": 0}
-    groupers = sorted(r for r in range(1, len(rows))
-                      if _is_grouper_row(rows[r])
-                      or (r in known and all(_blank(c) for c in
-                                              list(rows[r][1:GROUPER_NCOLS]))))
-    stats["groupers"] = len(groupers)
-    unmerge, merge, fmt, heights = [], [], [], []
-    live: list = []                       # объединения, которые остаются
-    for m in (merges or []):
-        sr, er = int(m.get("startRowIndex", 0)), int(m.get("endRowIndex", 10 ** 7))
-        sc, ec = int(m.get("startColumnIndex", 0)), int(m.get("endColumnIndex", 10 ** 4))
-        hides = any(not _blank(_cell(rows, r, c))
-                    for r in range(sr, min(er, len(rows)))
-                    for c in range(sc, min(ec, GROUPER_NCOLS + 1))
-                    if (r, c) != (sr, sc))
-        # шапку таблицы и объединения за пределами A:F (например, G) не трогаем
-        if hides and sr >= 1 and ec <= GROUPER_NCOLS:
-            unmerge.append({"unmergeCells": {"range": {
-                "sheetId": sheet_id, "startRowIndex": sr, "endRowIndex": er,
-                "startColumnIndex": sc, "endColumnIndex": ec}}})
-            stats["unmerged"] += 1
-        else:
-            live.append((sr, er, sc, ec))
-    for r in groupers:
-        rng = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
-               "startColumnIndex": 0, "endColumnIndex": GROUPER_NCOLS}
-        merged_after = False               # будет ли строка объединена A:F
-        if merges is not None:
-            if (r, r + 1, 0, GROUPER_NCOLS) in live:
-                stats["already"] += 1
-                merged_after = True
-            elif any(sr < r + 1 and r < er and sc < GROUPER_NCOLS and 0 < ec
-                     for sr, er, sc, ec in live):
-                stats["conflicts"] += 1
-            else:
-                merge.append({"mergeCells": {"range": rng, "mergeType": "MERGE_ALL"}})
-                stats["merged"] += 1
-                merged_after = True
-        fmt.append({"repeatCell": {
-            "range": rng,
-            "cell": {"userEnteredFormat": dict(GROUPER_FORMAT)},
-            "fields": GROUPER_FORMAT_FIELDS,
-        }})
-        if not merged_after:
-            continue   # без объединения (A = 50px) высоту оставляем авторазмеру
-        label = str(rows[r][0])
-        lines = max(1, -(-len(label) // GROUPER_LINE_CHARS))
-        # явная высота объединённой строки: авторазмер считался до объединения
-        heights.append({"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                      "startIndex": r, "endIndex": r + 1},
-            "properties": {"pixelSize": GROUPER_LINE_PX * lines},
-            "fields": "pixelSize"}})
-    stats["merge_requests"] = len(unmerge) + len(merge)
-    stats["height_requests"] = len(heights)
-    # высоты — в конце: при отказе объединений повтор берёт только формат
-    return unmerge + merge + fmt + heights, stats
+    rows — значения листа целиком (строка 0 — шапка).  Только формат строк-
+    заголовков A:F: жирный, серая заливка, wrapStrategy OVERFLOW_CELL; затем
+    авторазмер их высоты (без фиксированной высоты).  Значения, строки задач,
+    шапка и объединения ячеек не затрагиваются.  known — позиции заголовков,
+    записанных в этом синке (название встречи может быть числом)."""
+    groupers = [r for r in range(1, len(rows))
+                if _is_grouper_row(rows[r])
+                or (r in known and rows[r] and not _blank(rows[r][0])
+                    and all(_blank(c) for c in list(rows[r][1:GROUPER_NCOLS])))]
+    fmt = dict(GROUPER_FORMAT)
+    fmt["wrapStrategy"] = "OVERFLOW_CELL"
+    reqs = [{"repeatCell": {
+        "range": {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
+                  "startColumnIndex": 0, "endColumnIndex": GROUPER_NCOLS},
+        "cell": {"userEnteredFormat": dict(fmt)},
+        "fields": GROUPER_FORMAT_FIELDS,
+    }} for r in groupers]
+    # Высота считалась при WRAP в колонке 50px — пересчитываем авторазмером
+    reqs += [{"autoResizeDimensions": {"dimensions": {
+        "sheetId": sheet_id, "dimension": "ROWS", "startIndex": r, "endIndex": r + 1}}}
+        for r in groupers]
+    return reqs, len(groupers)
 
 
 def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
-    """Применяет _grouper_requests к листу; ошибки — только предупреждения."""
-    warnings: list = []
-    merges = None
+    """Применяет _grouper_requests к листу; ошибка — только предупреждение."""
+    reqs, n = _grouper_requests(ws.id, rows, known)
+    logger.info("One-time groupers: %d", n)
+    if not reqs:
+        return []
     try:
-        meta = _gs_call(spreadsheet.fetch_sheet_metadata,
-                        params={"fields": "sheets(properties(sheetId),merges)"})
-        for sh in (meta or {}).get("sheets") or [] if isinstance(meta, dict) else []:
-            if ((sh or {}).get("properties") or {}).get("sheetId") == ws.id:
-                merges = list(sh.get("merges") or [])
-        # листа нет в ответе → merges остаётся None: объединения не трогаем
+        _gs_call(spreadsheet.batch_update, {"requests": reqs})
     except Exception as e:
-        merges = None                       # без метаданных объединения не трогаем
         logger.warning("Sheet formatting error: %s", _err_brief(e))
-    reqs, st = _grouper_requests(ws.id, rows, merges, known)
-    logger.info("One-time groupers: total=%d merged=%d already=%d conflicts=%d "
-                "unmerged=%d", st["groupers"], st["merged"], st["already"],
-                st["conflicts"], st["unmerged"])
-    if st["conflicts"]:
-        warnings.append(f"Разовые встречи: {st['conflicts']} заголовков не объединены — "
-                        f"мешает существующее объединение ячеек")
-    if reqs:
-        try:
-            _gs_call(spreadsheet.batch_update, {"requests": reqs})
-        except Exception as e:
-            logger.warning("Sheet formatting error: %s", _err_brief(e))
-            # Пакет атомарен: при отказе объединений (фильтр, защита…) повторяем
-            # только формат, чтобы заголовки остались жирными и серыми
-            fmt_only = reqs[st.get("merge_requests", 0):
-                            len(reqs) - st.get("height_requests", 0)]
-            if st.get("merge_requests") and fmt_only:
-                try:
-                    _gs_call(spreadsheet.batch_update, {"requests": fmt_only})
-                    warnings.append("Разовые встречи: заголовки не объединены "
-                                    f"(ошибка Google Sheets: {_err_brief(e)})")
-                    return warnings
-                except Exception as e2:
-                    logger.warning("Sheet formatting error: %s", _err_brief(e2))
-            warnings.append(f"Разовые встречи (заголовки встреч): {e}")
-    return warnings
+        return [f"Разовые встречи (заголовки встреч): {e}"]
+    return []
 
 
 def _all_protocol_keys(spreadsheet) -> set:

@@ -325,7 +325,9 @@ def _load_main_async(names, ns_extra, assigns=()):
     import typing
     ns = {"asyncio": asyncio, "Optional": typing.Optional, "datetime": datetime,
           "timezone": timezone, "Update": object, "Bot": object,
-          "ContextTypes": NS(DEFAULT_TYPE=object)}
+          "ContextTypes": NS(DEFAULT_TYPE=object),
+          # аналитика (#46): обработчики вызывают _track — здесь no-op
+          "_track": lambda *a, **k: None}
     ns.update(ns_extra)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), ns)
     return ns

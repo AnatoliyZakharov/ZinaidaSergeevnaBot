@@ -1147,7 +1147,7 @@ def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -
         vranges = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
         fresh = (vranges[0] or {}).get("values") or [] if vranges else []
     except Exception as e:
-        logger.warning("My tasks: re-read failed (%s): %s", title, type(e).__name__)
+        logger.warning("My tasks: re-read failed: %s", type(e).__name__)
         return False
     return rows_builder.sheet_unchanged(before_rows, fresh)
 
@@ -1210,7 +1210,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
         if my_title in protocol_titles:
             msg = (f"Лист «{my_title}» занят протоколом встречи с таким "
                    f"же названием — личный лист не обновлён")
-            logger.warning("My tasks: %s", msg)
+            logger.warning("My tasks: personal sheet name taken by a protocol sheet")   # без названия листа (ФИО)
             warnings.append(msg)
         else:
             try:
@@ -1232,7 +1232,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                f"удаления)")
                         rows = None
                         rows_builder.blocked("shrink")
-                        logger.warning("My tasks: %s", msg)
+                        logger.warning("My tasks: mass-shrink guard, sheet not rewritten")   # без названия листа (ФИО)
                         warnings.append(msg)
                     elif exists and not _my_tasks_sheet_stable(
                             spreadsheet, my_title, my_rows, rows_builder):
@@ -1242,7 +1242,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                f"запись отложена, повторю")
                         rows = None
                         rows_builder.blocked("conflict")
-                        logger.warning("My tasks: %s", msg)
+                        logger.warning("My tasks: sheet changed during sync, not rewritten")   # без названия листа (ФИО)
                         warnings.append(msg)
                 if rows is not None:
                     # Запись сразу после повторного чтения — окно гонки = 1 запрос

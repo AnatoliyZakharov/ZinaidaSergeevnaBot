@@ -1317,7 +1317,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     cfg = _build_user_config(user_config)
     st = stats if stats is not None else {}
     st.update(fetched=0, after_date=0, after_org=0, protocols_failed=0,
-              protocols_missing=0, total_tasks=0, new_rows=0, skipped_known=0)
+              protocols_missing=0, total_tasks=0, new_rows=0, skipped_known=0,
+              protocols_written=False, registry="skipped", my_tasks="skipped")
     logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
 
     raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
@@ -1703,11 +1704,17 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
 
     # Все записи прошли — запоминаем импортированные ключи (повтор не создаст
     # дублей, даже если строку удалят или перенесут вручную).
+    # Реестр не влияет на «Мои задачи»: личный лист строится из всех
+    # протокольных листов таблицы, поэтому повтор после сбоя доставит задачи
+    # даже для ключей, уже записанных в реестр.
+    st["protocols_written"] = True
     if registry is not None and candidate_keys:
         try:
             registry.record(candidate_keys)
+            st["registry"] = "ok"
         except Exception as e:
-            # Не критично: дубли всё равно отсекаются по листам
+            # Дубли всё равно отсекаются по листам; исход станет partial
+            st["registry"] = "failed"
             logger.warning("MYmeet import registry write failed: %s", type(e).__name__)
 
     # ── Status colours + personal «Мои задачи» sheet ──────────────────────────
@@ -1715,20 +1722,36 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     full_name = (cfg.get("full_name") or "").strip()
     my_tasks_count = None
     my_tasks_title = None
+    _builder = cfg.get("my_tasks_builder")
     try:
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name, rows_builder=cfg.get("my_tasks_builder"))
+            spreadsheet, full_name, rows_builder=_builder)
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
         all_fmt_warnings.append(f"Мои задачи / цвета статусов: {e}")
+    # Итог доставки в личный лист — отдельно от записи протоколов
+    if not full_name:
+        st["my_tasks"] = "no_name"          # личного листа нет по настройке
+    elif my_tasks_count is not None and (_builder is None
+                                         or getattr(_builder, "committed", True)):
+        st["my_tasks"] = "ok"
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "shrink":
+        st["my_tasks"] = "guard"            # защита от массового удаления
+    elif _builder is not None and getattr(_builder, "block_reason", None) == "conflict":
+        st["my_tasks"] = "conflict"         # пользователь правил лист — повтор
+    elif _builder is not None and getattr(_builder, "anomaly", None):
+        st["my_tasks"] = "anomaly"
+    else:
+        st["my_tasks"] = "failed"           # ошибка записи / Sheets / имя занято
     if not full_name:
         my_tasks_line = (f"\n👤 Лист «{MY_TASKS_SHEET_PREFIX}ФИО» не создан. "
                          f"Укажите ФИО: /setname Имя Фамилия")
-    elif my_tasks_count is not None:
+    elif st["my_tasks"] == "ok":
         my_tasks_line = f"\n👤 Лист «{my_tasks_title}»: {my_tasks_count} задач"
     else:
-        my_tasks_line = ""
+        my_tasks_line = ("\n⚠️ Лист «Мои задачи» не обновлён — протоколы записаны, "
+                         "повторите синхронизацию позже")
 
     fmt_warn_text = (
         f"\n⚠️ Ошибки форматирования ({len(all_fmt_warnings)}):\n"
@@ -1751,9 +1774,11 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     )
     # В лог — только счётчики (без названий листов, ФИО и текста задач)
     logger.info("MYmeet sync done: days=%d append=%s tasks=%d new_rows=%d sheets=%d "
-                "proto_failed=%d proto_missing=%d fmt_warnings=%d", days, append,
+                "proto_failed=%d proto_missing=%d protocols_written=%s registry=%s "
+                "my_tasks=%s fmt_warnings=%d", days, append,
                 total_tasks, st["new_rows"], sheets_written, st["protocols_failed"],
-                st["protocols_missing"], len(all_fmt_warnings))
+                st["protocols_missing"], st["protocols_written"], st["registry"],
+                st["my_tasks"], len(all_fmt_warnings))
     return result
 
 
@@ -1896,6 +1921,26 @@ def classify_sync_error(exc: BaseException) -> tuple:
             return AUTO_CONFIG, "sheet_access"
         return AUTO_TRANSIENT, "sheets_api"
     return AUTO_TRANSIENT, "internal"
+
+
+def auto_outcome(stats: dict) -> dict:
+    """Исход успешно завершившегося sync_to_sheets: полный успех — только если
+    протоколы загружены и записаны, реестр сохранён и личный лист «Мои задачи»
+    обновлён (или его нет по настройке — нет ФИО).  Иначе слот не закрывается
+    и повторяется; личный лист при повторе строится заново из протокольных
+    листов, поэтому задачи доставляются и для ключей из реестра."""
+    if stats.get("protocols_failed"):
+        return {"outcome": AUTO_PARTIAL, "reason": "protocols"}
+    if not stats.get("protocols_written"):
+        return {"outcome": AUTO_TRANSIENT, "reason": "internal"}
+    mt = stats.get("my_tasks")
+    if mt == "guard":
+        return {"outcome": AUTO_CONFIG, "reason": "my_tasks_guard"}
+    if mt not in ("ok", "no_name"):
+        return {"outcome": AUTO_PARTIAL, "reason": "my_tasks_sheet"}
+    if stats.get("registry") == "failed":
+        return {"outcome": AUTO_PARTIAL, "reason": "registry"}
+    return {"outcome": AUTO_OK, "reason": None}
 
 
 def auto_record(state: dict | None, slot: str, outcome: str, reason: str | None,

@@ -1524,6 +1524,12 @@ MYMEET_AUTO_REASON_TEXT = {
     "mymeet_api": "MYmeet отвечает ошибкой. Повторю автоматически.",
     "mymeet_unavailable": "MYmeet временно недоступен. Повторю автоматически.",
     "protocols": "Часть протоколов MYmeet не загрузилась. Повторю автоматически.",
+    "my_tasks_sheet": "Задачи записаны в листы протоколов, но лист «Мои задачи» не "
+                      "обновился. Повторю автоматически.",
+    "my_tasks_guard": "Лист «Мои задачи» не обновлён: сработала защита от массового "
+                      "удаления строк. Нужна проверка таблицы.",
+    "registry": "Задачи записаны, но не удалось сохранить отметку об импорте. "
+                "Повторю автоматически.",
     "google_not_connected": "Google не подключён — он нужен, чтобы отобрать встречи, "
                             "где вы организатор. Подключите: /connect",
     "google_token_invalid": "Доступ к Google истёк или отозван. Переподключите: /connect",
@@ -1582,8 +1588,7 @@ async def _run_mymeet_auto(user, state: dict | None, now_ts: float) -> dict:
         outcome, reason = mymeet_sync.classify_sync_error(e)
         res.update(outcome=outcome, reason=reason)
         return res
-    if res["stats"].get("protocols_failed"):
-        res.update(outcome=mymeet_sync.AUTO_PARTIAL, reason="protocols")
+    res.update(mymeet_sync.auto_outcome(res["stats"]))
     return res
 
 
@@ -1623,12 +1628,14 @@ async def scheduled_mymeet_sync(bot: Bot):
             logger.info(
                 "MYmeet auto [%s] slot=%s window=%sd%s outcome=%s reason=%s attempt=%s "
                 "fetched=%s organizer=%s tasks=%s new_rows=%s proto_failed=%s "
-                "proto_missing=%s", telegram_id, slot, res["days"],
+                "proto_missing=%s protocols_written=%s registry=%s my_tasks=%s",
+                telegram_id, slot, res["days"],
                 " (truncated)" if res["truncated"] else "", res["outcome"],
                 res["reason"] or "-", fields["slot_attempts"], st.get("fetched", "-"),
                 st.get("after_org", "-"), st.get("total_tasks", "-"),
                 st.get("new_rows", "-"), st.get("protocols_failed", "-"),
-                st.get("protocols_missing", "-"))
+                st.get("protocols_missing", "-"), st.get("protocols_written", "-"),
+                st.get("registry", "-"), st.get("my_tasks", "-"))
             if notify:
                 await bot.send_message(chat_id=telegram_id,
                                        text=_mymeet_auto_notice(res["reason"], state, tz),

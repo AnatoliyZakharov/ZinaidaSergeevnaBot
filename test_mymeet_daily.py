@@ -61,6 +61,7 @@ class Book:
         self.ss.worksheet.side_effect = self._get
         self.ss.add_worksheet.side_effect = lambda title, rows, cols: self._new(title, [])
         self.fail_reads = False
+        self.fail_update = ()     # префиксы листов, запись в которые падает
 
     def _get(self, title):
         if title not in self.ws:
@@ -76,6 +77,8 @@ class Book:
         self.data[title] = rows
 
         def _upd(*args, **kw):
+            if any(title.startswith(p) for p in self.fail_update):
+                raise RuntimeError("sheets-503")
             rng = kw.get("range_name")
             vals = kw.get("values")
             for a in args:
@@ -585,6 +588,150 @@ def test_sheet_name_collision_keeps_all_rows():
         assert made.count(name) == 1 and "Синк 1-1" not in made, made
 
 
+MY_TITLE = f"Мои задачи — {ME}"
+
+
+def _my_task_names(env):
+    return [r[3] for r in env.my_tasks_sheet()[1:] if len(r) > 3]
+
+
+def test_my_tasks_failure_not_success_then_recovered():
+    """Аудит B-1: протоколы записаны, личный лист — нет → не ok, слот не
+    закрыт; после восстановления Sheets повтор доставляет задачу в «Мои задачи»
+    (ключ уже в реестре), без дублей в протоколах, ручной статус сохранён."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.mm.add("m1", "Стратсессия", _now() - timedelta(hours=3), [("Отчёт", ME, False)])
+        b = env.book()
+        b.fail_update = ("Мои задачи",)
+        env.force_due()
+        bot = Bot()
+        env.tick(bot)
+        st = env.db.mymeet_sync_get(1)
+        assert (st["last_outcome"], st["last_reason"]) == ("partial", "my_tasks_sheet"), st
+        assert st["last_success_slot"] == "2000-01-01", st          # слот не закрыт
+        assert [r[1] for r in b.task_rows()] == ["Отчёт"]           # протокол записан
+        assert "Отчёт" not in _my_task_names(env)
+        conn = __import__("sqlite3").connect(env.db.DB_PATH)
+        assert conn.execute("SELECT COUNT(*) FROM mymeet_imported").fetchone()[0] == 1
+        conn.close()                                                # ключ уже в реестре
+        # Ручная правка статуса в протоколе до восстановления
+        for r in b.data[env.ms.ONE_TIME_SHEET_NAME]:
+            if len(r) > 2 and r[2] == "Отчёт":
+                r[5] = "В работе"
+        # Ещё два сбоя → уведомление (временная причина — после 3 подряд)
+        for _ in range(2):
+            env.db.mymeet_sync_save(1, next_attempt_ts=0)
+            env.tick(bot)
+        assert len(bot.sent) == 1 and "«Мои задачи» не" in bot.sent[0][1], bot.sent
+        # Sheets восстановился
+        b.fail_update = ()
+        env.db.mymeet_sync_save(1, next_attempt_ts=0)
+        env.tick(bot)
+        st = env.db.mymeet_sync_get(1)
+        assert st["last_outcome"] == "ok" and st["last_success_slot"] != "2000-01-01", st
+        assert b.task_rows() == [(env.ms.ONE_TIME_SHEET_NAME, "Отчёт", ME, "В работе")]
+        mt = env.my_tasks_sheet()
+        row = next(r for r in mt[1:] if len(r) > 3 and r[3] == "Отчёт")
+        # Новая для «Мои задачи» задача — «Требует верификации» (правило #39 п.7),
+        # ручной статус в листе протокола при этом сохранён (проверено выше)
+        assert UNVERIFIED in row, row
+        # Повтор: без дублей и без изменения статусов
+        env.force_due()
+        env.tick(bot)
+        assert _my_task_names(env).count("Отчёт") == 1
+        assert len(b.task_rows()) == 1
+
+
+def test_my_tasks_manual_edit_survives_retry():
+    """Ручной статус в «Мои задачи» не сбрасывается повторным импортом после сбоя."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.mm.add("m1", "Стратсессия", _now() - timedelta(hours=3), [("Отчёт", ME, False)])
+        env.force_due()
+        env.tick()
+        mt = env.my_tasks_sheet()
+        hdr = mt[0]
+        col = next(i for i, h in enumerate(hdr) if "Статус" in str(h))
+        row = next(r for r in mt[1:] if len(r) > 3 and r[3] == "Отчёт")
+        row[col] = "Выполнено"
+        b = env.book()
+        b.fail_update = ("Мои задачи",)
+        env.force_due()
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "partial"
+        b.fail_update = ()
+        env.db.mymeet_sync_save(1, next_attempt_ts=0)
+        env.tick()
+        row = next(r for r in env.my_tasks_sheet()[1:] if len(r) > 3 and r[3] == "Отчёт")
+        assert row[col] == "Выполнено", row
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "ok"
+
+
+def test_registry_failure_is_partial_no_loss():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.mm.add("m1", "Стратсессия", _now() - timedelta(hours=3), [("Отчёт", ME, False)])
+        real_add = env.db.mymeet_imported_add
+
+        def _boom(*a, **k):
+            raise RuntimeError("db locked")
+        env.db.mymeet_imported_add = _boom
+        env.force_due()
+        env.tick()
+        st = env.db.mymeet_sync_get(1)
+        assert (st["last_outcome"], st["last_reason"]) == ("partial", "registry"), st
+        assert st["last_success_slot"] == "2000-01-01"
+        assert "Отчёт" in _my_task_names(env)                         # задача доставлена
+        env.db.mymeet_imported_add = real_add
+        env.db.mymeet_sync_save(1, next_attempt_ts=0)
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "ok"
+        assert len(env.book().task_rows()) == 1 and _my_task_names(env).count("Отчёт") == 1
+
+
+def test_partial_protocol_write_then_retry_no_dupes():
+    """Сбой записи второго протокольного листа: нет ложного успеха, реестр не
+    записан; повтор дописывает остаток без дублей."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        n = _now()
+        env.mm.add("a1", "Планёрка", n - timedelta(hours=5), [("A1", ME, False)])
+        env.mm.add("a2", "Планёрка", n - timedelta(hours=4), [("A2", ME, False)])
+        env.mm.add("o1", "Разовая", n - timedelta(hours=2), [("O1", ME, False)])
+        b = env.book()
+        b.fail_update = (env.ms.ONE_TIME_SHEET_NAME,)
+        env.force_due()
+        env.tick()
+        st = env.db.mymeet_sync_get(1)
+        assert st["last_outcome"] == "transient" and st["last_success_slot"] == "2000-01-01", st
+        assert sorted(r[1] for r in b.task_rows()) == ["A1", "A2"]
+        conn = __import__("sqlite3").connect(env.db.DB_PATH)
+        assert conn.execute("SELECT COUNT(*) FROM mymeet_imported").fetchone()[0] == 0
+        conn.close()
+        b.fail_update = ()
+        env.db.mymeet_sync_save(1, next_attempt_ts=0)
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "ok"
+        assert sorted(r[1] for r in b.task_rows()) == ["A1", "A2", "O1"]
+        assert sorted(_my_task_names(env)) == ["A1", "A2", "O1"]
+
+
+def test_auto_outcome_matrix():
+    ms = _ms()
+    base = {"protocols_written": True, "registry": "ok", "my_tasks": "ok"}
+    assert ms.auto_outcome(base) == {"outcome": "ok", "reason": None}
+    assert ms.auto_outcome({**base, "my_tasks": "no_name"})["outcome"] == "ok"
+    for mt in ("failed", "conflict", "anomaly", "skipped"):
+        assert ms.auto_outcome({**base, "my_tasks": mt}) == {
+            "outcome": "partial", "reason": "my_tasks_sheet"}, mt
+    assert ms.auto_outcome({**base, "my_tasks": "guard"})["outcome"] == "config"
+    assert ms.auto_outcome({**base, "registry": "failed"})["reason"] == "registry"
+    assert ms.auto_outcome({**base, "registry": "skipped"})["outcome"] == "ok"   # нечего записывать
+    assert ms.auto_outcome({**base, "protocols_failed": 1})["reason"] == "protocols"
+    assert ms.auto_outcome({**base, "protocols_written": False})["outcome"] == "transient"
+
+
 def test_volume_guard_writes_nothing():
     with tempfile.TemporaryDirectory() as tmp:
         env = Env(tmp)
@@ -699,6 +846,13 @@ TESTS = [
     (test_existing_rows_without_registry_not_duplicated,
      "MYmeet авто: старые строки (до реестра) не дублируются"),
     (test_sheet_name_collision_keeps_all_rows, "MYmeet авто: одно имя листа у разных встреч"),
+    (test_my_tasks_failure_not_success_then_recovered,
+     "MYmeet авто: сбой «Мои задачи» ≠ успех; повтор доставляет без дублей"),
+    (test_my_tasks_manual_edit_survives_retry, "MYmeet авто: ручной статус в «Мои задачи» после повтора"),
+    (test_registry_failure_is_partial_no_loss, "MYmeet авто: сбой реестра → partial, без потерь"),
+    (test_partial_protocol_write_then_retry_no_dupes,
+     "MYmeet авто: частичная запись протоколов → повтор без дублей"),
+    (test_auto_outcome_matrix, "MYmeet авто: матрица исходов протоколы/реестр/«Мои задачи»"),
     (test_volume_guard_writes_nothing, "MYmeet авто: лимит объёма — ничего не записано"),
     (test_dedup_read_failure_writes_nothing, "MYmeet авто: нет чтения листов — нет записи"),
     (test_parallel_jobs_serialized_by_user_lock, "MYmeet авто: параллельные задания по очереди"),

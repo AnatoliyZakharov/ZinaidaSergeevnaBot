@@ -77,7 +77,7 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CONFERENCE_PATTERNS = re.compile(
     r"(zoom\.us|teams\.microsoft\.com|webex\.com|whereby\.com|"
     r"gotomeeting\.com|bluejeans\.com|meet\.jit\.si|"
-    r"telemost\.yandex\.ru|telemost\.yandex\.net)",
+    r"telemost\.yandex\.(?:ru|com|net)|telemost\.360\.yandex\.(?:ru|com))",
     re.IGNORECASE,
 )
 
@@ -188,6 +188,32 @@ def get_events_next_7_days(telegram_id: int) -> list[dict]:
     return result.get("items", [])
 
 
+def _telemost_line(link) -> str:
+    """Строка описания события со ссылкой Телемоста.
+
+    Явная HTML-ссылка <a href> (Google Calendar рендерит её в описании), чтобы
+    мобильный клиент не распознавал длинный номер конференции как телефон.
+    Только для URL из allowlist Телемоста (https, хост Телемоста, путь /j/цифры);
+    иначе — прежний текстовый формат."""
+    import html
+    import re as _re
+    from urllib.parse import urlsplit
+    plain = f"🔗 Яндекс Телемост: {link}"
+    hosts = ("telemost.yandex.ru", "telemost.yandex.com", "telemost.yandex.net",
+             "telemost.360.yandex.ru", "telemost.360.yandex.com")
+    url = link if isinstance(link, str) else ""
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return plain
+    if (u.scheme != "https" or u.netloc not in hosts or u.query or u.fragment
+            or not _re.fullmatch(r"/j/[0-9]+", u.path)
+            or url != f"https://{u.netloc}{u.path}"):
+        return plain
+    safe = html.escape(url, quote=True)
+    return f'🔗 Яндекс Телемост: <a href="{safe}">{safe}</a>'
+
+
 def create_calendar_event(
     telegram_id: int,
     title: str,
@@ -210,7 +236,7 @@ def create_calendar_event(
         "end":   {"dateTime": end_dt.isoformat(),   "timeZone": tz.zone},
     }
     if telemost_link:
-        body["description"] = f"🔗 Яндекс Телемост: {telemost_link}"
+        body["description"] = _telemost_line(telemost_link)
     return service.events().insert(calendarId=calendar_id, body=body).execute()
 
 
@@ -242,7 +268,7 @@ def add_telemost_to_event(telegram_id: int, event: dict, link: str) -> bool:
         calendar_id = _get_calendar_id(user)
         service = get_calendar_service(telegram_id)
         old_desc = event.get("description") or ""
-        line = f"🔗 Яндекс Телемост: {link}"
+        line = _telemost_line(link)
         new_desc = f"{old_desc}\n\n{line}" if old_desc else line
         service.events().patch(
             calendarId=calendar_id,

@@ -1201,7 +1201,8 @@ def test_build_my_tasks_rows_one_time_dedup_without_mtg_id():
 # ── #21: Телемост только во встречи, где пользователь — организатор ──
 
 _TELEMOST_FUNCS = ("_is_event_organizer", "_fetch_fresh_event", "has_conference_link",
-                   "add_telemost_to_event", "process_telemost_links", "format_telemost_report")
+                   "add_telemost_to_event", "process_telemost_links", "format_telemost_report",
+                   "_telemost_line")
 
 
 def _load_main_funcs(names, extra_ns=None, assigns=("CONFERENCE_PATTERNS",)):
@@ -1347,7 +1348,10 @@ def test_telemost_organizer_no_link_added():
     assert call["eventId"] == "e1" and call["calendarId"] == "primary"
     desc = call["body"]["description"]
     assert desc.startswith("Повестка"), desc
-    assert desc.count("https://telemost.yandex.ru/j/0") == 1
+    # одна строка Телемоста; URL — в href и в тексте ссылки (issue #36)
+    assert desc.count("Яндекс Телемост") == 1, desc
+    assert desc.endswith('🔗 Яндекс Телемост: <a href="https://telemost.yandex.ru/j/0">'
+                         'https://telemost.yandex.ru/j/0</a>'), desc
     # остальные поля события не тронуты
     assert cal.store["e1"]["summary"] == "Встреча e1"
     assert cal.store["e1"]["organizer"]["self"] is True
@@ -1410,7 +1414,9 @@ def test_telemost_repeated_run_no_duplicates():
     assert create.call_count == 2
     assert len(cal.patch_calls) == 2
     for eid in ("r1", "r2"):
-        assert cal.store[eid]["description"].count("telemost.yandex.ru") == 1
+        # одна строка Телемоста (URL дважды: href + текст ссылки, issue #36)
+        assert cal.store[eid]["description"].count("Яндекс Телемост") == 1
+        assert cal.store[eid]["description"].count("<a href=") == 1
 
 
 def test_telemost_race_fresh_has_link():
@@ -1584,6 +1590,9 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    # issue #36: иерархия Google Tasks, ссылки на письма, ссылка Телемоста
+    from test_gt_hierarchy_links import TESTS as _ISSUE36_TESTS
+    tests += _ISSUE36_TESTS
     # issue #32: диагностика отказа Google Tasks и проверка выданных scopes
     from test_google_errors import TESTS as _GOOGLE_ERRORS_TESTS
     tests += _GOOGLE_ERRORS_TESTS

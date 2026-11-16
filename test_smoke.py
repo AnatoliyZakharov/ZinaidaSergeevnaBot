@@ -1606,6 +1606,9 @@ if __name__ == "__main__":
     # issue #41: заголовки встреч «Разовые встречи» (OVERFLOW_CELL, без объединения)
     from test_grouper_format import TESTS as _GROUPER_TESTS
     tests += _GROUPER_TESTS
+    # issue #33: токен бота не попадает в логи (httpx INFO, traceback)
+    from test_log_security import TESTS as _LOG_SECURITY_TESTS
+    tests += _LOG_SECURITY_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

@@ -1677,32 +1677,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         if existing_ot:
             all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(existing_ot) - 1))
 
-    # Batch-format all grouper rows in a single API call (saves N-1 API calls)
-    if all_rows and grouper_rel_positions:
-        sid = ws.id
-        grouper_requests = []
-        for rel in grouper_rel_positions:
-            abs_row = start_row + rel - 1  # 0-based row index
-            grouper_requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sid,
-                        "startRowIndex": abs_row, "endRowIndex": abs_row + 1,
-                        "startColumnIndex": 0, "endColumnIndex": 6,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "textFormat": {"bold": True, "fontSize": 10},
-                            "backgroundColor": {"red": 0.878, "green": 0.878, "blue": 0.878},
-                        }
-                    },
-                    "fields": "userEnteredFormat",
-                }
-            })
-        try:
-            _gs_call(spreadsheet.batch_update, {"requests": grouper_requests})
-        except Exception as e:
-            logger.warning("Sheet formatting error: %s", _err_brief(e))
+    # Строки-заголовки встреч — ПОСЛЕ общего формата листа (он ставит WRAP):
+    # OVERFLOW_CELL, жирный шрифт, серый фон A:F — для новых и уже существующих
+    # заголовков, в обычном и полном режимах одинаково.
+    if ws is not None:
+        if append and not new_sheet:
+            final_rows = list(existing_ot) + all_rows
+        else:
+            final_rows = [HEADER_ROW] + all_rows
+        known = {start_row - 1 + rel for rel in grouper_rel_positions} if all_rows else set()
+        all_fmt_warnings.extend(_format_one_time_groupers(spreadsheet, ws, final_rows, known))
 
     # Все записи прошли — запоминаем импортированные ключи (повтор не создаст
     # дублей, даже если строку удалят или перенесут вручную).
@@ -1795,6 +1779,71 @@ class ImportVolumeError(Exception):
         super().__init__(f"{count} новых строк > лимита {limit}")
         self.count = count
         self.limit = limit
+
+
+# ── «Разовые встречи»: строки-заголовки встреч ───────────────────────────────
+
+GROUPER_NCOLS = 6                   # A:F — жирный шрифт и серая заливка
+# Заголовок «перекрывает соседние ячейки» (пустые B:F), как до 0db9d26: общий
+# формат листа ставит WRAP на все строки, поэтому заголовкам OVERFLOW_CELL
+# возвращается после него на каждом синке.  Объединения ячеек не используются.
+GROUPER_FORMAT_FIELDS = ("userEnteredFormat.textFormat,userEnteredFormat.backgroundColor,"
+                         "userEnteredFormat.wrapStrategy")
+
+
+def _blank(c) -> bool:
+    """Пусто строго: None или "" (пробел — значение)."""
+    return c is None or c == ""
+
+
+def _is_grouper_row(row) -> bool:
+    """Заголовок встречи: текст в A (не номер задачи), B:F пусты."""
+    if not row or _blank(row[0]):
+        return False
+    if isinstance(row[0], int) or str(row[0]).strip().isdigit():
+        return False
+    return all(_blank(c) for c in list(row[1:GROUPER_NCOLS]))
+
+
+def _grouper_requests(sheet_id: int, rows: list, known: set = frozenset()) -> tuple:
+    """(requests, число заголовков) для листа «Разовые встречи».
+
+    rows — значения листа целиком (строка 0 — шапка).  Только формат строк-
+    заголовков A:F: жирный, серая заливка, wrapStrategy OVERFLOW_CELL; затем
+    авторазмер их высоты (без фиксированной высоты).  Значения, строки задач,
+    шапка и объединения ячеек не затрагиваются.  known — позиции заголовков,
+    записанных в этом синке (название встречи может быть числом)."""
+    groupers = [r for r in range(1, len(rows))
+                if _is_grouper_row(rows[r])
+                or (r in known and rows[r] and not _blank(rows[r][0])
+                    and all(_blank(c) for c in list(rows[r][1:GROUPER_NCOLS])))]
+    fmt = dict(GROUPER_FORMAT)
+    fmt["wrapStrategy"] = "OVERFLOW_CELL"
+    reqs = [{"repeatCell": {
+        "range": {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
+                  "startColumnIndex": 0, "endColumnIndex": GROUPER_NCOLS},
+        "cell": {"userEnteredFormat": dict(fmt)},
+        "fields": GROUPER_FORMAT_FIELDS,
+    }} for r in groupers]
+    # Высота считалась при WRAP в колонке 50px — пересчитываем авторазмером
+    reqs += [{"autoResizeDimensions": {"dimensions": {
+        "sheetId": sheet_id, "dimension": "ROWS", "startIndex": r, "endIndex": r + 1}}}
+        for r in groupers]
+    return reqs, len(groupers)
+
+
+def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
+    """Применяет _grouper_requests к листу; ошибка — только предупреждение."""
+    reqs, n = _grouper_requests(ws.id, rows, known)
+    logger.info("One-time groupers: %d", n)
+    if not reqs:
+        return []
+    try:
+        _gs_call(spreadsheet.batch_update, {"requests": reqs})
+    except Exception as e:
+        logger.warning("Sheet formatting error: %s", _err_brief(e))
+        return [f"Разовые встречи (заголовки встреч): {e}"]
+    return []
 
 
 def _all_protocol_keys(spreadsheet) -> set:

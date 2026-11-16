@@ -1603,6 +1603,9 @@ if __name__ == "__main__":
     # issue #39: ежедневный автоимпорт MYmeet (догон, дедупликация, уведомления)
     from test_mymeet_daily import TESTS as _MYMEET_DAILY_TESTS
     tests += _MYMEET_DAILY_TESTS
+    # issue #41: заголовки встреч «Разовые встречи» (OVERFLOW_CELL, без объединения)
+    from test_grouper_format import TESTS as _GROUPER_TESTS
+    tests += _GROUPER_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

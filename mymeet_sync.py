@@ -1796,7 +1796,8 @@ GROUPER_LINE_PX = 21
 
 
 def _blank(c) -> bool:
-    return c is None or str(c).strip() == ""
+    """Пусто строго: None или "".  Пробел — тоже значение (MERGE_ALL удалил бы его)."""
+    return c is None or c == ""
 
 
 def _cell(rows, r, c):
@@ -1846,7 +1847,8 @@ def _grouper_requests(sheet_id: int, rows: list, merges: list | None,
                     for r in range(sr, min(er, len(rows)))
                     for c in range(sc, min(ec, GROUPER_NCOLS + 1))
                     if (r, c) != (sr, sc))
-        if hides and sr >= 1:              # шапку таблицы не трогаем
+        # шапку таблицы и объединения за пределами A:F (например, G) не трогаем
+        if hides and sr >= 1 and ec <= GROUPER_NCOLS:
             unmerge.append({"unmergeCells": {"range": {
                 "sheetId": sheet_id, "startRowIndex": sr, "endRowIndex": er,
                 "startColumnIndex": sc, "endColumnIndex": ec}}})
@@ -1871,13 +1873,14 @@ def _grouper_requests(sheet_id: int, rows: list, merges: list | None,
             "fields": GROUPER_FORMAT_FIELDS,
         }})
         label = str(rows[r][0])
-        lines = -(-len(label) // GROUPER_LINE_CHARS)
-        if lines > 1:
-            fmt.append({"updateDimensionProperties": {
-                "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                          "startIndex": r, "endIndex": r + 1},
-                "properties": {"pixelSize": GROUPER_LINE_PX * lines},
-                "fields": "pixelSize"}})
+        lines = max(1, -(-len(label) // GROUPER_LINE_CHARS))
+        # явная высота: авторазмер строки считался до объединения
+        fmt.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "ROWS",
+                      "startIndex": r, "endIndex": r + 1},
+            "properties": {"pixelSize": GROUPER_LINE_PX * lines},
+            "fields": "pixelSize"}})
+    stats["merge_requests"] = len(unmerge) + len(merge)
     return unmerge + merge + fmt, stats
 
 
@@ -1888,10 +1891,10 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
     try:
         meta = _gs_call(spreadsheet.fetch_sheet_metadata,
                         params={"fields": "sheets(properties(sheetId),merges)"})
-        merges = []
         for sh in (meta or {}).get("sheets") or [] if isinstance(meta, dict) else []:
             if ((sh or {}).get("properties") or {}).get("sheetId") == ws.id:
                 merges = list(sh.get("merges") or [])
+        # листа нет в ответе → merges остаётся None: объединения не трогаем
     except Exception as e:
         merges = None                       # без метаданных объединения не трогаем
         logger.warning("Sheet formatting error: %s", _err_brief(e))
@@ -1907,6 +1910,17 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
             _gs_call(spreadsheet.batch_update, {"requests": reqs})
         except Exception as e:
             logger.warning("Sheet formatting error: %s", _err_brief(e))
+            # Пакет атомарен: при отказе объединений (фильтр, защита…) повторяем
+            # только формат, чтобы заголовки остались жирными и серыми
+            fmt_only = reqs[st.get("merge_requests", 0):]
+            if st.get("merge_requests") and fmt_only:
+                try:
+                    _gs_call(spreadsheet.batch_update, {"requests": fmt_only})
+                    warnings.append("Разовые встречи: заголовки не объединены "
+                                    f"(ошибка Google Sheets: {_err_brief(e)})")
+                    return warnings
+                except Exception as e2:
+                    logger.warning("Sheet formatting error: %s", _err_brief(e2))
             warnings.append(f"Разовые встречи (заголовки встреч): {e}")
     return warnings
 

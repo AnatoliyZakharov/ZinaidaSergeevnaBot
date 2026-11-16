@@ -51,7 +51,8 @@ SHEET = [
 def test_merge_only_grouper_rows():
     ms = _ms()
     reqs, st = ms._grouper_requests(SID, SHEET, [])
-    assert st == {"groupers": 2, "merged": 2, "already": 0, "conflicts": 0, "unmerged": 0}, st
+    assert st == {"groupers": 2, "merged": 2, "already": 0, "conflicts": 0, "unmerged": 0,
+                  "merge_requests": 2}, st
     assert _rows_of(reqs, "mergeCells") == [1, 4]
     assert _rows_of(reqs, "repeatCell") == [1, 4]
     for r in reqs:
@@ -108,15 +109,27 @@ def test_header_merge_untouched():
     assert 0 not in _rows_of(reqs, "repeatCell") + _rows_of(reqs, "mergeCells")
 
 
+def test_merge_outside_af_not_unmerged():
+    """Объединение в G (вне A:F), закрывающее строки задач, не снимаем."""
+    ms = _ms()
+    g = {"sheetId": SID, "startRowIndex": 2, "endRowIndex": 4,
+         "startColumnIndex": 6, "endColumnIndex": 7}
+    wide = {"sheetId": SID, "startRowIndex": 5, "endRowIndex": 6,
+            "startColumnIndex": 0, "endColumnIndex": 7}
+    reqs, st = ms._grouper_requests(SID, SHEET, [g, wide])
+    assert st["unmerged"] == 0 and "unmergeCells" not in _kinds(reqs), reqs
+
+
 def test_conflicting_values_not_merged():
     """Текст в A и значение в B:F — не заголовок: не объединяем и не красим."""
     ms = _ms()
     rows = [PROTO_HDR,
             ["Совещание  (12.11.2026)", "", "", "заметка", "", "", ""],
-            ["Пустая метка", None, " ", "", "", "", ""]]
+            ["С пробелом", None, " ", "", "", "", ""],      # пробел — тоже значение
+            ["Пустая метка", None, "", "", "", "", ""]]
     reqs, st = ms._grouper_requests(SID, rows, [])
-    assert st["groupers"] == 1 and _rows_of(reqs, "mergeCells") == [2], (st, reqs)
-    assert 1 not in _rows_of(reqs, "repeatCell")
+    assert st["groupers"] == 1 and _rows_of(reqs, "mergeCells") == [3], (st, reqs)
+    assert not {1, 2} & set(_rows_of(reqs, "repeatCell"))
 
 
 def test_long_name_row_height():
@@ -127,13 +140,16 @@ def test_long_name_row_height():
     assert len(dims) == 1 and dims[0]["range"]["startIndex"] == 1
     assert dims[0]["properties"]["pixelSize"] > ms.GROUPER_LINE_PX
     short, _ = ms._grouper_requests(SID, SHEET, [])
-    assert "updateDimensionProperties" not in _kinds(short)
+    heights = [r["updateDimensionProperties"]["properties"]["pixelSize"]
+               for r in short if "updateDimensionProperties" in r]
+    assert heights == [ms.GROUPER_LINE_PX] * 2, heights      # однострочные — 21px
 
 
 def test_no_metadata_no_merge_changes():
     ms = _ms()
     reqs, st = ms._grouper_requests(SID, SHEET, None)
-    assert set(_kinds(reqs)) == {"repeatCell"} and st["merged"] == 0
+    assert set(_kinds(reqs)) == {"repeatCell", "updateDimensionProperties"}, reqs
+    assert st["merged"] == 0 and st["merge_requests"] == 0
 
 
 def test_numeric_label_known_new_row():
@@ -290,6 +306,42 @@ def test_full_sync_drops_stale_merges_before_write():
         assert book.merged_rows(name) == _grouper_row_idx(rows) == [1, 3], (rows, book.merges)
 
 
+def test_merge_rejected_format_still_applied():
+    """Отказ API на объединение (фильтр/защита): формат повторяется без
+    объединений, синк не падает, предупреждение."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        name = env.ms.ONE_TIME_SHEET_NAME
+        book = MergeBook({name: [list(r) for r in SHEET]})
+        env.books["sheet-1"] = book
+        real = book._batch
+
+        def _batch(body):
+            if any("mergeCells" in r for r in body.get("requests", [])):
+                raise RuntimeError("400 protected range")
+            return real(body)
+        book.ss.batch_update.side_effect = _batch
+        cfg = {"gcal_organizer_data": env.mm.gcal(), "mymeet_spreadsheet_id": "sheet-1",
+               "mymeet_token": "t"}
+        res = env.ms.sync_to_sheets(days=1, append=True, user_config=cfg)
+        assert book.merges[name] == []
+        fmt = [r for b in book.batches for r in b["requests"]
+               if "repeatCell" in r and r["repeatCell"]["fields"].endswith("backgroundColor")]
+        assert sorted(r["repeatCell"]["range"]["startRowIndex"] for r in fmt) == [1, 4], fmt
+        assert "не объединены" in res, res
+
+
+def test_sheet_missing_in_metadata_no_merges():
+    ms = _ms()
+    from unittest.mock import MagicMock
+    ss, ws = MagicMock(), MagicMock()
+    ws.id = SID
+    ss.fetch_sheet_metadata.return_value = {"sheets": [{"properties": {"sheetId": 99}}]}
+    ms._format_one_time_groupers(ss, ws, SHEET, set())
+    sent = ss.batch_update.call_args.args[0]["requests"]
+    assert not any("mergeCells" in r or "unmergeCells" in r for r in sent), sent
+
+
 def test_sync_survives_metadata_failure():
     with tempfile.TemporaryDirectory() as tmp:
         env = D.Env(tmp)
@@ -320,6 +372,7 @@ TESTS = [
      "Разовые: существующие/чужие объединения — без повторов и конфликтов"),
     (test_stale_merge_hiding_data_is_unmerged, "Разовые: съехавшее объединение снимается"),
     (test_header_merge_untouched, "Разовые: шапка таблицы не трогается"),
+    (test_merge_outside_af_not_unmerged, "Разовые: объединения вне A:F не снимаются"),
     (test_conflicting_values_not_merged, "Разовые: значения в B:F — не объединяем"),
     (test_long_name_row_height, "Разовые: длинное название — высота строки"),
     (test_no_metadata_no_merge_changes, "Разовые: нет метаданных — объединения не меняются"),
@@ -330,6 +383,8 @@ TESTS = [
      "Разовые: пользовательское объединение не трогается, предупреждение"),
     (test_full_sync_drops_stale_merges_before_write,
      "Разовые: полный синк снимает старые объединения до записи"),
+    (test_merge_rejected_format_still_applied, "Разовые: отказ объединения — формат сохраняется"),
+    (test_sheet_missing_in_metadata_no_merges, "Разовые: лист не найден в метаданных — без объединений"),
     (test_sync_survives_metadata_failure, "Разовые: сбой метаданных не ломает синк"),
 ]
 

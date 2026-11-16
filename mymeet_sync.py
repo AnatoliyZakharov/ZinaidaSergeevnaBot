@@ -1838,7 +1838,7 @@ def _grouper_requests(sheet_id: int, rows: list, merges: list | None,
                       or (r in known and all(_blank(c) for c in
                                               list(rows[r][1:GROUPER_NCOLS]))))
     stats["groupers"] = len(groupers)
-    unmerge, merge, fmt = [], [], []
+    unmerge, merge, fmt, heights = [], [], [], []
     live: list = []                       # объединения, которые остаются
     for m in (merges or []):
         sr, er = int(m.get("startRowIndex", 0)), int(m.get("endRowIndex", 10 ** 7))
@@ -1858,30 +1858,37 @@ def _grouper_requests(sheet_id: int, rows: list, merges: list | None,
     for r in groupers:
         rng = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
                "startColumnIndex": 0, "endColumnIndex": GROUPER_NCOLS}
+        merged_after = False               # будет ли строка объединена A:F
         if merges is not None:
             if (r, r + 1, 0, GROUPER_NCOLS) in live:
                 stats["already"] += 1
+                merged_after = True
             elif any(sr < r + 1 and r < er and sc < GROUPER_NCOLS and 0 < ec
                      for sr, er, sc, ec in live):
                 stats["conflicts"] += 1
             else:
                 merge.append({"mergeCells": {"range": rng, "mergeType": "MERGE_ALL"}})
                 stats["merged"] += 1
+                merged_after = True
         fmt.append({"repeatCell": {
             "range": rng,
             "cell": {"userEnteredFormat": dict(GROUPER_FORMAT)},
             "fields": GROUPER_FORMAT_FIELDS,
         }})
+        if not merged_after:
+            continue   # без объединения (A = 50px) высоту оставляем авторазмеру
         label = str(rows[r][0])
         lines = max(1, -(-len(label) // GROUPER_LINE_CHARS))
-        # явная высота: авторазмер строки считался до объединения
-        fmt.append({"updateDimensionProperties": {
+        # явная высота объединённой строки: авторазмер считался до объединения
+        heights.append({"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "ROWS",
                       "startIndex": r, "endIndex": r + 1},
             "properties": {"pixelSize": GROUPER_LINE_PX * lines},
             "fields": "pixelSize"}})
     stats["merge_requests"] = len(unmerge) + len(merge)
-    return unmerge + merge + fmt, stats
+    stats["height_requests"] = len(heights)
+    # высоты — в конце: при отказе объединений повтор берёт только формат
+    return unmerge + merge + fmt + heights, stats
 
 
 def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
@@ -1912,7 +1919,8 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             # Пакет атомарен: при отказе объединений (фильтр, защита…) повторяем
             # только формат, чтобы заголовки остались жирными и серыми
-            fmt_only = reqs[st.get("merge_requests", 0):]
+            fmt_only = reqs[st.get("merge_requests", 0):
+                            len(reqs) - st.get("height_requests", 0)]
             if st.get("merge_requests") and fmt_only:
                 try:
                     _gs_call(spreadsheet.batch_update, {"requests": fmt_only})

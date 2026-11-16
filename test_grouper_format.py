@@ -52,7 +52,7 @@ def test_merge_only_grouper_rows():
     ms = _ms()
     reqs, st = ms._grouper_requests(SID, SHEET, [])
     assert st == {"groupers": 2, "merged": 2, "already": 0, "conflicts": 0, "unmerged": 0,
-                  "merge_requests": 2}, st
+                  "merge_requests": 2, "height_requests": 2}, st
     assert _rows_of(reqs, "mergeCells") == [1, 4]
     assert _rows_of(reqs, "repeatCell") == [1, 4]
     for r in reqs:
@@ -109,6 +109,28 @@ def test_header_merge_untouched():
     assert 0 not in _rows_of(reqs, "repeatCell") + _rows_of(reqs, "mergeCells")
 
 
+def _heights(reqs):
+    return {r["updateDimensionProperties"]["range"]["startIndex"]
+            for r in reqs if "updateDimensionProperties" in r}
+
+
+def test_height_only_for_merged_rows():
+    """QA: необъединённый заголовок (конфликт, нет метаданных) не получает 21px —
+    иначе название в колонке 50px обрезается."""
+    ms = _ms()
+    user = {"sheetId": SID, "startRowIndex": 4, "endRowIndex": 5,
+            "startColumnIndex": 0, "endColumnIndex": 3}
+    exact = {"sheetId": SID, "startRowIndex": 1, "endRowIndex": 2,
+             "startColumnIndex": 0, "endColumnIndex": 6}
+    reqs, _ = ms._grouper_requests(SID, SHEET, [user])
+    assert _heights(reqs) == {1}, reqs                      # 4 — конфликт
+    reqs, _ = ms._grouper_requests(SID, SHEET, [exact, user])
+    assert _heights(reqs) == {1}                             # уже объединена — да
+    reqs, _ = ms._grouper_requests(SID, SHEET, None)
+    assert _heights(reqs) == set()
+    assert _kinds(ms._grouper_requests(SID, SHEET, [])[0])[-1] == "updateDimensionProperties"
+
+
 def test_merge_outside_af_not_unmerged():
     """Объединение в G (вне A:F), закрывающее строки задач, не снимаем."""
     ms = _ms()
@@ -148,7 +170,7 @@ def test_long_name_row_height():
 def test_no_metadata_no_merge_changes():
     ms = _ms()
     reqs, st = ms._grouper_requests(SID, SHEET, None)
-    assert set(_kinds(reqs)) == {"repeatCell", "updateDimensionProperties"}, reqs
+    assert set(_kinds(reqs)) == {"repeatCell"}, reqs     # без высоты: не объединены
     assert st["merged"] == 0 and st["merge_requests"] == 0
 
 
@@ -328,6 +350,10 @@ def test_merge_rejected_format_still_applied():
         fmt = [r for b in book.batches for r in b["requests"]
                if "repeatCell" in r and r["repeatCell"]["fields"].endswith("backgroundColor")]
         assert sorted(r["repeatCell"]["range"]["startRowIndex"] for r in fmt) == [1, 4], fmt
+        row_heights = [r for b in book.batches for r in b["requests"]
+                       if "updateDimensionProperties" in r
+                       and r["updateDimensionProperties"]["range"]["dimension"] == "ROWS"]
+        assert not row_heights, "повтор без объединений — без высоты строк"
         assert "не объединены" in res, res
 
 
@@ -372,6 +398,7 @@ TESTS = [
      "Разовые: существующие/чужие объединения — без повторов и конфликтов"),
     (test_stale_merge_hiding_data_is_unmerged, "Разовые: съехавшее объединение снимается"),
     (test_header_merge_untouched, "Разовые: шапка таблицы не трогается"),
+    (test_height_only_for_merged_rows, "Разовые: высота только у объединённых заголовков"),
     (test_merge_outside_af_not_unmerged, "Разовые: объединения вне A:F не снимаются"),
     (test_conflicting_values_not_merged, "Разовые: значения в B:F — не объединяем"),
     (test_long_name_row_height, "Разовые: длинное название — высота строки"),

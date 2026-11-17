@@ -1528,7 +1528,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                     ])
                     idx += 1
             # Строки вне окна — как есть (статус, срок, ручные правки)
-            rows += [(list(r) + [""] * 7)[:7] for r in (existing_full[1:] if existing_full else [])
+            rows += [_carry_copy(r) for r in (existing_full[1:] if existing_full else [])
                      if _carry(r, sheet_name)]
             written_by_sheet.setdefault(sheet_name, set()).update(
                 k for k in (_task_key(r) for r in rows) if k)
@@ -1654,6 +1654,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     grouper_rel_positions: list[int] = []
     seen_in_run_ot: set[str] = set()
 
+    # Источник переноса — прежний лист (а не план регулярной встречи с тем же
+    # именем листа): его строки — перенесённые, со своими колонками правее G
+    _ot_src_old = not append and existing_ot_before is ot_old
     if not append and existing_ot_before:
         # Полная перезапись: блоки встреч вне окна переносятся первыми, как есть
         pending_grouper = None
@@ -1661,7 +1664,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             # Заголовок встречи: текст в A, B:F пусты (у задачи всегда есть дата в B) —
             # в т.ч. числовое название встречи
             if r and not _blank(r[0]) and all(_blank(c) for c in list(r[1:GROUPER_NCOLS])):
-                pending_grouper = (list(r) + [""] * 7)[:7]
+                pending_grouper = _carry_copy(r, mark=_ot_src_old or isinstance(r, _Carried))
                 continue
             if not _carry(r, ot_name):
                 continue
@@ -1669,7 +1672,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                 grouper_rel_positions.append(len(all_rows))
                 all_rows.append(pending_grouper)
                 pending_grouper = None
-            row = (list(r) + [""] * 7)[:7]
+            row = _carry_copy(r, mark=_ot_src_old or isinstance(r, _Carried))
             row[0] = idx
             all_rows.append(row)
             idx += 1
@@ -1957,23 +1960,71 @@ def _cell_value(v) -> dict:
     return {"userEnteredValue": {"stringValue": str(v)}}
 
 
+class _Carried(list):
+    """Строка, перенесённая из прежнего листа как есть (вместе со своими
+    колонками правее G)."""
+
+
+def _carry_copy(r, mark: bool = True) -> list:
+    """Копия строки для переноса: A:G нормализованы, колонки правее G — свои.
+    mark=False — строка не из прежнего листа (сгенерирована в этом запуске)."""
+    row = (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS] + list(r)[FULL_NCOLS:]
+    return _Carried(row) if mark else row
+
+
+def _row_ids(r) -> list:
+    """Идентификаторы строки для сопоставления заметок: ключ задачи (и
+    legacy-ключ без mtg_id), для заголовка встречи — текст в A."""
+    k = _task_key(r)
+    if not k:
+        return [("grouper", str(r[0]).strip())] if r and not _blank(r[0]) else []
+    base = (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS]
+    lk = _task_key(base[:6])
+    return [k] if lk == k else [k, lk]
+
+
+def _tail(r) -> list:
+    t = ["" if c is None else c for c in list(r)[FULL_NCOLS:]]
+    while t and _blank(t[-1]):
+        t.pop()
+    return t
+
+
 def _with_user_columns(data: list, old: list) -> list:
-    """Колонки правее G (заметки пользователя) переезжают вместе со своей
-    строкой: задача — по ключу, заголовок встречи — по тексту в A.
-    Значения без своей строки в новом наборе очищаются, как раньше clear."""
-    tails: dict = {}
+    """Колонки правее G (заметки пользователя) остаются при своей строке.
+
+    • Перенесённые строки (_Carried) уже несут свои колонки правее G; их
+      исходные строки исключаются из пула.
+    • Строкам, созданным заново (задачи окна из MYmeet, новые заголовки),
+      достаются заметки оставшихся прежних строк с тем же ключом задачи
+      (или legacy-ключом без mtg_id) / текстом заголовка — n-я строка
+      получает заметку n-й, поэтому одинаковые ключи и подписи не путаются.
+    • Заметки строк, которых больше нет, не переносятся — ячейки очищаются
+      тем же запросом (ширина — _plan_width)."""
+    pool: dict = {}
     for r in (old or [])[1:]:
-        if len(r) <= FULL_NCOLS or all(_blank(c) for c in r[FULL_NCOLS:]):
-            continue
-        k = _task_key(r) or ("grouper", str(r[0]).strip())
-        tails.setdefault(k, list(r[FULL_NCOLS:]))
-    if not tails:
-        return data
+        ids = _row_ids(r)
+        if ids:
+            pool.setdefault(ids[0], []).append(_tail(r))
     out = [list(data[0])] if data else []
+    carried = [r for r in data[1:] if isinstance(r, _Carried)]
+    for r in carried:                       # исходные строки переноса — не в пул
+        ids = _row_ids(r)
+        lst = pool.get(ids[0]) if ids else None
+        t = _tail(r)
+        if lst and t in lst:
+            lst.remove(t)
     for r in data[1:]:
         base = (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS]
-        k = _task_key(base) or ("grouper", str(base[0]).strip())
-        out.append(base + tails.get(k, []))
+        if isinstance(r, _Carried):
+            out.append(base + _tail(r))
+            continue
+        tail: list = []
+        for k in _row_ids(base):
+            if pool.get(k):
+                tail = pool[k].pop(0)
+                break
+        out.append(base + tail)
     return out
 
 
@@ -2074,7 +2125,9 @@ def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
         try:
             cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
         except Exception:
-            cur_rows, cur_cols = 0, 0
+            # Размер сетки неизвестен — не меняем его (не уменьшаем). Если
+            # данных больше сетки, Google отклонит весь запрос: «не изменены».
+            cur_rows, cur_cols = height, width
         if height > cur_rows or cur_cols < width:
             requests.append({"updateSheetProperties": {
                 "properties": {"sheetId": ws.id, "gridProperties": {

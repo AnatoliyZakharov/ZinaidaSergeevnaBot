@@ -122,7 +122,13 @@ class Book:
         """Применить updateCells (значения A:G) атомарно, как Google: сначала
         проверка всех запросов, затем применение всех."""
         by_id = {w.id: t for t, w in self.ws.items()}
-        grid = {t: int(w.row_count) for t, w in self.ws.items()}
+        def _n(w, attr):          # размер сетки, недоступный коду, — без ограничения
+            try:
+                return int(getattr(w, attr))
+            except Exception:
+                return 10 ** 6
+        grid = {t: _n(w, "row_count") for t, w in self.ws.items()}
+        gcols = {t: _n(w, "col_count") for t, w in self.ws.items()}
         plan = []
         for r in reqs:
             if "updateSheetProperties" in r:
@@ -130,22 +136,27 @@ class Book:
                 gp = pr.get("gridProperties") or {}
                 if "rowCount" in gp:
                     grid[by_id[pr["sheetId"]]] = gp["rowCount"]
+                if "columnCount" in gp:
+                    gcols[by_id[pr["sheetId"]]] = gp["columnCount"]
                 continue
             if "updateCells" not in r or r["updateCells"].get("fields") != "userEnteredValue":
                 continue          # ссылки/формат «Моих задач» — не значения
             uc = r["updateCells"]
             rng = uc["range"]
             assert rng["sheetId"] in by_id, rng
-            if rng["endRowIndex"] > grid[by_id[rng["sheetId"]]]:
+            if (rng["endRowIndex"] > grid[by_id[rng["sheetId"]]]
+                    or rng["endColumnIndex"] > gcols[by_id[rng["sheetId"]]]):
                 # как Google: весь запрос отклоняется, ничего не применено
                 raise RuntimeError("exceeds grid limits")
             plan.append((by_id[rng["sheetId"]], rng, uc.get("rows", [])))
         for r in reqs:
             if "updateSheetProperties" in r:
                 pr = r["updateSheetProperties"]["properties"]
-                rc = (pr.get("gridProperties") or {}).get("rowCount")
-                if rc:
-                    self.ws[by_id[pr["sheetId"]]].row_count = rc
+                gp = pr.get("gridProperties") or {}
+                if gp.get("rowCount"):
+                    self.ws[by_id[pr["sheetId"]]].row_count = gp["rowCount"]
+                if gp.get("columnCount"):
+                    self.ws[by_id[pr["sheetId"]]].col_count = gp["columnCount"]
         if plan:
             self.commits += 1
         for t, rng, rows in plan:

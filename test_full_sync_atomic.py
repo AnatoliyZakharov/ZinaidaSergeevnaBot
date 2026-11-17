@@ -455,6 +455,116 @@ def test_b2_notes_with_write_failures():
         _assert_no_dupes(book)
 
 
+def test_notes_duplicate_groupers_and_keys():
+    """Одинаковые подписи заголовков и одинаковые ключи задач: каждая заметка
+    остаётся при своей строке (n-я — при n-й), ничего не теряется."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        ot = env.ms.ONE_TIME_SHEET_NAME
+        book = D.Book({ot: [
+            PROTO_HDR,
+            ["Созвон  (01.08.2026)", "", "", "", "", "", "", "note-A"],
+            ["1", "01.08.2026", "Дубль", ME, "", "В работе", "s1", "n1"],
+            ["2", "01.08.2026", "Дубль", ME, "", "Выполнено", "s1", "n2"],
+            ["Созвон  (01.08.2026)", "", "", "", "", "", "", "note-B"],
+            ["3", "01.08.2026", "Другая", ME, "", "В работе", "s2", "", "i-другой"],
+        ]})
+        env.books["sheet-1"] = book
+        env.mm.add("n1", "Новая", D._now() - timedelta(hours=2), [("Н", ME, False)])
+        for _ in range(2):
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            rows = book.data[ot]
+            got = [(r[0] if not str(r[1]).strip() else (r[2], r[5]), r[7] if len(r) > 7 else "",
+                    r[8] if len(r) > 8 else "") for r in rows[1:]]
+            assert got[:5] == [
+                ("Созвон  (01.08.2026)", "note-A", ""), (("Дубль", "В работе"), "n1", ""),
+                (("Дубль", "Выполнено"), "n2", ""), ("Созвон  (01.08.2026)", "note-B", ""),
+                (("Другая", "В работе"), "", "i-другой")], got
+            assert all(not (len(r) > 7 and any(str(c).strip() for c in r[7:]))
+                       for r in rows[6:]), rows
+
+
+def test_notes_window_meeting_vs_carried_same_label():
+    """Заголовок встречи окна (пересоздаётся из MYmeet) и перенесённый блок
+    с той же подписью: заметки не меняются местами."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        ot = env.ms.ONE_TIME_SHEET_NAME
+        t = D._now() - timedelta(hours=2)
+        env.mm.add("w1", "Совещание", t, [("Задача окна", ME, False)])
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        book = env.book()
+        label = next(r[0] for r in book.data[ot][1:] if not str(r[1]).strip())
+        rows = book.data[ot]
+        # Над ним — старый блок с той же подписью вне окна (другая встреча)
+        old_block = [[label, "", "", "", "", "", "", "note-old"],
+                     ["1", "01.08.2026", "Старая", ME, "", "Выполнено", "o1", "t-old"]]
+        rows[1] = list(rows[1]) + [""] * (7 - len(rows[1])) + ["note-win"]
+        book.data[ot] = [rows[0]] + old_block + [list(r) for r in rows[1:]]
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        vals = sorted(c for r in book.data[ot][1:] for c in r[7:] if str(c).strip())
+        assert vals == ["note-old", "note-win", "t-old"], book.data[ot]
+        r_old = next(i for i, r in enumerate(book.data[ot]) if len(r) > 2 and r[2] == "Старая")
+        r_win = next(i for i, r in enumerate(book.data[ot]) if len(r) > 2 and r[2] == "Задача окна")
+        assert book.data[ot][r_old - 1][7] == "note-old", book.data[ot]
+        assert book.data[ot][r_win - 1][7] == "note-win", book.data[ot]
+
+
+def test_legacy_row_note_kept_when_task_in_window():
+    """Legacy-строка без mtg_id, чья задача снова пришла из MYmeet: заметка
+    переходит к строке задачи вместе со статусом."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Legacy", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Другая", ME, False)])
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        book = env.book()
+        date = next(r[1] for r in book.data[REG][1:] if r[2] == "Legacy")
+        book.data[REG] = [PROTO_HDR,
+                          ["1", date, "Legacy", ME, "", "В работе", "", "note-L"],
+                          ["2", date, "Другая", ME, "", "Требует верификации", "p2"]]
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        assert _user_cells(book.data[REG]) == {("Legacy", 7): "note-L"}, book.data[REG]
+        assert {r[2]: r[5] for r in book.data[REG][1:]}["Legacy"] == "В работе"
+        _assert_no_dupes(book)
+
+
+def test_grid_columns_grow_in_same_request():
+    """Заметки дальше текущей ширины сетки: columnCount растёт тем же запросом."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        book = _b2_book(env, [["1", "01.08.2026", "Старая", ME, "", "Выполнено", "old",
+                               "", "", "", "", "", "m"]])
+        book.ws[REG].col_count = 7                        # фейк отклонит выход за сетку
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("А", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Б", ME, False)])
+        res = env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        assert res.startswith("✅"), res
+        reqs = _value_writes(book)[0]
+        props = [r["updateSheetProperties"] for r in reqs if "updateSheetProperties" in r
+                 and r["updateSheetProperties"]["properties"]["sheetId"] == book.ws[REG].id]
+        assert props and props[0]["properties"]["gridProperties"]["columnCount"] == 13, props
+        assert _user_cells(book.data[REG]) == {("Старая", 12): "m"}, book.data[REG]
+
+
+def test_unknown_grid_size_never_shrinks():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        book = _scenario(env)
+        class _Broken:
+            def __int__(self):
+                raise RuntimeError("no props")
+        book.ws[REG].row_count = _Broken()
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        sid = book.ws[REG].id
+        assert not any("updateSheetProperties" in r and
+                       r["updateSheetProperties"]["properties"]["sheetId"] == sid
+                       for r in _value_writes(book)[0])
+        _expect_ok_state(book)
+
+
 def test_recurring_named_like_one_time_sheet_atomic():
     """Регулярная встреча с именем листа «Разовые встречи»: один лист в плане,
     отказ записи не меняет его, повтор — без дублей."""
@@ -521,6 +631,13 @@ TESTS = [
      "Полный синк B-2: заметки в H, I, K — при задаче, дальняя сирота очищена"),
     (test_b2_shrink_with_notes_in_tail, "Полный синк B-2: сокращение листа с заметками"),
     (test_b2_notes_with_write_failures, "Полный синк B-2: заметки при отказе и таймауте записи"),
+    (test_notes_duplicate_groupers_and_keys,
+     "Полный синк: заметки при одинаковых заголовках и ключах — каждая при своей"),
+    (test_notes_window_meeting_vs_carried_same_label,
+     "Полный синк: заголовок окна и перенесённый с той же подписью"),
+    (test_legacy_row_note_kept_when_task_in_window, "Полный синк: заметка legacy-строки"),
+    (test_grid_columns_grow_in_same_request, "Полный синк: рост колонок сетки в том же запросе"),
+    (test_unknown_grid_size_never_shrinks, "Полный синк: неизвестный размер сетки не уменьшается"),
     (test_recurring_named_like_one_time_sheet_atomic,
      "Полный синк B-1: регулярная встреча с именем «Разовые встречи»"),
     (test_append_and_auto_import_unchanged,

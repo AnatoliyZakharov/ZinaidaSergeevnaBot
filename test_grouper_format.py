@@ -195,7 +195,9 @@ def test_full_sync_same_behaviour():
         env.mm.add("n2", "Встреча Б", D._now() - timedelta(hours=2), [("Т2", ME, False)])
         for _ in range(2):
             env.ms.sync_to_sheets(days=1, append=False, user_config=_cfg(env))
-            assert _check_sheet(book, name) == [1, 3]
+            # #49: встречи вне окна (10–11.11) сохраняются со своими заголовками
+            assert _check_sheet(book, name) == [1, 4, 6, 8]
+            assert [r[1] for r in book.task_rows(name)] == ["Отчёт", "Бюджет", "План", "Т1", "Т2"]
 
 
 def test_append_without_new_rows_restores_groupers():

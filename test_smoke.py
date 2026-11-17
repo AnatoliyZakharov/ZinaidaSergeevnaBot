@@ -805,10 +805,10 @@ def test_sync_my_tasks_exception_does_not_break_sync():
     mod = _load_mymeet()
     for append in (False, True):
         ss, _ = _mock_sync_env(mod, meta_exc=RuntimeError("boom-meta"))
-        if append:
-            # append сначала читает листы для поиска дублей (#39) — это чтение
-            # проходит, падает только шаг «Мои задачи»
-            ss.fetch_sheet_metadata.side_effect = [{"sheets": []}, RuntimeError("boom-meta")]
+        # Сначала синк читает все листы протоколов: append — для поиска дублей
+        # (#39), полный режим — для ручных статусов (#49).  Это чтение проходит,
+        # падает только шаг «Мои задачи».
+        ss.fetch_sheet_metadata.side_effect = [{"sheets": []}, RuntimeError("boom-meta")]
         res = mod.sync_to_sheets(days=1, append=append,
                                  user_config={"gcal_organizer_data": _GCAL,
                                               "mymeet_spreadsheet_id": "x",
@@ -1612,6 +1612,9 @@ if __name__ == "__main__":
     # issue #46: продуктовая аналитика /analytics
     from test_analytics import TESTS as _ANALYTICS_TESTS
     tests += _ANALYTICS_TESTS
+    # issue #49: аудит надёжности синхронизации (перезапуск, гонки, полный синк)
+    from test_sync_audit import TESTS as _SYNC_AUDIT_TESTS
+    tests += _SYNC_AUDIT_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

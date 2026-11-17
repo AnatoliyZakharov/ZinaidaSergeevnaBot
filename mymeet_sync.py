@@ -1427,16 +1427,60 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     pending_recurring: dict = {}
 
     # ── Recurring meetings — one sheet per name ───────────────────────────────
-    for meeting_name, meetings in sorted(recurring.items()):
-        sheet_name = _safe_sheet_name(meeting_name)
+    # Полный режим (#49): ключи задач окна — всё, что перезаписывается из MYmeet.
+    # Строки листов вне этого набора (старше окна, legacy) переносятся как есть,
+    # со статусами: полная синхронизация не теряет данные за пределами окна.
+    window_keys: set = set()
+    window_legacy: set = set()
+    # Встречи окна, чей протокол получен с задачами: для них MYmeet — источник
+    # истины (устаревшие версии изменённых задач не переносятся).  Встречи
+    # с протоколом «ещё не готов» (404) или незагрузившимся — не здесь: их
+    # строки переносятся как есть.
+    window_mids = {m["id"] for m in all_meetings if m["tasks"] and m["id"]}
+    for m in all_meetings:
+        for task in m["tasks"]:
+            k = _task_key([None, m["date"], task["name"], task["assignee"], None, None, m["id"]])
+            if k:
+                window_keys.add(k)
+                window_legacy.add(_task_key([None, m["date"], task["name"], task["assignee"]]))
+    written_by_sheet: dict = {}            # ключи, уже записанные в лист в этом запуске
+    # Ручные статусы со ВСЕХ листов протоколов: встреча может сменить лист
+    # (разовая ↔ регулярная) — статус её задач не должен сброситься.
+    global_statuses: dict = {} if append else _all_protocol_statuses(spreadsheet)
+
+    def _carry(row, sheet) -> bool:
+        """Перенести строку старого листа при полной перезаписи?"""
+        k = _task_key(row)
+        if not k:
+            return False
+        if k in written_by_sheet.get(sheet, set()):
+            return True                    # записана в этот лист раньше в этом же запуске
+        mid = str(row[6]).strip() if len(row) > 6 else ""
+        if mid:
+            return k not in window_keys and mid not in window_mids
+        return k not in window_legacy
+
+    def _read_before_clear(ws_):
+        try:
+            return _gs_call(ws_.get_all_values)
+        except Exception as e:
+            # Без чтения нельзя сохранить статусы и строки вне окна — лист не очищаем
+            raise RuntimeError("не удалось прочитать лист перед полной перезаписью "
+                               f"({type(e).__name__}) — синхронизация отменена, "
+                               "лист не изменён") from None
+
+    # Разные названия встреч могут дать одно имя листа (_safe_sheet_name) —
+    # объединяем их, чтобы второй проход не перетёр первый.
+    recurring_by_sheet: dict = {}
+    for meeting_name, meetings in recurring.items():
+        recurring_by_sheet.setdefault(_safe_sheet_name(meeting_name), []).extend(meetings)
+
+    for sheet_name, meetings in sorted(recurring_by_sheet.items()):
         try:
             ws = spreadsheet.worksheet(sheet_name)
             if not append:
                 # Read existing data BEFORE clearing so we can restore manual statuses.
-                try:
-                    existing_full: list = _gs_call(ws.get_all_values)
-                except Exception:
-                    existing_full = []
+                existing_full: list = _read_before_clear(ws)
                 _gs_call(ws.clear)
         except gspread.WorksheetNotFound:
             # append: лист создаётся только на этапе записи (после проверки объёма)
@@ -1466,7 +1510,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         task["deadline"], None, m["id"],
                     ])
                     # Restore manually-set status; fall back to MYmeet status
-                    status = manual_statuses.get(tkey) if tkey else None
+                    status = (manual_statuses.get(tkey) or global_statuses.get(tkey)) if tkey else None
                     if not status:
                         status = "Выполнено" if task["done"] else "Требует верификации"
                     rows.append([
@@ -1474,6 +1518,11 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         task["deadline"], status, m["id"],
                     ])
                     idx += 1
+            # Строки вне окна — как есть (статус, срок, ручные правки)
+            rows += [(list(r) + [""] * 7)[:7] for r in (existing_full[1:] if existing_full else [])
+                     if _carry(r, sheet_name)]
+            written_by_sheet.setdefault(sheet_name, set()).update(
+                k for k in (_task_key(r) for r in rows) if k)
             # Sort by deadline: earliest first, no-deadline at bottom
             rows.sort(key=lambda r: _deadline_sort_key(str(r[4]) if len(r) > 4 else ""))
             for _i, _r in enumerate(rows, 1):
@@ -1534,10 +1583,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         ws = spreadsheet.worksheet(ot_name)
         if not append:
             # Read BEFORE clear to preserve manually-set statuses.
-            try:
-                existing_ot_before: list = _gs_call(ws.get_all_values)
-            except Exception:
-                existing_ot_before = []
+            existing_ot_before: list = _read_before_clear(ws)
             _gs_call(ws.clear)
         else:
             existing_ot_before = []
@@ -1595,6 +1641,24 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     grouper_rel_positions: list[int] = []
     seen_in_run_ot: set[str] = set()
 
+    if not append and existing_ot_before:
+        # Полная перезапись: блоки встреч вне окна переносятся первыми, как есть
+        pending_grouper = None
+        for r in existing_ot_before[1:]:
+            if _is_grouper_row(r):
+                pending_grouper = (list(r) + [""] * 7)[:7]
+                continue
+            if not _carry(r, ot_name):
+                continue
+            if pending_grouper is not None:
+                grouper_rel_positions.append(len(all_rows))
+                all_rows.append(pending_grouper)
+                pending_grouper = None
+            row = (list(r) + [""] * 7)[:7]
+            row[0] = idx
+            all_rows.append(row)
+            idx += 1
+
     for m in one_time:
         if not m["tasks"]:
             continue
@@ -1622,7 +1686,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         for task in new_tasks:
             tkey_ot = _task_key([None, m["date"], task["name"], task["assignee"],
                                   task["deadline"], None, m["id"]])
-            status_ot = (manual_statuses_ot.get(tkey_ot) if not append else None) or (
+            status_ot = ((manual_statuses_ot.get(tkey_ot) or global_statuses.get(tkey_ot))
+                         if not append else None) or (
                 "Выполнено" if task["done"] else "Требует верификации"
             )
             all_rows.append([
@@ -1844,6 +1909,29 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
         return [f"Разовые встречи (заголовки встреч): {e}"]
     return []
+
+
+def _all_protocol_statuses(spreadsheet) -> dict:
+    """{ключ задачи: статус} со всех листов протоколов (одно чтение метаданных,
+    batchGet частями).  Ошибка чтения пробрасывается — без неё полная
+    перезапись могла бы сбросить ручные статусы."""
+    meta = _gs_call(spreadsheet.fetch_sheet_metadata,
+                    params={"fields": "sheets(properties(sheetId,title))"})
+    titles = [((sh or {}).get("properties") or {}).get("title")
+              for sh in ((meta or {}).get("sheets") or [])] if isinstance(meta, dict) else []
+    titles = [t for t in titles if t and not _is_my_tasks_title(t)]
+    out: dict = {}
+    for i in range(0, len(titles), 20):
+        resp = _gs_call(spreadsheet.values_batch_get,
+                        [_quote_sheet_title(t) + "!A:G" for t in titles[i:i + 20]])
+        for vr in (resp.get("valueRanges") or []) if isinstance(resp, dict) else []:
+            rows = (vr or {}).get("values") or []
+            if rows and _is_protocol_header(rows[0]):
+                for r in rows[1:]:
+                    k = _task_key(r)
+                    if k and len(r) >= 6 and str(r[5]).strip():
+                        out.setdefault(k, str(r[5]).strip())
+    return out
 
 
 def _all_protocol_keys(spreadsheet) -> set:

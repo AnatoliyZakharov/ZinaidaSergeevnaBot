@@ -565,6 +565,53 @@ def test_unknown_grid_size_never_shrinks():
         _expect_ok_state(book)
 
 
+def test_unknown_grid_size_data_too_big_rejected_safely():
+    """Размер сетки неизвестен, данных больше сетки: Google отклоняет весь
+    запрос — «не изменены», данные целы, не «успех»."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        book = _scenario(env)
+
+        class _Broken:
+            def __int__(self):
+                raise RuntimeError("no props")
+        book.ws[REG].row_count = _Broken()
+        book.true_grid[(REG, "row_count")] = 2            # фактическая сетка — 2 строки
+        before = _snapshot(book)
+        e = _full_sync_error(env)
+        assert type(e).__name__ == "FullSyncWriteError" and "не изменены" in str(e), repr(e)
+        snap = _snapshot(book)
+        assert {t: snap[t] for t in before} == before
+        assert env.my_tasks_sheet() == []
+
+
+def test_note_follows_task_to_another_sheet():
+    """Встреча стала регулярной: её задача переезжает из «Разовых встреч» в
+    лист регулярной встречи вместе со статусом и заметками правее G; в
+    «Разовых» заметка не остаётся."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        ot = env.ms.ONE_TIME_SHEET_NAME
+        n = D._now()
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Переезд", ME, False)])
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        book = env.book()
+        rows = book.data[ot]
+        i = next(j for j, r in enumerate(rows) if len(r) > 2 and r[2] == "Переезд")
+        rows[i] = (list(rows[i]) + [""] * 7)[:7] + ["note-H", "", "note-J"]
+        rows[i][5] = "В работе"
+        rows[i - 1] = (list(rows[i - 1]) + [""] * 7)[:7] + ["note-заголовка"]
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Вторая", ME, False)])  # стала регулярной
+        for _ in range(2):
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            assert _user_cells(book.data[REG]) == {("Переезд", 7): "note-H",
+                                                   ("Переезд", 9): "note-J"}, book.data[REG]
+            assert {r[2]: r[5] for r in book.data[REG][1:]}["Переезд"] == "В работе"
+            assert not any(len(r) > 7 and any(str(c).strip() for c in r[7:])
+                           for r in book.data[ot]), book.data[ot]
+            _assert_no_dupes(book)
+
+
 def test_recurring_named_like_one_time_sheet_atomic():
     """Регулярная встреча с именем листа «Разовые встречи»: один лист в плане,
     отказ записи не меняет его, повтор — без дублей."""
@@ -638,6 +685,10 @@ TESTS = [
     (test_legacy_row_note_kept_when_task_in_window, "Полный синк: заметка legacy-строки"),
     (test_grid_columns_grow_in_same_request, "Полный синк: рост колонок сетки в том же запросе"),
     (test_unknown_grid_size_never_shrinks, "Полный синк: неизвестный размер сетки не уменьшается"),
+    (test_unknown_grid_size_data_too_big_rejected_safely,
+     "Полный синк: неизвестная сетка и отказ Google — данные целы"),
+    (test_note_follows_task_to_another_sheet,
+     "Полный синк: заметка переезжает с задачей в другой лист"),
     (test_recurring_named_like_one_time_sheet_atomic,
      "Полный синк B-1: регулярная встреча с именем «Разовые встречи»"),
     (test_append_and_auto_import_unchanged,

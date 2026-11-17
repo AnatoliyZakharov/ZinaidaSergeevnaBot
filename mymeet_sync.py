@@ -1990,7 +1990,8 @@ def _tail(r) -> list:
     return t
 
 
-def _with_user_columns(data: list, old: list) -> list:
+def _with_user_columns(data: list, old: list, unmatched: list | None = None,
+                       pool_out: list | None = None) -> list:
     """Колонки правее G (заметки пользователя) остаются при своей строке.
 
     • Перенесённые строки (_Carried) уже несут свои колонки правее G; их
@@ -2020,12 +2021,38 @@ def _with_user_columns(data: list, old: list) -> list:
             out.append(base + _tail(r))
             continue
         tail: list = []
+        found = False
         for k in _row_ids(base):
             if pool.get(k):
                 tail = pool[k].pop(0)
+                found = True
                 break
+        if not found and unmatched is not None:
+            unmatched.append(len(out))          # строку мог «унести» другой лист
         out.append(base + tail)
+    if pool_out is not None:
+        pool_out.append(pool)
     return out
+
+
+def _move_notes_between_sheets(plan: dict, unmatched: dict, pools: dict) -> None:
+    """Задача сменила лист (разовая ↔ регулярная): её заметки правее G
+    переезжают с ней.  Берутся только заметки задач (не заголовков), которые
+    не достались ни одной строке своего листа; порядок листов — как в плане."""
+    left: dict = {}
+    for name in plan:
+        for k, lst in (pools.get(name) or {}).items():
+            if isinstance(k, str):              # ключ задачи (заголовки — кортежи)
+                left.setdefault(k, []).extend(t for t in lst if t)
+    if not left:
+        return
+    for name, p in plan.items():
+        for i in unmatched.get(name, []):
+            row = p["data"][i]
+            for k in _row_ids(row):
+                if isinstance(k, str) and left.get(k):
+                    p["data"][i] = list(row[:FULL_NCOLS]) + left[k].pop(0)
+                    break
 
 
 def _norm_grid(rows, width: int = FULL_NCOLS) -> list:
@@ -2114,9 +2141,16 @@ def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
         if p["ws"] is None:
             p["ws"] = _gs_call(spreadsheet.add_worksheet, title=name, rows=1000, cols=10)
     requests: list = []
+    unmatched: dict = {}
+    pools: dict = {}
     for name, p in plan.items():
-        ws, old = p["ws"], p["old"]
-        p["data"] = data = _with_user_columns(p["data"], old)
+        _po: list = []
+        p["data"] = _with_user_columns(p["data"], p["old"],
+                                       unmatched.setdefault(name, []), _po)
+        pools[name] = _po[0]
+    _move_notes_between_sheets(plan, unmatched, pools)
+    for name, p in plan.items():
+        ws, old, data = p["ws"], p["old"], p["data"]
         # Ширина — по новым И прежним строкам (#49 B-2): значения правее G
         # у строк, которых больше нет, очищаются этим же запросом и не
         # остаются напротив другой задачи.

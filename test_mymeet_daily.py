@@ -66,6 +66,7 @@ class Book:
         # commit_fail = (исключение, применить_ли_до_ошибки) | None
         self.commit_fail = None
         self.commits = 0
+        self.true_grid = {}       # (лист, "row_count") -> размер, когда код его не видит
         self.ss.batch_update.side_effect = self._batch_update
 
     def _get(self, title):
@@ -125,8 +126,8 @@ class Book:
         def _n(w, attr):          # размер сетки, недоступный коду, — без ограничения
             try:
                 return int(getattr(w, attr))
-            except Exception:
-                return 10 ** 6
+            except Exception:   # фактический размер (если задан тестом) или без ограничения
+                return self.true_grid.get((w.title, attr), 10 ** 6)
         grid = {t: _n(w, "row_count") for t, w in self.ws.items()}
         gcols = {t: _n(w, "col_count") for t, w in self.ws.items()}
         plan = []

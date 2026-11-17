@@ -130,6 +130,7 @@ def test_no_clear_single_atomic_write():
         assert ids == protocol_ids, (ids, protocol_ids)       # все листы — в одном запросе
         for c in cells:
             assert c["fields"] == "userEnteredValue"            # формат не трогаем
+            # без заметок правее G — ровно A:G
             assert (c["range"]["startColumnIndex"], c["range"]["endColumnIndex"]) == (0, 7)
         assert {next(iter(r)) for r in reqs} <= {"updateCells", "updateSheetProperties"}
         # протоколы не меняли значения до этой записи (только чтения)
@@ -317,7 +318,60 @@ def test_sheet_shrinks_tail_cleared_atomically():
         assert len(cells["rows"]) == 3                    # хвост очищается тем же запросом
 
 
-# ── 6. Обычный и вечерний импорт не изменились ───────────────────────────────
+# ── 6. Структура: колонки правее G, совпадение имени листа ───────────────────
+
+def test_user_columns_follow_their_row():
+    """Заметка в H остаётся напротив своей задачи после пересортировки;
+    заметка строки, которой больше нет, очищается (как раньше clear)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        book = _scenario(env)
+        book.data[REG][1] = book.data[REG][1] + ["заметка-старой"]
+        book.data[REG].append(["2", "x", "удалённая", ME, "", "В работе", "p1", "сирота"])
+        ot = env.ms.ONE_TIME_SHEET_NAME
+        book.data[ot][1] = book.data[ot][1] + ["к заголовку"]
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        notes = {r[2]: r[7] for r in book.data[REG][1:] if len(r) > 7 and r[7]}
+        assert notes == {"Старая регулярная": "заметка-старой"}, book.data[REG]
+        assert [r[7] for r in book.data[ot] if len(r) > 7 and r[7]] == ["к заголовку"]
+        assert next(r for r in book.data[ot] if len(r) > 7 and r[7])[0] == \
+            "Старая встреча  (01.08.2026)"
+        _expect_ok_state(book)
+        snap = _snapshot(book)                            # повтор — те же заметки
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        assert {r[2]: r[7] for r in book.data[REG][1:] if len(r) > 7 and r[7]} == notes
+        assert _content(_snapshot(book)) == _content(snap)
+
+
+def test_recurring_named_like_one_time_sheet_atomic():
+    """Регулярная встреча с именем листа «Разовые встречи»: один лист в плане,
+    отказ записи не меняет его, повтор — без дублей."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        book = _scenario(env)
+        ot = env.ms.ONE_TIME_SHEET_NAME
+        n = D._now()
+        env.mm.add("c1", ot, n - timedelta(hours=7), [("К1", ME, False)])
+        env.mm.add("c2", ot, n - timedelta(hours=6), [("К2", ME, False)])
+        before = _snapshot(book)
+        book.commit_fail = (RuntimeError("HTTP 400"), False)
+        e = _full_sync_error(env)
+        assert type(e).__name__ == "FullSyncWriteError", repr(e)
+        snap = _snapshot(book)
+        assert {t: snap[t] for t in before} == before     # прежние листы не тронуты
+        assert all(snap[t] == [] for t in snap if t not in before)   # новые — пустые
+        book.commit_fail = None
+        for _ in range(2):
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            names = sorted(r[1] for r in book.task_rows(ot))
+            assert names == sorted(["Новая", "Старая задача", "К1", "К2"]), names
+            _expect_ok_state(book)
+        cells = [r["updateCells"]["range"]["sheetId"] for r in _value_writes(book)[-1]
+                 if "updateCells" in r]
+        assert len(cells) == len(set(cells)), cells       # лист один раз в запросе
+
+
+# ── 7. Обычный и вечерний импорт не изменились ───────────────────────────────
 
 def test_append_and_auto_import_unchanged():
     with tempfile.TemporaryDirectory() as tmp:
@@ -347,6 +401,10 @@ TESTS = [
      "Полный синк B-1: рост листа за сетку — в том же запросе"),
     (test_sheet_shrinks_tail_cleared_atomically,
      "Полный синк B-1: сокращение листа — хвост очищен атомарно"),
+    (test_user_columns_follow_their_row,
+     "Полный синк B-1: колонки правее G остаются при своей строке"),
+    (test_recurring_named_like_one_time_sheet_atomic,
+     "Полный синк B-1: регулярная встреча с именем «Разовые встречи»"),
     (test_append_and_auto_import_unchanged,
      "Полный синк B-1: обычный и вечерний импорт без изменений"),
 ]

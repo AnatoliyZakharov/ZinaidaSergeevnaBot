@@ -1957,17 +1957,46 @@ def _cell_value(v) -> dict:
     return {"userEnteredValue": {"stringValue": str(v)}}
 
 
-def _norm_grid(rows) -> list:
-    """Значения A:G как строки, без хвостовых пустых ячеек и строк — для
+def _with_user_columns(data: list, old: list) -> list:
+    """Колонки правее G (заметки пользователя) переезжают вместе со своей
+    строкой: задача — по ключу, заголовок встречи — по тексту в A.
+    Значения без своей строки в новом наборе очищаются, как раньше clear."""
+    tails: dict = {}
+    for r in (old or [])[1:]:
+        if len(r) <= FULL_NCOLS or all(_blank(c) for c in r[FULL_NCOLS:]):
+            continue
+        k = _task_key(r) or ("grouper", str(r[0]).strip())
+        tails.setdefault(k, list(r[FULL_NCOLS:]))
+    if not tails:
+        return data
+    out = [list(data[0])] if data else []
+    for r in data[1:]:
+        base = (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS]
+        k = _task_key(base) or ("grouper", str(base[0]).strip())
+        out.append(base + tails.get(k, []))
+    return out
+
+
+def _norm_grid(rows, width: int = FULL_NCOLS) -> list:
+    """Значения как строки, без хвостовых пустых ячеек и строк — для
     сравнения записанного с ожидаемым (get_all_values отдаёт строки)."""
     out = []
     for r in rows or []:
-        cells = ["" if c is None else str(c) for c in list(r)[:FULL_NCOLS]]
+        cells = ["" if c is None else str(c) for c in list(r)[:width]]
         while cells and cells[-1] == "":
             cells.pop()
         out.append(cells)
     while out and not out[-1]:
         out.pop()
+    return out
+
+
+def _col_letter(n: int) -> str:
+    """1 → A, 7 → G, 27 → AA."""
+    out = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
     return out
 
 
@@ -1980,11 +2009,12 @@ def _full_overwrite_state(spreadsheet, plan: dict) -> str:
     """После ошибки записи: 'new' — все листы уже в новом состоянии,
     'old' — все в прежнем, 'mixed' — иначе, 'unknown' — прочитать не удалось."""
     names = list(plan)
+    width = {n: max([FULL_NCOLS] + [len(r) for r in plan[n]["data"]]) for n in names}
     try:
         got: list = []
         for i in range(0, len(names), 20):
             resp = _gs_call(spreadsheet.values_batch_get, [
-                f"{_quote_sheet_title(n)}!A1:G"
+                f"{_quote_sheet_title(n)}!A1:{_col_letter(width[n])}"
                 f"{max(len(plan[n]['data']), len(plan[n]['old']), 1)}"
                 for n in names[i:i + 20]])
             vrs = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
@@ -1994,10 +2024,10 @@ def _full_overwrite_state(spreadsheet, plan: dict) -> str:
     except Exception as e:
         logger.warning("Full sync verification read failed: %s", _err_brief(e))
         return "unknown"
-    cur = [_norm_grid(g) for g in got]
-    if all(c == _norm_grid(plan[n]["data"]) for c, n in zip(cur, names)):
+    cur = [_norm_grid(g, width[n]) for g, n in zip(got, names)]
+    if all(c == _norm_grid(plan[n]["data"], width[n]) for c, n in zip(cur, names)):
         return "new"
-    if all(c == _norm_grid(plan[n]["old"]) for c, n in zip(cur, names)):
+    if all(c == _norm_grid(plan[n]["old"], width[n]) for c, n in zip(cur, names)):
         return "old"
     return "mixed"
 
@@ -2009,7 +2039,8 @@ def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
 
     Механизм сохранности (#49 B-1):
       • листы не очищаются (нет clear): updateCells заменяет значения A:G
-        на высоту max(новые, прежние) строк — лишние прежние строки
+        (и колонки правее G, если они заполнены — они переезжают со своей
+        строкой) на высоту max(новые, прежние) строк — лишние прежние строки
         очищаются в том же запросе; форматирование не трогается
         (fields=userEnteredValue);
       • batchUpdate атомарен: Google применяет все запросы или ни одного —
@@ -2026,23 +2057,25 @@ def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
             p["ws"] = _gs_call(spreadsheet.add_worksheet, title=name, rows=1000, cols=10)
     requests: list = []
     for name, p in plan.items():
-        ws, data, old = p["ws"], p["data"], p["old"]
+        ws, old = p["ws"], p["old"]
+        p["data"] = data = _with_user_columns(p["data"], old)
+        width = max([FULL_NCOLS] + [len(r) for r in data])
         height = max(len(data), len(old), 1)
         try:
             cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
         except Exception:
             cur_rows, cur_cols = 0, 0
-        if height > cur_rows or cur_cols < FULL_NCOLS:
+        if height > cur_rows or cur_cols < width:
             requests.append({"updateSheetProperties": {
                 "properties": {"sheetId": ws.id, "gridProperties": {
                     "rowCount": max(height, cur_rows),
-                    "columnCount": max(FULL_NCOLS, cur_cols)}},
+                    "columnCount": max(width, cur_cols)}},
                 "fields": "gridProperties.rowCount,gridProperties.columnCount"}})
         requests.append({"updateCells": {
             "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": height,
-                      "startColumnIndex": 0, "endColumnIndex": FULL_NCOLS},
+                      "startColumnIndex": 0, "endColumnIndex": width},
             "rows": [{"values": [_cell_value(v) for v in
-                                 (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS]]}
+                                 (list(r) + [""] * width)[:width]]}
                      for r in data],
             "fields": "userEnteredValue"}})
     try:

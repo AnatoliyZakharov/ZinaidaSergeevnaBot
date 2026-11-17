@@ -273,9 +273,10 @@ def test_full_sync_read_failure_does_not_clear():
             env.ms.sync_to_sheets(days=30, append=False, user_config=_cfg(env))
             raise AssertionError("должна быть ошибка")
         except RuntimeError as e:
-            assert "этот лист не изменён" in str(e), e
+            assert "до записи: Google Sheets не изменён" in str(e), e
         assert not book.ws[name].clear.called
-        assert book.data[name] == before[name]
+        assert book.commits == 0                              # ни одной записи значений
+        assert book.data == before
 
 
 def test_full_sync_status_read_failure_aborts_before_clear():

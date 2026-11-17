@@ -813,7 +813,12 @@ def test_sync_my_tasks_exception_does_not_break_sync():
                                  user_config={"gcal_organizer_data": _GCAL,
                                               "mymeet_spreadsheet_id": "x",
                                               "mymeet_full_name": "Иван Петров"})
-        assert "Синхронизировано" in res, res
+        if append:
+            assert "✅ Синхронизировано" in res, res
+        else:
+            # #49 B-1: полный режим не объявляет успех, если «Мои задачи» не обновлены
+            assert res.startswith("⚠️ Синхронизация выполнена частично"), res
+            assert "✅" not in res, res
         assert "boom-meta" in res and "Ошибки форматирования" in res, res
 
 
@@ -1615,6 +1620,9 @@ if __name__ == "__main__":
     # issue #49: аудит надёжности синхронизации (перезапуск, гонки, полный синк)
     from test_sync_audit import TESTS as _SYNC_AUDIT_TESTS
     tests += _SYNC_AUDIT_TESTS
+    # issue #49 B-1: полный синк — атомарная запись без промежуточной очистки
+    from test_full_sync_atomic import TESTS as _FULL_ATOMIC_TESTS
+    tests += _FULL_ATOMIC_TESTS
     # Полнота Docker-образа и Deploy Monitor (issue #29): только stdlib, без сети
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS

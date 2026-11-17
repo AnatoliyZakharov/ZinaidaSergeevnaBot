@@ -116,8 +116,13 @@ class FmtBook(D.Book):
 
     def _batch(self, body):
         self.batches.append(body)
+        D.Book._batch_update(self, {"requests": [
+            r for r in body.get("requests", []) if "updateCells" in r]})
         for r in body.get("requests", []):
             k = next(iter(r))
+            if k == "updateCells" and r[k].get("fields") == "userEnteredValue":
+                # значения полного синка
+                continue
             assert k not in FORBIDDEN, k
             if k != "repeatCell":
                 continue

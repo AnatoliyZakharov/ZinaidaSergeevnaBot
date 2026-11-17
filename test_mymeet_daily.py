@@ -62,6 +62,11 @@ class Book:
         self.ss.add_worksheet.side_effect = lambda title, rows, cols: self._new(title, [])
         self.fail_reads = False
         self.fail_update = ()     # префиксы листов, запись в которые падает
+        # Атомарная запись полного синка (batchUpdate с updateCells):
+        # commit_fail = (исключение, применить_ли_до_ошибки) | None
+        self.commit_fail = None
+        self.commits = 0
+        self.ss.batch_update.side_effect = self._batch_update
 
     def _get(self, title):
         if title not in self.ws:
@@ -79,6 +84,8 @@ class Book:
         def _upd(*args, **kw):
             if any(title.startswith(p) for p in self.fail_update):
                 raise RuntimeError("sheets-503")
+            if self.commit_fail is not None and not self.commit_fail[1]:
+                raise self.commit_fail[0]      # сбой записи значений (любым способом)
             rng = kw.get("range_name")
             vals = kw.get("values")
             for a in args:
@@ -98,6 +105,66 @@ class Book:
         w.batch_clear.side_effect = lambda ranges: None
         self.ws[title] = w
         return w
+
+    def _batch_update(self, body):
+        reqs = body.get("requests", [])
+        cells = [r for r in reqs if (r.get("updateCells") or {}).get("fields")
+                 == "userEnteredValue"]
+        if cells and self.commit_fail is not None:
+            exc, applied = self.commit_fail
+            if applied:
+                self.apply_requests(reqs)
+            raise exc
+        self.apply_requests(reqs)
+        return {}
+
+    def apply_requests(self, reqs):
+        """Применить updateCells (значения A:G) атомарно, как Google: сначала
+        проверка всех запросов, затем применение всех."""
+        by_id = {w.id: t for t, w in self.ws.items()}
+        grid = {t: int(w.row_count) for t, w in self.ws.items()}
+        plan = []
+        for r in reqs:
+            if "updateSheetProperties" in r:
+                pr = r["updateSheetProperties"]["properties"]
+                gp = pr.get("gridProperties") or {}
+                if "rowCount" in gp:
+                    grid[by_id[pr["sheetId"]]] = gp["rowCount"]
+                continue
+            if "updateCells" not in r or r["updateCells"].get("fields") != "userEnteredValue":
+                continue          # ссылки/формат «Моих задач» — не значения
+            uc = r["updateCells"]
+            rng = uc["range"]
+            assert rng["sheetId"] in by_id, rng
+            if rng["endRowIndex"] > grid[by_id[rng["sheetId"]]]:
+                # как Google: весь запрос отклоняется, ничего не применено
+                raise RuntimeError("exceeds grid limits")
+            plan.append((by_id[rng["sheetId"]], rng, uc.get("rows", [])))
+        for r in reqs:
+            if "updateSheetProperties" in r:
+                pr = r["updateSheetProperties"]["properties"]
+                rc = (pr.get("gridProperties") or {}).get("rowCount")
+                if rc:
+                    self.ws[by_id[pr["sheetId"]]].row_count = rc
+        if plan:
+            self.commits += 1
+        for t, rng, rows in plan:
+            cur = self.data[t]
+            c0, c1 = rng.get("startColumnIndex", 0), rng["endColumnIndex"]
+            r0, r1 = rng.get("startRowIndex", 0), rng["endRowIndex"]
+            while len(cur) < r1:
+                cur.append([])
+            for i in range(r0, r1):
+                vals = rows[i - r0]["values"] if i - r0 < len(rows) else []
+                row = list(cur[i]) + [""] * max(0, c1 - len(cur[i]))
+                for j in range(c0, c1):
+                    cd = vals[j - c0] if j - c0 < len(vals) else {}
+                    uv = cd.get("userEnteredValue") or {}
+                    row[j] = uv.get("numberValue", uv.get("stringValue", ""))
+                cur[i] = row
+            while cur and all(c in ("", None) for c in cur[-1]):
+                cur.pop()
+            self.writes.append(t)
 
     def _batch_get(self, ranges):
         if self.fail_reads:

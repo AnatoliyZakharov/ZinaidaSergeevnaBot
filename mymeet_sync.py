@@ -1460,15 +1460,24 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             return k not in window_keys and mid not in window_mids
         return k not in window_legacy
 
-    def _read_before_clear(ws_):
+    # Полный режим (#49 B-1): сначала читаются и рассчитываются ВСЕ листы,
+    # затем одна атомарная запись (_commit_full_overwrite).  Листы не
+    # очищаются: пока запись не применена, в таблице остаются прежние данные.
+    full_plan: dict = {}   # лист -> {"ws": ws|None, "old": строки до, "data": строки после}
+
+    def _open_for_full(name):
         try:
-            return _gs_call(ws_.get_all_values)
+            ws_ = spreadsheet.worksheet(name)
+        except gspread.WorksheetNotFound:
+            return None, []            # создаётся на этапе записи
+        try:
+            return ws_, _gs_call(ws_.get_all_values)
         except Exception as e:
-            # Без чтения нельзя сохранить статусы и строки вне окна — лист не очищаем
+            # Без чтения нельзя сохранить статусы и строки вне окна
             raise RuntimeError("не удалось прочитать лист перед полной перезаписью "
-                               f"({type(e).__name__}) — синхронизация остановлена: этот "
-                               "лист не изменён, листы, обработанные раньше, уже обновлены "
-                               "без потерь. Повторите синхронизацию позже") from None
+                               f"({type(e).__name__}) — синхронизация остановлена до "
+                               "записи: Google Sheets не изменён. Повторите "
+                               "синхронизацию позже") from None
 
     # Разные названия встреч могут дать одно имя листа (_safe_sheet_name) —
     # объединяем их, чтобы второй проход не перетёр первый.
@@ -1477,17 +1486,13 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         recurring_by_sheet.setdefault(_safe_sheet_name(meeting_name), []).extend(meetings)
 
     for sheet_name, meetings in sorted(recurring_by_sheet.items()):
-        try:
-            ws = spreadsheet.worksheet(sheet_name)
-            if not append:
-                # Read existing data BEFORE clearing so we can restore manual statuses.
-                existing_full: list = _read_before_clear(ws)
-                _gs_call(ws.clear)
-        except gspread.WorksheetNotFound:
-            # append: лист создаётся только на этапе записи (после проверки объёма)
-            ws = None if append else _gs_call(spreadsheet.add_worksheet, title=sheet_name,
-                                              rows=1000, cols=10)
-            existing_full = []
+        if not append:
+            ws, existing_full = _open_for_full(sheet_name)
+        else:
+            try:
+                ws = spreadsheet.worksheet(sheet_name)
+            except gspread.WorksheetNotFound:
+                ws = None   # создаётся только на этапе записи (после проверки объёма)
 
         if not append:
             # Full overwrite: preserve manually-set statuses from existing sheet.
@@ -1531,9 +1536,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             rows.sort(key=lambda r: _deadline_sort_key(str(r[4]) if len(r) > 4 else ""))
             for _i, _r in enumerate(rows, 1):
                 _r[0] = _i  # re-number after sort
-            all_data = [HEADER_ROW] + rows
-            _gs_call(ws.update, f"A1:G{len(all_data)}", all_data)
-            all_fmt_warnings.extend(_apply_full_format(spreadsheet, ws, data_rows=len(rows)))
+            # Запись — позже, одной атомарной операцией для всех листов
+            full_plan[sheet_name] = {"ws": ws, "old": existing_full,
+                                     "data": [list(HEADER_ROW)] + rows}
         else:
             # Append mode: deduplicate by (date, task, assignee) to avoid re-adding
             # existing rows on repeated daily runs; preserve manually-changed statuses.
@@ -1583,18 +1588,22 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     # Format: № | Дата | Задача | Ответственный | Срок | Статус
     # Bold grouper row with meeting name before each meeting's tasks.
     ot_name = ONE_TIME_SHEET_NAME
-    try:
-        ws = spreadsheet.worksheet(ot_name)
-        if not append:
-            # Read BEFORE clear to preserve manually-set statuses.
-            existing_ot_before: list = _read_before_clear(ws)
-            _gs_call(ws.clear)
-        else:
-            existing_ot_before = []
-    except gspread.WorksheetNotFound:
-        ws = None if append else _gs_call(spreadsheet.add_worksheet, title=ot_name,
-                                          rows=2000, cols=10)
-        existing_ot_before = []
+    existing_ot_before: list = []
+    ot_old: list = []
+    if append:
+        try:
+            ws = spreadsheet.worksheet(ot_name)
+        except gspread.WorksheetNotFound:
+            ws = None
+    elif ot_name in full_plan:
+        # Регулярная встреча с именем листа разовых: её строки уже в плане —
+        # переносятся (written_by_sheet), исходное состояние листа — прежнее
+        ws = full_plan[ot_name]["ws"]
+        ot_old = full_plan[ot_name]["old"]
+        existing_ot_before = full_plan[ot_name]["data"]
+    else:
+        ws, existing_ot_before = _open_for_full(ot_name)
+        ot_old = existing_ot_before
 
     if not append:
         start_idx = 1
@@ -1735,7 +1744,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             except gspread.WorksheetNotFound:
                 ws = _gs_call(spreadsheet.add_worksheet, title=ot_name, rows=2000, cols=10)
 
-    if new_sheet:
+    if not append:
+        # ── Полный режим: одна атомарная запись всех листов, затем формат ──
+        full_plan[ot_name] = {"ws": ws, "old": ot_old,
+                              "data": [list(HEADER_ROW)] + all_rows}
+        _commit_full_overwrite(spreadsheet, full_plan)
+        ws = full_plan[ot_name]["ws"]
+        for _name, _p in full_plan.items():
+            all_fmt_warnings.extend(_apply_full_format(spreadsheet, _p["ws"],
+                                                       data_rows=len(_p["data"]) - 1))
+    elif new_sheet:
         write_data = [HEADER_ROW] + all_rows
         if write_data:
             _gs_call(ws.update, f"A1:G{len(write_data)}", write_data)
@@ -1821,8 +1839,15 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     )
     _diag_now = datetime.now(timezone.utc)
     _diag_from = _diag_now - timedelta(days=days)
+    # Полный режим: протоколы записаны, но «Мои задачи» нет — это частичный
+    # результат, не «успех» (обычный импорт сообщает об этом своей строкой).
+    if not append and full_name and st["my_tasks"] != "ok":
+        head = (f"⚠️ Синхронизация выполнена частично: листы протоколов записаны "
+                f"({total_tasks} задач), лист «Мои задачи» не обновлён\n")
+    else:
+        head = f"✅ Синхронизировано: {total_tasks} задач\n"
     result = (
-        f"✅ Синхронизировано: {total_tasks} задач\n"
+        head +
         f"📋 {sheets_written} листов по регулярным встречам\n"
         f"📝 Разовые встречи: {len(one_time)} встреч\n"
         f"📅 Период: {_diag_from.strftime('%d.%m.%Y')} — {_diag_now.strftime('%d.%m.%Y')}\n"
@@ -1917,6 +1942,129 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
         return [f"Разовые встречи (заголовки встреч): {e}"]
     return []
+
+
+FULL_NCOLS = 7                      # A:G — колонки листа протокола
+
+
+def _cell_value(v) -> dict:
+    """CellData для updateCells: как запись RAW (числа — числами, остальное —
+    строкой как есть); пустое значение — ячейка очищается."""
+    if v is None or v == "":
+        return {}
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return {"userEnteredValue": {"numberValue": v}}
+    return {"userEnteredValue": {"stringValue": str(v)}}
+
+
+def _norm_grid(rows) -> list:
+    """Значения A:G как строки, без хвостовых пустых ячеек и строк — для
+    сравнения записанного с ожидаемым (get_all_values отдаёт строки)."""
+    out = []
+    for r in rows or []:
+        cells = ["" if c is None else str(c) for c in list(r)[:FULL_NCOLS]]
+        while cells and cells[-1] == "":
+            cells.pop()
+        out.append(cells)
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+class FullSyncWriteError(RuntimeError):
+    """Полная перезапись не применена или не подтверждена (текст — для
+    пользователя, без названий листов и данных)."""
+
+
+def _full_overwrite_state(spreadsheet, plan: dict) -> str:
+    """После ошибки записи: 'new' — все листы уже в новом состоянии,
+    'old' — все в прежнем, 'mixed' — иначе, 'unknown' — прочитать не удалось."""
+    names = list(plan)
+    try:
+        got: list = []
+        for i in range(0, len(names), 20):
+            resp = _gs_call(spreadsheet.values_batch_get, [
+                f"{_quote_sheet_title(n)}!A1:G"
+                f"{max(len(plan[n]['data']), len(plan[n]['old']), 1)}"
+                for n in names[i:i + 20]])
+            vrs = (resp.get("valueRanges") or []) if isinstance(resp, dict) else []
+            got += [(vr or {}).get("values") or [] for vr in vrs]
+        if len(got) != len(names):
+            return "unknown"
+    except Exception as e:
+        logger.warning("Full sync verification read failed: %s", _err_brief(e))
+        return "unknown"
+    cur = [_norm_grid(g) for g in got]
+    if all(c == _norm_grid(plan[n]["data"]) for c, n in zip(cur, names)):
+        return "new"
+    if all(c == _norm_grid(plan[n]["old"]) for c, n in zip(cur, names)):
+        return "old"
+    return "mixed"
+
+
+def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
+    """Записать все листы полного синка ОДНИМ spreadsheets.batchUpdate.
+
+    plan: {лист: {"ws": Worksheet|None, "old": строки до, "data": строки после}}.
+
+    Механизм сохранности (#49 B-1):
+      • листы не очищаются (нет clear): updateCells заменяет значения A:G
+        на высоту max(новые, прежние) строк — лишние прежние строки
+        очищаются в том же запросе; форматирование не трогается
+        (fields=userEnteredValue);
+      • batchUpdate атомарен: Google применяет все запросы или ни одного —
+        при отказе, таймауте или обрыве процесса таблица либо полностью
+        прежняя, либо полностью новая, промежуточного пустого листа нет;
+      • повтор запроса идемпотентен (те же значения), поэтому повторы
+        _gs_call при 429/503 безопасны;
+      • при ошибке результат проверяется чтением: применено — успех,
+        не применено / не подтверждено — FullSyncWriteError (не «успех»).
+    Недостающие листы создаются пустыми до записи (данные это не меняет).
+    """
+    for name, p in plan.items():
+        if p["ws"] is None:
+            p["ws"] = _gs_call(spreadsheet.add_worksheet, title=name, rows=1000, cols=10)
+    requests: list = []
+    for name, p in plan.items():
+        ws, data, old = p["ws"], p["data"], p["old"]
+        height = max(len(data), len(old), 1)
+        try:
+            cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)
+        except Exception:
+            cur_rows, cur_cols = 0, 0
+        if height > cur_rows or cur_cols < FULL_NCOLS:
+            requests.append({"updateSheetProperties": {
+                "properties": {"sheetId": ws.id, "gridProperties": {
+                    "rowCount": max(height, cur_rows),
+                    "columnCount": max(FULL_NCOLS, cur_cols)}},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount"}})
+        requests.append({"updateCells": {
+            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": height,
+                      "startColumnIndex": 0, "endColumnIndex": FULL_NCOLS},
+            "rows": [{"values": [_cell_value(v) for v in
+                                 (list(r) + [""] * FULL_NCOLS)[:FULL_NCOLS]]}
+                     for r in data],
+            "fields": "userEnteredValue"}})
+    try:
+        _gs_call(spreadsheet.batch_update, {"requests": requests})
+        return
+    except Exception as e:
+        err = type(e).__name__
+        logger.warning("Full sync write failed: %s — verifying", _err_brief(e))
+    state = _full_overwrite_state(spreadsheet, plan)
+    logger.info("Full sync write state after error: %s (sheets=%d)", state, len(plan))
+    if state == "new":
+        return      # запрос применён, ответ потерян (таймаут) — данные записаны
+    if state == "old":
+        raise FullSyncWriteError(
+            f"Google Sheets не принял запись ({err}). Полная синхронизация не "
+            "выполнена: листы протоколов не изменены — задачи и статусы на месте. "
+            "Повторите /sync_mymeet_full позже.")
+    raise FullSyncWriteError(
+        f"Результат записи в Google Sheets не подтверждён ({err}). Полная "
+        "синхронизация не считается выполненной. Листы не очищались: запись "
+        "атомарная — каждый лист содержит либо прежние данные, либо полный новый "
+        "набор. Повторите /sync_mymeet_full позже.")
 
 
 def _all_protocol_statuses(spreadsheet) -> dict:

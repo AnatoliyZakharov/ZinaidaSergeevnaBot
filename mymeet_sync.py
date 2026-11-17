@@ -1991,6 +1991,12 @@ def _norm_grid(rows, width: int = FULL_NCOLS) -> list:
     return out
 
 
+def _plan_width(data: list, old: list) -> int:
+    """Ширина перезаписи: A:G и все колонки, занятые в новых или прежних
+    строках листа."""
+    return max([FULL_NCOLS] + [len(r) for r in data] + [len(r) for r in (old or [])])
+
+
 def _col_letter(n: int) -> str:
     """1 → A, 7 → G, 27 → AA."""
     out = ""
@@ -2009,7 +2015,8 @@ def _full_overwrite_state(spreadsheet, plan: dict) -> str:
     """После ошибки записи: 'new' — все листы уже в новом состоянии,
     'old' — все в прежнем, 'mixed' — иначе, 'unknown' — прочитать не удалось."""
     names = list(plan)
-    width = {n: max([FULL_NCOLS] + [len(r) for r in plan[n]["data"]]) for n in names}
+    width = {n: plan[n].get("width") or _plan_width(plan[n]["data"], plan[n]["old"])
+             for n in names}
     try:
         got: list = []
         for i in range(0, len(names), 20):
@@ -2059,7 +2066,10 @@ def _commit_full_overwrite(spreadsheet, plan: dict) -> None:
     for name, p in plan.items():
         ws, old = p["ws"], p["old"]
         p["data"] = data = _with_user_columns(p["data"], old)
-        width = max([FULL_NCOLS] + [len(r) for r in data])
+        # Ширина — по новым И прежним строкам (#49 B-2): значения правее G
+        # у строк, которых больше нет, очищаются этим же запросом и не
+        # остаются напротив другой задачи.
+        p["width"] = width = _plan_width(data, old)
         height = max(len(data), len(old), 1)
         try:
             cur_rows, cur_cols = int(ws.row_count), int(ws.col_count)

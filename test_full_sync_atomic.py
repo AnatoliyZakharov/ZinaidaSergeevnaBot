@@ -343,6 +343,118 @@ def test_user_columns_follow_their_row():
         assert _content(_snapshot(book)) == _content(snap)
 
 
+def _user_cells(rows):
+    """{(задача или заголовок, колонка): значение} для всех непустых ячеек
+    правее G — заметки и к какой строке они относятся."""
+    out = {}
+    for r in rows[1:]:
+        owner = r[2] if len(r) > 2 and str(r[2]).strip() else r[0]
+        for j in range(7, len(r)):
+            if str(r[j]).strip():
+                out[(owner, j)] = r[j]
+    return out
+
+
+def _b2_book(env, rows):
+    book = D.Book({REG: [PROTO_HDR] + rows})
+    env.books["sheet-1"] = book
+    return book
+
+
+def test_b2_removed_task_note_not_orphaned():
+    """B-2: у исключённой задачи заметка в H, у оставшихся заметок нет —
+    после синка заметка не остаётся напротив другой задачи."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        book = _b2_book(env, [
+            ["1", "x", "Удалённая", ME, "", "В работе", "p1", "заметка H"],
+            ["2", "x", "Удалённая 2", ME, "", "В работе", "p1", "", "заметка I", "", "заметка K"],
+        ])
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Новая А", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Новая Б", ME, False)])
+        for _ in range(2):                                # повтор — тот же итог
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            assert _user_cells(book.data[REG]) == {}, book.data[REG]
+            assert sorted(r[2] for r in book.data[REG][1:]) == ["Новая А", "Новая Б"]
+
+
+def test_b2_notes_in_several_columns_follow_task():
+    """Заметки в H, I и K остаются при своей задаче после пересортировки;
+    заметка исключённой задачи в дальней колонке (M) очищается, хотя у
+    оставшихся строк такой колонки нет."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        book = _b2_book(env, [
+            ["1", "01.08.2026", "Старая", ME, "", "Выполнено", "old", "h1", "i1", "", "k1"],
+            ["2", "x", "Удалённая", ME, "", "В работе", "p1", "", "", "", "", "", "m-сирота"],
+            ["3", "02.08.2026", "Вторая старая", ME, "01.01.2020", "В работе", "old2", "h2"],
+        ])
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Новая А", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Новая Б", ME, False)])
+        want = {("Старая", 7): "h1", ("Старая", 8): "i1", ("Старая", 10): "k1",
+                ("Вторая старая", 7): "h2"}
+        for _ in range(2):
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            assert _user_cells(book.data[REG]) == want, book.data[REG]
+            # пересортировка действительно была: «Вторая старая» (срок 2020) — первая
+            assert book.data[REG][1][2] == "Вторая старая", book.data[REG]
+        cells = [r["updateCells"] for r in _value_writes(book)[-1] if "updateCells" in r]
+        assert cells[0]["range"]["endColumnIndex"] == 13    # A:M — ширина старых данных
+        assert cells[0]["fields"] == "userEnteredValue"
+
+
+def test_b2_shrink_with_notes_in_tail():
+    """Лист сократился: заметки в хвостовых строках очищаются вместе с ними,
+    заметка оставшейся задачи переезжает на её новую строку."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        book = _b2_book(env, [
+            ["1", "x", "a", ME, "", "В работе", "p1", "na"],
+            ["2", "x", "b", ME, "", "В работе", "p1", "nb", "ib"],
+            ["3", "x", "c", ME, "", "В работе", "p1", "", "", "jc"],
+            ["4", "01.08.2026", "Старая", ME, "", "Выполнено", "old", "keep"],
+        ])
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Одна", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Две", ME, False)])
+        for _ in range(2):
+            env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+            assert len(book.data[REG]) == 4, book.data[REG]   # шапка + 3 задачи
+            assert _user_cells(book.data[REG]) == {("Старая", 7): "keep"}, book.data[REG]
+            st = {r[2]: r[5] for r in book.data[REG][1:]}
+            assert st["Старая"] == "Выполнено", st
+        assert book.commits == 2
+
+
+def test_b2_notes_with_write_failures():
+    """Заметки и сбои записи: отказ — заметки на прежних местах; таймаут после
+    применения подтверждается чтением на полную ширину; повтор — без сирот."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        n = D._now()
+        book = _b2_book(env, [
+            ["1", "x", "Удалённая", ME, "", "В работе", "p1", "", "сирота-I"],
+            ["2", "01.08.2026", "Старая", ME, "", "Выполнено", "old", "h-старой"],
+        ])
+        env.mm.add("p1", REG, n - timedelta(hours=3), [("Новая", ME, False)])
+        env.mm.add("p2", REG, n - timedelta(hours=1), [("Новая 2", ME, False)])
+        before = _snapshot(book)
+        book.commit_fail = (RuntimeError("HTTP 400"), False)
+        e = _full_sync_error(env)
+        assert type(e).__name__ == "FullSyncWriteError" and "не изменены" in str(e), repr(e)
+        assert _snapshot(book)[REG] == before[REG]
+        book.commit_fail = (TimeoutError("timeout"), True)
+        res = env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        assert res.startswith("✅"), res
+        assert _user_cells(book.data[REG]) == {("Старая", 7): "h-старой"}, book.data[REG]
+        book.commit_fail = None
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_full_cfg(env))
+        assert _user_cells(book.data[REG]) == {("Старая", 7): "h-старой"}, book.data[REG]
+        _assert_no_dupes(book)
+
+
 def test_recurring_named_like_one_time_sheet_atomic():
     """Регулярная встреча с именем листа «Разовые встречи»: один лист в плане,
     отказ записи не меняет его, повтор — без дублей."""
@@ -403,6 +515,12 @@ TESTS = [
      "Полный синк B-1: сокращение листа — хвост очищен атомарно"),
     (test_user_columns_follow_their_row,
      "Полный синк B-1: колонки правее G остаются при своей строке"),
+    (test_b2_removed_task_note_not_orphaned,
+     "Полный синк B-2: заметка исключённой задачи не остаётся у другой"),
+    (test_b2_notes_in_several_columns_follow_task,
+     "Полный синк B-2: заметки в H, I, K — при задаче, дальняя сирота очищена"),
+    (test_b2_shrink_with_notes_in_tail, "Полный синк B-2: сокращение листа с заметками"),
+    (test_b2_notes_with_write_failures, "Полный синк B-2: заметки при отказе и таймауте записи"),
     (test_recurring_named_like_one_time_sheet_atomic,
      "Полный синк B-1: регулярная встреча с именем «Разовые встречи»"),
     (test_append_and_auto_import_unchanged,

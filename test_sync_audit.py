@@ -273,7 +273,7 @@ def test_full_sync_read_failure_does_not_clear():
             env.ms.sync_to_sheets(days=30, append=False, user_config=_cfg(env))
             raise AssertionError("должна быть ошибка")
         except RuntimeError as e:
-            assert "лист не изменён" in str(e), e
+            assert "этот лист не изменён" in str(e), e
         assert not book.ws[name].clear.called
         assert book.data[name] == before[name]
 
@@ -333,6 +333,8 @@ def test_full_sync_legacy_row_without_mid_not_duplicated():
         env.ms.sync_to_sheets(days=30, append=False, user_config=_cfg(env))
         tasks = sorted(r[1] for r in book.task_rows(name))
         assert tasks == ["Древняя", "Отчёт"], book.data[name]
+        st = {r[2]: r[5] for r in book.data[name][1:] if len(r) > 5}
+        assert st["Отчёт"] == "Выполнено", st                     # статус legacy-строки
 
 
 def test_full_sync_window_meeting_mymeet_is_source_of_truth():
@@ -357,6 +359,22 @@ def test_full_sync_window_meeting_mymeet_is_source_of_truth():
         assert tasks == ["Отчёт v2", "Смета"], book.data[name]
         st = {r[2]: r[5] for r in book.data[name][1:] if len(r) > 5}
         assert st["Смета"] == "Выполнено", st
+
+
+def test_full_sync_numeric_meeting_title_carried():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = D.Env(tmp)
+        name = env.ms.ONE_TIME_SHEET_NAME
+        book = D.Book({name: [PROTO_HDR, ["Старая A  (01.08.2026)"],
+                              ["1", "01.08.2026", "A1", ME, "", "Выполнено", "a"],
+                              ["2024"],                                   # числовое название
+                              ["2", "02.08.2026", "B1", ME, "", "В работе", "b"]]})
+        book.ws[name].clear.side_effect = lambda: book.data.__setitem__(name, [])
+        env.books["sheet-1"] = book
+        env.mm.add("n1", "Новая", D._now() - timedelta(hours=2), [("N1", ME, False)])
+        env.ms.sync_to_sheets(days=30, append=False, user_config=_cfg(env))
+        labels = [r[0] for r in book.data[name][1:] if len(r) > 1 and not str(r[1]).strip()]
+        assert labels[:2] == ["Старая A  (01.08.2026)", "2024"], book.data[name]
 
 
 def test_full_sync_sheet_name_collisions():
@@ -400,9 +418,11 @@ TESTS = [
      "Аудит: полный синк — сбой чтения статусов, ничего не очищено"),
     (test_full_sync_classification_change_no_cross_sheet_dupes,
      "Аудит: полный синк — смена разовая/регулярная: без дублей, статус сохранён"),
-    (test_full_sync_legacy_row_without_mid_not_duplicated, "Аудит: полный синк — legacy-строки"),
+    (test_full_sync_legacy_row_without_mid_not_duplicated,
+     "Аудит: полный синк — legacy-строки без дублей, статус сохранён"),
     (test_full_sync_window_meeting_mymeet_is_source_of_truth,
      "Аудит: полный синк — изменённая задача без двойника, протокол 404 — строки целы"),
+    (test_full_sync_numeric_meeting_title_carried, "Аудит: полный синк — числовое название встречи"),
     (test_full_sync_sheet_name_collisions, "Аудит: полный синк — одно имя листа у разных встреч"),
 ]
 

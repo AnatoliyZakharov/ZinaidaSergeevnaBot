@@ -1466,13 +1466,14 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         except Exception as e:
             # Без чтения нельзя сохранить статусы и строки вне окна — лист не очищаем
             raise RuntimeError("не удалось прочитать лист перед полной перезаписью "
-                               f"({type(e).__name__}) — синхронизация отменена, "
-                               "лист не изменён") from None
+                               f"({type(e).__name__}) — синхронизация остановлена: этот "
+                               "лист не изменён, листы, обработанные раньше, уже обновлены "
+                               "без потерь. Повторите синхронизацию позже") from None
 
     # Разные названия встреч могут дать одно имя листа (_safe_sheet_name) —
     # объединяем их, чтобы второй проход не перетёр первый.
     recurring_by_sheet: dict = {}
-    for meeting_name, meetings in recurring.items():
+    for meeting_name, meetings in sorted(recurring.items()):   # детерминированный порядок
         recurring_by_sheet.setdefault(_safe_sheet_name(meeting_name), []).extend(meetings)
 
     for sheet_name, meetings in sorted(recurring_by_sheet.items()):
@@ -1510,7 +1511,10 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
                         task["deadline"], None, m["id"],
                     ])
                     # Restore manually-set status; fall back to MYmeet status
-                    status = (manual_statuses.get(tkey) or global_statuses.get(tkey)) if tkey else None
+                    lkey = _task_key([None, m["date"], task["name"], task["assignee"]])
+                    status = (manual_statuses.get(tkey) or global_statuses.get(tkey)
+                              or manual_statuses.get(lkey) or global_statuses.get(lkey)
+                              ) if tkey else None
                     if not status:
                         status = "Выполнено" if task["done"] else "Требует верификации"
                     rows.append([
@@ -1645,7 +1649,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         # Полная перезапись: блоки встреч вне окна переносятся первыми, как есть
         pending_grouper = None
         for r in existing_ot_before[1:]:
-            if _is_grouper_row(r):
+            # Заголовок встречи: текст в A, B:F пусты (у задачи всегда есть дата в B) —
+            # в т.ч. числовое название встречи
+            if r and not _blank(r[0]) and all(_blank(c) for c in list(r[1:GROUPER_NCOLS])):
                 pending_grouper = (list(r) + [""] * 7)[:7]
                 continue
             if not _carry(r, ot_name):
@@ -1686,7 +1692,9 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         for task in new_tasks:
             tkey_ot = _task_key([None, m["date"], task["name"], task["assignee"],
                                   task["deadline"], None, m["id"]])
-            status_ot = ((manual_statuses_ot.get(tkey_ot) or global_statuses.get(tkey_ot))
+            lkey_ot = _task_key([None, m["date"], task["name"], task["assignee"]])
+            status_ot = ((manual_statuses_ot.get(tkey_ot) or global_statuses.get(tkey_ot)
+                          or manual_statuses_ot.get(lkey_ot) or global_statuses.get(lkey_ot))
                          if not append else None) or (
                 "Выполнено" if task["done"] else "Требует верификации"
             )

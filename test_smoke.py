@@ -819,7 +819,7 @@ def test_sync_my_tasks_exception_does_not_break_sync():
             # #49 B-1: полный режим не объявляет успех, если «Мои задачи» не обновлены
             assert res.startswith("⚠️ Синхронизация выполнена частично"), res
             assert "✅" not in res, res
-        assert "boom-meta" in res and "Ошибки форматирования" in res, res
+        assert "boom-meta" not in res and "Ошибки форматирования" in res, res
 
 
 def test_sync_with_full_name_writes_my_tasks():
@@ -1013,7 +1013,7 @@ def test_write_my_tasks_update_failure_keeps_old_data():
     assert ws.update.called
     assert not ws.clear.called
     assert not ws.batch_clear.called
-    assert any("quota-boom" in w for w in warnings), warnings
+    assert warnings == ["Не удалось обновить лист «Мои задачи»"], warnings
 
 
 def test_write_my_tasks_update_before_tail_clear():
@@ -1045,7 +1045,7 @@ def test_write_my_tasks_update_before_tail_clear():
     ws.batch_clear.side_effect = RuntimeError("clear-boom")
     w2 = []
     mod._write_my_tasks_sheet(ss, title, True, [list(rows3[0])], w2)
-    assert any("clear-boom" in x for x in w2), w2
+    assert w2 == ["Не удалось очистить старые строки"], w2
     # Лист, где строк ровно n: хвост не чистится (нет выхода за пределы сетки)
     ws_small = _fake_ws(title, rows=2, sid=12)
     ss.worksheet.return_value = ws_small
@@ -1627,6 +1627,10 @@ if __name__ == "__main__":
     from test_docker_packaging import TESTS as _DOCKER_PACKAGING_TESTS
     from test_deploy_monitor import TESTS as _DEPLOY_MONITOR_TESTS
     tests += _DOCKER_PACKAGING_TESTS + _DEPLOY_MONITOR_TESTS
+    from test_bot_reliability import TESTS as _BOT_RELIABILITY_TESTS
+    tests += _BOT_RELIABILITY_TESTS
+    from test_mymeet_reconfiguration import run_mymeet_reconfiguration_tests
+    tests.append((run_mymeet_reconfiguration_tests, "MYmeet: атомарная замена конфигурации"))
     failed = []
     for fn, label in tests:
         try:

@@ -23,6 +23,7 @@ import os
 import json
 import logging
 import re
+import signal
 from datetime import datetime, time, timedelta, timezone
 import time as time_module
 from typing import Optional
@@ -53,7 +54,7 @@ import my_tasks
 import crypto as _crypto
 from crypto import CryptoDecryptError
 import mymeet_sync
-from mymeet_sync import sync_to_sheets_async, fetch_workspaces, verify_token_and_get_workspace, MymeetTokenError
+from mymeet_sync import sync_to_sheets_async, verify_token_and_get_workspace, MymeetTokenError
 
 # ─── Логирование ─────────────────────────────────────────────
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -154,7 +155,8 @@ def _tz(user_row) -> pytz.timezone:
 
 
 def _work_start(user_row) -> int:
-    return user_row["work_start"] or DEFAULT_WORK_START
+    value = user_row["work_start"]
+    return DEFAULT_WORK_START if value is None else value
 
 
 def _work_end(user_row) -> int:
@@ -174,14 +176,33 @@ def _get_calendar_id(user_row) -> str:
 
 # ─── Google Calendar ─────────────────────────────────────────
 
+def _local_work_boundary(tz, day, hour, *, end=False):
+    if hour == 24:
+        day += timedelta(days=1)
+        hour = 0
+    wall_time = datetime.combine(day, time(hour))
+    try:
+        return tz.localize(wall_time, is_dst=None)
+    except pytz.AmbiguousTimeError:
+        choices = [tz.localize(wall_time, is_dst=value) for value in (False, True)]
+        return (max if end else min)(choices)
+    except pytz.NonExistentTimeError:
+        # If the clock skips the boundary, move forward by the offset change.
+        return max(tz.normalize(tz.localize(wall_time, is_dst=value))
+                   for value in (False, True))
+
+
 def get_free_slots(telegram_id: int, target_date: datetime) -> list[str]:
     user = db.get_user(telegram_id)
     tz   = _tz(user)
     calendar_id = _get_calendar_id(user)
     service = get_calendar_service(telegram_id)
 
-    work_start = tz.localize(datetime.combine(target_date.date(), time(_work_start(user), 0)))
-    work_end   = tz.localize(datetime.combine(target_date.date(), time(_work_end(user), 0)))
+    day = target_date.astimezone(tz).date() if target_date.tzinfo else target_date.date()
+    work_start = _local_work_boundary(tz, day, _work_start(user))
+    work_end = _local_work_boundary(tz, day, _work_end(user), end=True)
+    if work_end <= work_start:
+        return []
 
     body = {
         "timeMin": work_start.isoformat(),
@@ -193,13 +214,14 @@ def get_free_slots(telegram_id: int, target_date: datetime) -> list[str]:
     busy_raw = result["calendars"][calendar_id]["busy"]
 
     busy = []
-    for p in sorted(busy_raw, key=lambda x: x["start"]):
+    for p in busy_raw:
         s = datetime.fromisoformat(p["start"].replace("Z", "+00:00")).astimezone(tz)
         e = datetime.fromisoformat(p["end"].replace("Z", "+00:00")).astimezone(tz)
-        busy.append((s, e))
+        if max(s, work_start) < min(e, work_end):
+            busy.append((max(s, work_start), min(e, work_end)))
 
     free, cur = [], work_start
-    for b_start, b_end in busy:
+    for b_start, b_end in sorted(busy):
         if cur < b_start:
             mins = int((b_start - cur).total_seconds() / 60)
             if mins >= 30:
@@ -238,8 +260,9 @@ def get_events_next_7_days(telegram_id: int) -> list[dict]:
 def _telemost_line(link) -> str:
     """Строка описания события со ссылкой Телемоста.
 
-    Явная HTML-ссылка <a href> (Google Calendar рендерит её в описании), чтобы
-    мобильный клиент не распознавал длинный номер конференции как телефон.
+    Calendar API допускает HTML в описании. Явная ссылка снижает риск,
+    что клиент распознает номер конференции как телефон. Видимый URL также
+    можно скопировать в клиентах без поддержки HTML.
     Только для URL из allowlist Телемоста (https, хост Телемоста, путь /j/цифры);
     иначе — прежний текстовый формат."""
     import html
@@ -324,7 +347,7 @@ def add_telemost_to_event(telegram_id: int, event: dict, link: str) -> bool:
         ).execute()
         return True
     except Exception as e:
-        logger.error("Ошибка обновления события %s: %s", event_id, type(e).__name__)
+        logger.error("Ошибка обновления события: %s", type(e).__name__)
         return False
 
 
@@ -340,7 +363,7 @@ def transcribe(audio_bytes: bytes) -> str:
     )
     if resp.status_code == 200:
         return resp.json().get("result", "")
-    logger.error("SpeechKit %s: %s", resp.status_code, resp.text)
+    logger.error("SpeechKit HTTP %s", resp.status_code)
     return ""
 
 
@@ -366,13 +389,13 @@ def create_telemost_conference(telegram_id: Optional[int] = None) -> Optional[st
             timeout=15,
         )
     except Exception as e:
-        logger.error("Телемост: %s", e)
+        logger.error("Телемост: %s", type(e).__name__)
         return None
 
     if resp.status_code in (200, 201):
         data = resp.json()
         return data.get("join_url") or data.get("conferenceUri") or data.get("uri")
-    logger.error("Телемост API %s: %s", resp.status_code, resp.text)
+    logger.error("Телемост API HTTP %s", resp.status_code)
     return None
 
 
@@ -418,8 +441,7 @@ def process_telemost_links(telegram_id: int) -> dict:
     try:
         events = get_events_next_7_days(telegram_id)
     except Exception as e:
-        logger.error("process_telemost_links: не удалось получить события user=%s: %s",
-                     telegram_id, type(e).__name__)
+        logger.error("process_telemost_links: не удалось получить события: %s", type(e).__name__)
         result["errors"].append("Не удалось получить события из Google Calendar")
         return result
 
@@ -461,8 +483,7 @@ def process_telemost_links(telegram_id: int) -> dict:
                 service = get_calendar_service(telegram_id)
             fresh = _fetch_fresh_event(service, calendar_id, event_id)
         except Exception as e:
-            logger.error("process_telemost_links: не удалось перечитать событие %s user=%s: %s",
-                         event_id, telegram_id, type(e).__name__)
+            logger.error("process_telemost_links: не удалось перечитать событие: %s", type(e).__name__)
             result["errors"].append(f"Не удалось перечитать «{title}» из Google Calendar")
             continue
 
@@ -598,11 +619,11 @@ async def process_query(telegram_id: int, text: str, update: Update):
         return
 
     try:
-        slots = await asyncio.get_event_loop().run_in_executor(
+        slots = await asyncio.get_running_loop().run_in_executor(
             None, lambda: get_free_slots(telegram_id, target)
         )
     except Exception as e:
-        logger.error("Calendar error: %s", e)
+        logger.error("Calendar error: %s", type(e).__name__)
         await update.message.reply_text("Ошибка при обращении к календарю 😔")
         return
 
@@ -645,13 +666,13 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
     duration = parse_duration_minutes(text)
 
     await msg.edit_text("📅 Создаю встречу и ссылку Телемост...")
-    telemost_link = await asyncio.get_event_loop().run_in_executor(
+    telemost_link = await asyncio.get_running_loop().run_in_executor(
         None, lambda: create_telemost_conference(telegram_id)
     )
 
     inline_emails = extract_emails(text)
     try:
-        created  = await asyncio.get_event_loop().run_in_executor(
+        created  = await asyncio.get_running_loop().run_in_executor(
             None, lambda: create_calendar_event(telegram_id, title, dt, duration, telemost_link)
         )
         event_id = created["id"]
@@ -665,26 +686,26 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
         invite_note   = ""
         if inline_emails:
             try:
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None, lambda: add_attendees_to_event(telegram_id, event_id, inline_emails)
                 )
                 invite_note = f"\n📧 Приглашены: {', '.join(inline_emails)}"
             except Exception as e:
-                logger.error("Ошибка приглашения: %s", e)
+                logger.error("Ошибка приглашения: %s", type(e).__name__)
 
         context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
         await msg.edit_text(
-            f"✅ *Встреча создана!*\n\n"
-            f"📌 {title}\n"
+            f"✅ <b>Встреча создана!</b>\n\n"
+            f"📌 {html_lib.escape(title)}\n"
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
-            f"{telemost_line}{invite_note}\n\n"
+            f"{html_lib.escape(telemost_line)}{html_lib.escape(invite_note)}\n\n"
             f"📧 Кого пригласить? Напиши имя из контактов или email(ы) через запятую\n"
-            f"_(или напиши «готово» чтобы пропустить)_",
-            parse_mode="Markdown",
+            f"<i>(или напиши «готово» чтобы пропустить)</i>",
+            parse_mode="HTML",
         )
     except Exception as e:
-        logger.error("Ошибка создания события: %s", e)
+        logger.error("Ошибка создания события: %s", type(e).__name__)
         await msg.edit_text("😔 Не удалось создать встречу. Попробуй позже.")
 
 
@@ -805,18 +826,19 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Команда недоступна")
         return
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, db.analytics_report_data)
+        data = await asyncio.to_thread(db.analytics_report_data)
+        report = _format_analytics(data)
     except Exception as e:
         logger.error("analytics report failed: %s", type(e).__name__)
         await update.message.reply_text("⚠️ Не удалось построить отчёт. Попробуйте позже.")
         return
-    await update.message.reply_text(_format_analytics(data), parse_mode="HTML")
+    await update.message.reply_text(report, parse_mode="HTML")
 
 
 async def scheduled_analytics_cleanup():
     """Раз в сутки: удаляем сырые события аналитики старше 13 месяцев."""
     try:
-        n = await asyncio.get_event_loop().run_in_executor(None, db.analytics_cleanup)
+        n = await asyncio.get_running_loop().run_in_executor(None, db.analytics_cleanup)
         logger.info("analytics cleanup: удалено событий %d", n)
     except Exception as e:
         logger.warning("analytics cleanup failed: %s", type(e).__name__)
@@ -885,16 +907,15 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала /start")
         return
     await update.message.reply_text(
-        f"⚙️ *Настройки*\n\n"
+        f"⚙️ Настройки\n\n"
         f"🕐 Рабочее время: {_work_start(user)}:00 — {_work_end(user)}:00\n"
         f"🌍 Часовой пояс: {user['timezone'] or DEFAULT_TZ}\n"
         f"📅 Календарь: {user['calendar_id'] or 'primary'}\n"
         f"👤 ФИО для листа «Мои задачи — ФИО»: {_user_full_name(user) or 'не указано'}\n\n"
         f"Команды:\n"
-        f"`/settz Europe/Saratov` — изменить часовой пояс\n"
-        f"`/sethours 9 18` — изменить рабочие часы\n"
-        f"`/setname Имя Фамилия` — ФИО для листа «Мои задачи — Имя Фамилия»",
-        parse_mode="Markdown",
+        f"/settz Europe/Saratov — изменить часовой пояс\n"
+        f"/sethours 9 18 — изменить рабочие часы\n"
+        f"/setname Имя Фамилия — ФИО для листа «Мои задачи — Имя Фамилия»",
     )
 
 
@@ -976,10 +997,10 @@ async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pytz.timezone(tz_name)
     except pytz.exceptions.UnknownTimeZoneError:
-        await update.message.reply_text(f"Неизвестный часовой пояс: `{tz_name}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Неизвестный часовой пояс: {tz_name}")
         return
     db.update_user_settings(telegram_id, timezone=tz_name)
-    await update.message.reply_text(f"✅ Часовой пояс установлен: `{tz_name}`", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Часовой пояс установлен: {tz_name}")
 
 
 async def cmd_sethours(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -997,31 +1018,49 @@ async def cmd_sethours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Рабочее время: {ws}:00 — {we}:00")
 
 
+_active_voice_users: set[int] = set()
+_MAX_ACTIVE_VOICES = 4
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_google(update):
         return
     telegram_id = update.effective_user.id
-    msg = await update.message.reply_text("🎙 Слушаю...")
-    tg_file = await context.bot.get_file(update.message.voice.file_id)
-    audio   = await tg_file.download_as_bytearray()
-    text    = transcribe(bytes(audio))
-    if not text:
-        await msg.edit_text("Не удалось распознать голос. Попробуй ещё раз.")
+    if not context.application.running:
         return
-    await msg.edit_text(f"Ты сказал: «{text}»\n\n⏳ Обрабатываю...")
+    if telegram_id in _active_voice_users or len(_active_voice_users) >= _MAX_ACTIVE_VOICES:
+        await update.message.reply_text("🎙 Уже обрабатываю голосовые сообщения. Попробуй чуть позже.")
+        return
+    _active_voice_users.add(telegram_id)
+    # PTB processes updates sequentially. Track a separate task so the next
+    # update can run while SpeechKit is busy, and Application.stop drains it.
+    context.application.create_task(_process_voice(telegram_id, update, context), update=update)
 
-    if TELEMOST_TRIGGER.search(text):
-        res = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: process_telemost_links(telegram_id)
-        )
-        await update.message.reply_text(
-            f"🔗 *Телемост-обход завершён*\n\n{format_telemost_report(res)}",
-            parse_mode="Markdown",
-        )
-    elif CREATE_TRIGGER.search(text):
-        await handle_create_event(telegram_id, text, update, context)
-    else:
-        await process_query(telegram_id, text, update)
+
+async def _process_voice(telegram_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = await update.message.reply_text("🎙 Слушаю...")
+        try:
+            tg_file = await context.bot.get_file(update.message.voice.file_id)
+            audio = await tg_file.download_as_bytearray()
+            text = await asyncio.to_thread(transcribe, bytes(audio))
+        except Exception as error:
+            logger.warning("Voice recognition failed: %s", type(error).__name__)
+            text = ""
+        if not text:
+            await msg.edit_text("Не удалось распознать голос. Попробуй ещё раз.")
+            return
+        await msg.edit_text(f"Ты сказал: «{text}»\n\n⏳ Обрабатываю...")
+
+        if TELEMOST_TRIGGER.search(text):
+            res = await asyncio.to_thread(process_telemost_links, telegram_id)
+            await update.message.reply_text("🔗 Телемост-обход завершён\n\n" + format_telemost_report(res))
+        elif CREATE_TRIGGER.search(text):
+            await handle_create_event(telegram_id, text, update, context)
+        else:
+            await process_query(telegram_id, text, update)
+    finally:
+        _active_voice_users.discard(telegram_id)
 
 
 # Глагольные префиксы которые пользователь добавляет перед именем («Пригласи Анастасию»)
@@ -1077,20 +1116,19 @@ async def _handle_pending_invite(telegram_id: int, text: str, update: Update, co
             await update.message.reply_text(
                 f"🤷 Не нашёл в контактах: «{text_clean}»\n"
                 f"Встреча создана без приглашений.\n"
-                f"Добавь контакт через /add\_contact Имя email@example.com",
-                parse_mode="Markdown",
+                f"Добавь контакт через /add_contact Имя email@example.com",
             )
             return True
 
     if emails:
         context.user_data.pop("pending_invite", None)
         try:
-            await asyncio.get_event_loop().run_in_executor(
+            await asyncio.get_running_loop().run_in_executor(
                 None, lambda: add_attendees_to_event(telegram_id, pending["event_id"], emails)
             )
             await update.message.reply_text(f"📧 Приглашения отправлены:\n{', '.join(emails)}")
         except Exception as e:
-            logger.error("Ошибка добавления участников: %s", e)
+            logger.error("Ошибка добавления участников: %s", type(e).__name__)
             await update.message.reply_text("😔 Не удалось отправить приглашения.")
         return True
     return False
@@ -1101,7 +1139,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     # MYmeet визард перехватывает сообщения до проверки Google
-    if await _handle_mymeet_setup(telegram_id, text, update, context):
+    if update.effective_chat.type == "private":
+        if await _handle_mymeet_setup(telegram_id, text, update, context):
+            return
+    elif text.lstrip().startswith("mm_"):
+        await _delete_mymeet_token_message(update.message)
+        await update.message.reply_text("Настраивай MYmeet в личном чате с ботом.")
         return
 
     if not await _require_google(update):
@@ -1113,15 +1156,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if TELEMOST_TRIGGER.search(text):
         msg = await update.message.reply_text("⏳ Проверяю встречи и добавляю ссылки...")
         try:
-            res = await asyncio.get_event_loop().run_in_executor(
+            res = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: process_telemost_links(telegram_id)
             )
             await msg.edit_text(
-                f"🔗 *Телемост-обход завершён*\n\n{format_telemost_report(res)}",
-                parse_mode="Markdown",
+                f"🔗 Телемост-обход завершён\n\n{format_telemost_report(res)}",
             )
         except Exception as e:
-            logger.error("handle_text telemost error: %s", e)
+            logger.error("handle_text telemost error: %s", type(e).__name__)
             await msg.edit_text("😔 Ошибка при обходе встреч. Попробуй позже.")
     elif CREATE_TRIGGER.search(text):
         await handle_create_event(telegram_id, text, update, context)
@@ -1132,10 +1174,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── APScheduler: per-user Телемост ──────────────────────────
 
 
-async def send_daily_schedule(bot):
+async def send_daily_schedule(bot, *, stop_event=None):
     """Каждый день в 8:00 MSK: отправляем расписание встреч на сегодня."""
-    users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
+    users = await asyncio.get_running_loop().run_in_executor(None, db.get_all_active_users)
     for user in users:
+        if stop_event is not None and stop_event.is_set():
+            return
         telegram_id = user["telegram_id"]
         try:
             tz = _tz(user)
@@ -1148,7 +1192,7 @@ async def send_daily_schedule(bot):
                 continue
 
             calendar_id = _get_calendar_id(user)
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: service.events().list(
                     calendarId=calendar_id,
@@ -1162,9 +1206,9 @@ async def send_daily_schedule(bot):
             events = result.get("items", [])
 
             if not events:
-                text = "📅 *Расписание на сегодня*\n\nВстреч нет — свободный день! 🎉"
+                text = "📅 Расписание на сегодня\n\nВстреч нет — свободный день! 🎉"
             else:
-                lines = ["📅 *Расписание на сегодня:*\n"]
+                lines = ["📅 Расписание на сегодня:\n"]
                 for ev in events:
                     start_raw = ev.get("start", {})
                     end_raw   = ev.get("end",   {})
@@ -1178,61 +1222,112 @@ async def send_daily_schedule(bot):
                     lines.append(f"• {time_str}  {title}")
                 text = "\n".join(lines)
 
-            await bot.send_message(chat_id=telegram_id, text=text, parse_mode="Markdown", disable_notification=True)
+            await bot.send_message(chat_id=telegram_id, text=text, disable_notification=True)
         except Exception as e:
-            logger.error("Ошибка daily_schedule для user %s: %s", telegram_id, e)
+            logger.error("Daily schedule failed: %s", type(e).__name__)
 
 
-async def scheduled_telemost_all_users(bot: Bot):
+async def scheduled_telemost_all_users(bot: Bot, *, stop_event=None):
     """Каждые 3 часа: добавляем ссылки для всех активных пользователей."""
-    users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
+    users = await asyncio.get_running_loop().run_in_executor(None, db.get_all_active_users)
     for user in users:
+        if stop_event is not None and stop_event.is_set():
+            return
         telegram_id = user["telegram_id"]
         try:
-            res = await asyncio.get_event_loop().run_in_executor(
+            res = await asyncio.get_running_loop().run_in_executor(
                 None, lambda uid=telegram_id: process_telemost_links(uid)
             )
             if res["added"]:
                 await bot.send_message(
                     chat_id=telegram_id,
-                    text=f"🔗 *Авто-обход Телемост*\n\n{format_telemost_report(res)}",
-                    parse_mode="Markdown",
+                    text=f"🔗 Авто-обход Телемост\n\n{format_telemost_report(res)}",
                     disable_notification=True,
                 )
         except Exception as e:
-            logger.error("Ошибка scheduled для user %s: %s", telegram_id, e)
+            logger.error("Scheduled Telemost failed: %s", type(e).__name__)
 
 
 # ─── MYmeet setup wizard ─────────────────────────────────────
 
-_SETUP_STEP_TOKEN  = "mymeet_token"
-_SETUP_STEP_WS     = "mymeet_ws"
-_SETUP_STEP_SHEET  = "mymeet_sheet"
+_SETUP_STEP_TOKEN = "mymeet_token"
+_SETUP_STEP_SHEET = "mymeet_sheet"
+_MYMEET_SETUP_TTL = 30 * 60
+_MYMEET_RESTART_TEXT = "Сессия настройки MYmeet завершилась. Начни заново: /setup_mymeet."
+_MYMEET_SHEET_ID = re.compile(r"[A-Za-z0-9_-]{20,200}")
+_MYMEET_SHEET_URL = re.compile(
+    r"https://docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]{20,200})(?:[/?#][^\s]*)?"
+)
 
 
 async def cmd_setup_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает визард настройки MYmeet (/setup_mymeet или /reset_mymeet)."""
+    """Start a replacement draft for /setup_mymeet and /reset_mymeet."""
+    telegram_id = update.effective_user.id
     try:
-        telegram_id = update.effective_user.id
         db.upsert_user(telegram_id, update.effective_user.username)
-        _track(telegram_id, "mymeet_used", source="setup_mymeet")
-        db.reset_mymeet_config(telegram_id)
         db.set_mymeet_setup_in_progress(telegram_id, True)
-        context.user_data["mymeet_setup"] = {"step": _SETUP_STEP_TOKEN}
-        await update.message.reply_text(
-            "🔧 <b>Настройка MYmeet</b>\n\n"
-            "Шаг 1 из 2: введи свой <b>MYmeet API-токен</b>.\n\n"
-            "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
-            "Токен начинается с <code>mm_</code>\n\n"
-            "⚠️ Сообщение с токеном будет удалено из чата сразу после проверки.",
-            parse_mode="HTML",
-        )
-    except Exception as fatal:
-        logger.error("cmd_setup_mymeet fatal: %s", fatal, exc_info=True)
-        try:
-            await update.message.reply_text(f"❌ Ошибка запуска настройки:\n{fatal}")
-        except Exception:
-            pass
+        context.user_data["mymeet_setup"] = {
+            "step": _SETUP_STEP_TOKEN,
+            "expires": time_module.monotonic() + _MYMEET_SETUP_TTL,
+        }
+        _track(telegram_id, "mymeet_used", source="setup_mymeet")
+    except Exception as exc:
+        logger.error("MYmeet setup start error: %s", type(exc).__name__)
+        await update.message.reply_text("Не удалось начать настройку. Попробуй /setup_mymeet позже.")
+        return
+    await update.message.reply_text(
+        "🔧 Настройка MYmeet\n\n"
+        "Действующая настройка продолжит работать, пока новая не сохранена.\n"
+        "Шаг 1 из 2: отправь API-токен, начинающийся с mm_.\n"
+        "Где взять: mymeet.ai → Профиль → API-ключ.\n"
+        "Бот попробует удалить сообщение с токеном. Отмена: /cancel."
+    )
+
+
+async def cmd_cancel_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the replacement draft only."""
+    telegram_id = update.effective_user.id
+    setup = context.user_data.pop("mymeet_setup", None)
+    try:
+        user = db.get_user(telegram_id)
+        if setup or (user and user["mymeet_setup_in_progress"]):
+            db.set_mymeet_setup_in_progress(telegram_id, False)
+            text = "Настройка MYmeet отменена. Действующая настройка сохранена."
+        else:
+            text = "Активной настройки MYmeet нет."
+    except Exception as exc:
+        logger.error("MYmeet setup cancel error: %s", type(exc).__name__)
+        text = "Не удалось подтвердить отмену. Повтори /cancel позже."
+    await update.message.reply_text(text)
+
+
+def _mymeet_sheet_id(text: str) -> str | None:
+    if _MYMEET_SHEET_ID.fullmatch(text):
+        return text
+    match = _MYMEET_SHEET_URL.fullmatch(text)
+    return match.group(1) if match else None
+
+
+def _check_mymeet_sheet_access(sheet_id: str) -> None:
+    """Verify the spreadsheet and edit capability without writing a cell."""
+    mymeet_sync.require_spreadsheet_editor(sheet_id)
+    client = mymeet_sync._gs_client()
+    client.http_client.set_timeout(15)
+    with client.http_client.session:
+        client.http_client.fetch_sheet_metadata(sheet_id, params={"fields": "spreadsheetId"})
+
+
+def _is_current_mymeet_draft(context, setup: dict) -> bool:
+    return (context.user_data.get("mymeet_setup") is setup
+            and time_module.monotonic() < setup.get("expires", 0))
+
+
+async def _delete_mymeet_token_message(message) -> None:
+    try:
+        await message.delete()
+    except Exception as exc:
+        logger.warning("MYmeet setup token message deletion error: %s", type(exc).__name__)
+        await message.reply_text("Не удалось удалить сообщение с токеном. Удали его вручную.")
 
 
 async def _handle_mymeet_setup(
@@ -1241,229 +1336,100 @@ async def _handle_mymeet_setup(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    """Перехватывает сообщения во время визарда настройки MYmeet.
-    Возвращает True если сообщение было обработано."""
-    setup = context.user_data.get("mymeet_setup")
-    if not setup:
-        # Проверяем: был ли пользователь в середине wizard'а до перезапуска бота?
-        # DB-флаг переживает перезапуск, context.user_data — нет.
-        user_row = db.get_user(telegram_id)
-        in_progress = user_row and user_row["mymeet_setup_in_progress"]
-        if in_progress:
-            # Пробуем восстановить состояние из DB (pending_token + ws_id).
-            # Если данные сохранены — wizard продолжается бесшовно на шаге 2.
-            pending = db.get_mymeet_pending(telegram_id)
-            if pending:
-                decrypted_token, ws_id = pending
-                setup = {
-                    "step": _SETUP_STEP_SHEET,
-                    "token": decrypted_token,
-                    "ws_id": ws_id,
-                }
-                context.user_data["mymeet_setup"] = setup
-                # Fall through to step processing below
-            else:
-                # Pending-данных нет — сессия действительно устарела
-                db.set_mymeet_setup_in_progress(telegram_id, False)
-                await update.message.reply_text(
-                    "⚠️ Сессия настройки MYmeet устарела — бот перезапускался.\n\n"
-                    "Запусти /setup_mymeet снова.",
-                )
-                return True
-        else:
-            # Safety net: ловим ссылку на Google Таблицу когда wizard не активен.
-            # Покрывает пользователей, запустивших /setup_mymeet со старым кодом
-            # (до PR #6), когда in_progress-флаг ещё не выставлялся.
-            if re.search(r"docs\.google\.com/spreadsheets", text, re.IGNORECASE):
-                await update.message.reply_text(
-                    "📊 Похоже, это ссылка на Google Таблицу.\n\n"
-                    "Если ты настраивал MYmeet — сессия не найдена (бот перезапускался). "
-                    "Запусти /setup_mymeet снова."
-                )
-                return True
-            return False
-
-    step = setup.get("step")
+    """Handle wizard input in the private chat."""
     text = text.strip()
+    setup = context.user_data.get("mymeet_setup")
+    if not setup or not _is_current_mymeet_draft(context, setup):
+        if setup:
+            context.user_data.pop("mymeet_setup", None)
+            db.set_mymeet_setup_in_progress(telegram_id, False)
+        if text.startswith("mm_"):
+            await _delete_mymeet_token_message(update.message)
+        elif not (setup or _MYMEET_SHEET_URL.fullmatch(text)):
+            if not _MYMEET_SHEET_ID.fullmatch(text):
+                return False
+            user = db.get_user(telegram_id)
+            if not user or not user["mymeet_setup_in_progress"]:
+                return False
+        await update.message.reply_text(_MYMEET_RESTART_TEXT)
+        return True
 
-    # Шаг 1: получаем токен и проверяем его через API
-    if step == _SETUP_STEP_TOKEN:
-        # Токен должен быть ASCII-только (не кириллица) и начинаться с mm_
-        is_ascii = all(ord(c) < 128 for c in text)
-        if not text.startswith("mm_") or not is_ascii:
-            await update.message.reply_text(
-                "❌ Похоже, это не MYmeet API-токен.\n\n"
-                "Токен должен начинаться с <code>mm_</code> и содержать только латинские символы.\n\n"
-                "Где взять: mymeet.ai → Профиль → API-ключ\n\n"
-                "Попробуй ещё раз или введи /cancel чтобы отменить.",
-                parse_mode="HTML",
-            )
+    if setup["step"] == _SETUP_STEP_TOKEN:
+        if not re.fullmatch(r"mm_[A-Za-z0-9_+=./-]+", text):
+            if text.startswith("mm_"):
+                await _delete_mymeet_token_message(update.message)
+            await update.message.reply_text("Проверь API-токен MYmeet и попробуй снова. Отмена: /cancel.")
             return True
-
-        # Пытаемся удалить сообщение с токеном из чата (безопасность)
-        try:
-            await update.message.delete()
-        except Exception as del_exc:
-            logger.warning("Не удалось удалить сообщение с токеном: %s", del_exc)
-            # Предупреждаем пользователя, но не блокируем процесс
-            await update.message.reply_text(
-                "⚠️ Не удалось автоматически удалить сообщение с токеном.\n"
-                "Пожалуйста, удали его вручную для безопасности.",
-                parse_mode="HTML",
-            )
-
+        await _delete_mymeet_token_message(update.message)
         msg = await update.message.reply_text("⏳ Проверяю токен...")
         try:
-            ws = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: verify_token_and_get_workspace(text)
-            )
-        except MymeetTokenError as mte:
-            if mte.status_code == 401:
-                err_text = (
-                    "❌ <b>Неверный API-токен.</b>\n\n"
-                    "Проверь токен в mymeet.ai → Профиль → API-ключ и попробуй ещё раз."
-                )
-            elif mte.status_code == 403:
-                err_text = (
-                    "❌ <b>Доступ к API запрещён (403).</b>\n\n"
-                    "Возможно, у тебя бесплатный тарифный план MYmeet, "
-                    "который не включает API-доступ. Обратись в поддержку mymeet.ai."
-                )
-            else:
-                err_text = f"❌ Ошибка API: {mte}"
-            await msg.edit_text(err_text, parse_mode="HTML")
-            context.user_data.pop("mymeet_setup", None)
-            db.set_mymeet_setup_in_progress(telegram_id, False)
+            ws = await asyncio.to_thread(verify_token_and_get_workspace, text)
+            candidate = _crypto.encrypt_token(text), ws["id"]
+        except MymeetTokenError as exc:
+            error = {
+                401: "Неверный API-токен. Проверь ключ и попробуй снова.",
+                403: "MYmeet запретил доступ к API. Проверь ключ и доступ к API в тарифе.",
+            }.get(exc.status_code, "MYmeet не подтвердил токен. Попробуй ещё раз позже.")
+            await msg.edit_text(error)
             return True
-        except Exception as net_exc:
-            logger.warning("MYmeet API недоступен при проверке токена: %s", net_exc)
-            await msg.edit_text(
-                "❌ <b>MYmeet API недоступен.</b>\n\n"
-                "Возможно, временные проблемы на стороне сервера. "
-                "Попробуй ещё раз через несколько минут.",
-                parse_mode="HTML",
-            )
+        except Exception as exc:
+            logger.warning("MYmeet setup token verification error: %s", type(exc).__name__)
+            await msg.edit_text("Не удалось подготовить токен. Попробуй ещё раз позже.")
             return True
-
-        # Токен верный — рабочее пространство определяется API-ключом автоматически
-        ws_id = ws.get("id", "active")
-        ws_name = ws.get("name", "Ваше пространство")
-        logger.error(
-            "DIAG _handle_mymeet_setup: before save_mymeet_pending telegram_id=%s type=%s bool_ws_id=%s",
-            telegram_id, type(telegram_id).__name__, bool(ws_id),
-        )
-        # Сохраняем pending-данные в БД, чтобы wizard пережил перезапуск бота
-        # между шагом 1 (токен) и шагом 2 (ID таблицы).
-        try:
-            db.save_mymeet_pending(telegram_id, text, ws_id)
-        except Exception as _pend_exc:
-            # Логируем только тип исключения — не строку, которая может содержать данные
-            logger.error(
-                "save_mymeet_pending: ошибка записи для telegram_id=%s (тип: %s)",
-                telegram_id, type(_pend_exc).__name__,
-            )
-            # Нельзя продолжать: данные не сохранены, wizard не переживёт рестарт
-            context.user_data.pop("mymeet_setup", None)
-            await msg.edit_text(
-                "❌ <b>Не удалось сохранить данные настройки.</b>\n\n"
-                "Попробуй ещё раз: /setup_mymeet\n"
-                "Если ошибка повторяется — обратись к разработчику.",
-                parse_mode="HTML",
-            )
+        if not _is_current_mymeet_draft(context, setup) or setup["step"] != _SETUP_STEP_TOKEN:
+            await msg.edit_text("Эта проверка токена больше не относится к текущему шагу.")
             return True
-        # Pending-состояние успешно сохранено — продолжаем wizard
-        setup.update({"step": _SETUP_STEP_SHEET, "token": text, "ws_id": ws_id})
-        context.user_data["mymeet_setup"] = setup
+        setup.update(step=_SETUP_STEP_SHEET, candidate=candidate)
         await msg.edit_text(
-            f"✅ <b>Токен принят!</b> Рабочее пространство: <b>{ws_name}</b>\n\n"
-            f"Шаг 2 из 2: введи <b>ID Google Таблицы</b>.\n\n"
-            f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
-            f"<code>docs.google.com/spreadsheets/d/</code><b>ВОТ_ЭТО</b><code>/edit</code>\n\n"
-            f"Не забудь открыть доступ к таблице сервисному аккаунту!",
-            parse_mode="HTML",
+            "✅ Токен принят. Шаг 2 из 2: отправь ссылку или ID Google Таблицы.\n"
+            "Дай сервисному аккаунту бота доступ на редактирование. Отмена: /cancel."
         )
         return True
 
-    # Шаг 3: ID таблицы
-    if step == _SETUP_STEP_SHEET:
-        sheet_id = text.strip().strip("/")
-        # Извлекаем ID из полного URL если вставили URL
-        import re as _re
-        url_match = _re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", sheet_id)
-        if url_match:
-            sheet_id = url_match.group(1)
-        if len(sheet_id) < 20:
-            await update.message.reply_text(
-                "❌ Похоже, это не ID таблицы. Скопируй именно ID из URL (длинная строка).\nПопробуй ещё раз."
-            )
-            return True
-
-        token = setup.get("token")
-        ws_id = setup.get("ws_id")
-        # Защита от рестарта бота: если токен/ws_id потеряны — сессия устарела
-        if not token or not ws_id:
-            context.user_data.pop("mymeet_setup", None)
-            db.set_mymeet_setup_in_progress(telegram_id, False)
-            await update.message.reply_text(
-                "⚠️ Сессия настройки устарела (бот перезапускался). "
-                "Запусти /setup_mymeet снова."
-            )
-            return True
-        try:
-            db.save_mymeet_config(
-                telegram_id,
-                token=token,
-                ws_id=ws_id,
-                spreadsheet_id=sheet_id,
-                organizer_email=None,  # определяется через organizer.self в Google Calendar
-            )
-        except Exception as _save_exc:
-            # exc_info=True безопасен: Python-трейсбэки не раскрывают значения локальных
-            # переменных. Текст исключений из crypto/sqlite также не содержит токена:
-            # CryptoError — "Нечего шифровать", sqlite3 ошибки — "disk full" и т.п.
-            logger.error(
-                "save_mymeet_config failed for telegram_id=%s: %s",
-                telegram_id, _save_exc, exc_info=True,
-            )
-            await update.message.reply_text(
-                "❌ Не удалось сохранить настройки MYmeet.\n\n"
-                "Попробуй ещё раз: /setup_mymeet\n"
-                "Если ошибка повторяется — обратись к разработчику."
-            )
-            return True
-        context.user_data.pop("mymeet_setup", None)
+    if text.startswith("mm_"):
+        await _delete_mymeet_token_message(update.message)
+        await update.message.reply_text("Сейчас нужен ID Google Таблицы. Для замены токена начни /setup_mymeet.")
+        return True
+    sheet_id = _mymeet_sheet_id(text)
+    if not sheet_id:
+        await update.message.reply_text("Отправь ID таблицы или ссылку вида https://docs.google.com/spreadsheets/d/ID/edit.")
+        return True
+    encrypted_token, ws_id = setup["candidate"]
+    try:
+        await asyncio.to_thread(_check_mymeet_sheet_access, sheet_id)
+    except Exception as exc:
+        logger.warning("MYmeet setup Sheets access check error: %s", type(exc).__name__)
         await update.message.reply_text(
-            "🎉 *MYmeet настроен!*\n\n"
-            "Запусти первоначальную загрузку (например, за 30 дней):\n"
-            "`/sync_mymeet_full 30`\n\n"
-            "Ежедневный синк (только сегодня):\n"
-            "`/sync_mymeet`\n\n"
-            "_Авто-синк запускается ежедневно в 19:00 МСК._",
-            parse_mode="Markdown",
+            "Не удалось подтвердить доступ на редактирование. Проверь ссылку и права "
+            "сервисного аккаунта или попробуй позже. Отмена: /cancel."
         )
         return True
-
-    return False
+    try:
+        async with _user_lock(telegram_id):
+            current = _is_current_mymeet_draft(context, setup)
+            if current:
+                db.save_mymeet_config(telegram_id, _crypto.decrypt_token(encrypted_token), ws_id, sheet_id)
+                context.user_data.pop("mymeet_setup", None)
+    except Exception as exc:
+        logger.error("MYmeet setup commit error: %s", type(exc).__name__)
+        await update.message.reply_text("Не удалось сохранить настройку. Попробуй ещё раз или введи /cancel.")
+        return True
+    if not current:
+        await update.message.reply_text("Этот черновик больше не активен. Новые настройки не применены.")
+        return True
+    await update.message.reply_text(
+        "🎉 MYmeet настроен!\n\n"
+        "Первоначальная загрузка: /sync_mymeet_full 30. Ежедневный импорт: /sync_mymeet."
+    )
+    return True
 
 
 async def _handle_mymeet_ws_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Обрабатывает нажатие кнопки выбора рабочего пространства MYmeet."""
+    """Ignore old workspace buttons. The verified token identifies the workspace."""
     query = update.callback_query
     if not query or not query.data or not query.data.startswith("mymeet_ws:"):
         return False
-
-    ws_id = query.data.split(":", 1)[1]
-    setup = context.user_data.get("mymeet_setup", {})
-    setup.update({"step": _SETUP_STEP_SHEET, "ws_id": ws_id})
-    context.user_data["mymeet_setup"] = setup
-    await query.answer()
-    await query.edit_message_text(
-        f"✅ Пространство выбрано: `{ws_id}`\n\n"
-        f"Шаг 2 из 2: введи *ID Google Таблицы*.\n\n"
-        f"Как найти: открой таблицу в браузере, скопируй часть URL:\n"
-        f"`docs.google.com/spreadsheets/d/`*ВОТ_ЭТО*`/edit`",
-        parse_mode="Markdown",
-    )
+    await query.answer("Эта кнопка устарела. При необходимости запусти /setup_mymeet.")
     return True
 
 
@@ -1499,8 +1465,7 @@ def _get_gcal_organizer_data_checked(telegram_id: int, days: int) -> tuple:
         reason = auth.classify_google_error(exc).category
         creds = None
     if not creds:
-        logger.warning("_get_gcal_organizer_data: no credentials for user %s (%s)",
-                       telegram_id, reason)
+        logger.warning("MYmeet calendar authorization unavailable: %s", reason)
         return None, reason or "no_auth"
     try:
         service = build("calendar", "v3", credentials=creds)
@@ -1533,13 +1498,11 @@ def _get_gcal_organizer_data_checked(telegram_id: int, days: int) -> tuple:
                     organizer_times.add(int(dt.timestamp() / 60) * 60 * 1000)
                 except Exception:
                     pass
-        logger.info("_get_gcal_organizer_data: %d organizer events for user %s",
-                    len(organizer_ids), telegram_id)
+        logger.info("MYmeet calendar: %d organizer events", len(organizer_ids))
         return {"ids": organizer_ids, "times": organizer_times}, None
     except Exception as exc:
         err = auth.classify_google_error(exc)
-        logger.warning("_get_gcal_organizer_data failed for user %s: %s (%s)",
-                       telegram_id, type(exc).__name__, err.category)
+        logger.warning("MYmeet calendar request failed: %s (%s)", type(exc).__name__, err.category)
         return None, err.category  # GCal unavailable -- caller must abort sync
 
 
@@ -1561,14 +1524,12 @@ def _user_row_to_mymeet_config(user) -> dict | None:
         else:
             # Незашифрованный токен (устаревшие данные) — пропускаем
             logger.warning(
-                "_user_row_to_mymeet_config: незашифрованный токен для "
-                "telegram_id=%s — требуется /setup_mymeet", user["telegram_id"]
+                "MYmeet: незашифрованная конфигурация — требуется /setup_mymeet"
             )
             return None
     except CryptoDecryptError:
         logger.error(
-            "_user_row_to_mymeet_config: не удалось расшифровать токен для "
-            "telegram_id=%s — требуется /setup_mymeet", user["telegram_id"]
+            "MYmeet: конфигурация не расшифровывается — требуется /setup_mymeet"
         )
         return None
     cfg = dict(user)
@@ -1592,14 +1553,21 @@ def _user_lock(telegram_id: int) -> asyncio.Lock:
     return lock
 
 
+def _mymeet_config_matches(telegram_id: int, snapshot) -> bool:
+    current = db.get_user(telegram_id)
+    fields = ("mymeet_setup_done", "mymeet_token", "mymeet_ws_id", "mymeet_spreadsheet_id")
+    return bool(current and all(current[field] == snapshot[field] for field in fields))
+
+
+_MYMEET_CONFIG_CHANGED = "Настройки MYmeet изменились. Запусти синхронизацию снова."
+
+
 async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Синхронизация за сегодня (/sync_mymeet) — добавляет сегодняшние задачи."""
     try:
         telegram_id = update.effective_user.id
         db.upsert_user(telegram_id, update.effective_user.username)
         user = db.get_user(telegram_id)
-        logger.info("cmd_sync_mymeet: user=%s mymeet_setup_done=%s",
-                    telegram_id, user["mymeet_setup_done"] if user else None)
         user_config = _user_row_to_mymeet_config(user)
 
         if not user_config:
@@ -1611,7 +1579,7 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _track(telegram_id, "mymeet_used", source="sync_mymeet")
 
         # Fetch GCal organizer data -- abort sync if GCal unavailable
-        gcal_data_1d = await asyncio.get_event_loop().run_in_executor(
+        gcal_data_1d = await asyncio.get_running_loop().run_in_executor(
             None, lambda: _get_gcal_organizer_data(telegram_id, 1)
         )
         if gcal_data_1d is None:
@@ -1626,16 +1594,19 @@ async def cmd_sync_mymeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("⏳ Синхронизирую задачи за сегодня из MYmeet...")
         try:
             async with _user_lock(telegram_id):
+                if not _mymeet_config_matches(telegram_id, user):
+                    await msg.edit_text(_MYMEET_CONFIG_CHANGED)
+                    return
                 result = await sync_to_sheets_async(days=1, append=True, user_config=user_config)
             _track(telegram_id, "first_value", source="sync_mymeet")
             await msg.edit_text(result)
         except Exception as e:
-            logger.error("MYmeet sync error: %s", e, exc_info=True)
-            await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+            logger.error("MYmeet sync error: %s", type(e).__name__)
+            await msg.edit_text("❌ Не удалось синхронизировать MYmeet. Попробуй позже.")
     except Exception as fatal:
-        logger.error("cmd_sync_mymeet fatal: %s", fatal, exc_info=True)
+        logger.error("cmd_sync_mymeet failed: %s", type(fatal).__name__)
         try:
-            await update.message.reply_text(f"❌ Внутренняя ошибка:\n{fatal}")
+            await update.message.reply_text("❌ Не удалось выполнить команду. Попробуй позже.")
         except Exception:
             pass
 
@@ -1675,7 +1646,7 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
             f"⏳ Полная синхронизация MYmeet за {days} дней (перезапись таблицы)..."
         )
         # Fetch GCal organizer data -- abort sync if GCal unavailable
-        gcal_data = await asyncio.get_event_loop().run_in_executor(
+        gcal_data = await asyncio.get_running_loop().run_in_executor(
             None, lambda: _get_gcal_organizer_data(telegram_id, days)
         )
         if gcal_data is None:
@@ -1687,23 +1658,26 @@ async def cmd_sync_mymeet_full(update: Update, context: ContextTypes.DEFAULT_TYP
         user_config["gcal_organizer_data"] = gcal_data
         try:
             async with _user_lock(telegram_id):
+                if not _mymeet_config_matches(telegram_id, user):
+                    await msg.edit_text(_MYMEET_CONFIG_CHANGED)
+                    return
                 result = await sync_to_sheets_async(days=days, append=False,
                                                     user_config=user_config)
             await msg.edit_text(result)
         except Exception as e:
-            logger.error("MYmeet sync full error: %s", e, exc_info=True)
-            await msg.edit_text(f"❌ Ошибка синхронизации:\n{e}")
+            logger.error("MYmeet sync full error: %s", type(e).__name__)
+            await msg.edit_text("❌ Не удалось синхронизировать MYmeet. Попробуй позже.")
     except Exception as fatal:
-        logger.error("cmd_sync_mymeet_full fatal: %s", fatal, exc_info=True)
+        logger.error("cmd_sync_mymeet_full failed: %s", type(fatal).__name__)
         try:
-            await update.message.reply_text(f"❌ Внутренняя ошибка:\n{fatal}")
+            await update.message.reply_text("❌ Не удалось выполнить команду. Попробуй позже.")
         except Exception:
             pass
 
 
 # Автоимпорт: причина → текст для пользователя (без технических деталей)
 MYMEET_AUTO_REASON_TEXT = {
-    "mymeet_token": "MYmeet отклоняет токен. Подключите заново: /reset_mymeet, затем /setup_mymeet.",
+    "mymeet_token": "MYmeet отклоняет токен. Подключите заново: /setup_mymeet.",
     "token_undecryptable": "Сохранённый токен MYmeet не читается. Введите его заново: /setup_mymeet.",
     "mymeet_api": "MYmeet отвечает ошибкой. Повторю автоматически.",
     "mymeet_unavailable": "MYmeet временно недоступен. Повторю автоматически.",
@@ -1757,7 +1731,7 @@ async def _run_mymeet_auto(user, state: dict | None, now_ts: float) -> dict:
     if not user_config:
         res.update(outcome=mymeet_sync.AUTO_CONFIG, reason="token_undecryptable")
         return res
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     gcal, gerr = await loop.run_in_executor(
         None, lambda: _get_gcal_organizer_data_checked(telegram_id, days))
     if gcal is None:
@@ -1770,6 +1744,8 @@ async def _run_mymeet_auto(user, state: dict | None, now_ts: float) -> dict:
     user_config["max_new_rows"] = mymeet_sync.AUTO_MAX_NEW_ROWS
     try:
         async with _user_lock(telegram_id):
+            if not _mymeet_config_matches(telegram_id, user):
+                return dict(res, configuration_changed=True)
             await sync_to_sheets_async(days=days, append=True, user_config=user_config,
                                        stats=res["stats"])
     except Exception as e:
@@ -1780,17 +1756,19 @@ async def _run_mymeet_auto(user, state: dict | None, now_ts: float) -> dict:
     return res
 
 
-async def scheduled_mymeet_sync(bot: Bot):
+async def scheduled_mymeet_sync(bot: Bot, *, stop_event=None):
     """Каждые 15 минут: автоимпорт MYmeet → Google Sheets / «Мои задачи».
 
     Слот — 19:00 по поясу пользователя.  Пропущенный вечер догоняется на
     ближайшем тике, окно — от последнего успешного импорта плюс 3 дня на
     задержку протоколов (не больше 14).  Неудача — повтор с паузой
     15→30→60→120 мин (до 6 попыток за вечер), уведомление без спама."""
-    rows = await asyncio.get_event_loop().run_in_executor(None, db.get_mymeet_user_rows)
+    rows = await asyncio.get_running_loop().run_in_executor(None, db.get_mymeet_user_rows)
     now_utc = datetime.now(timezone.utc)
     now_ts = now_utc.timestamp()
     for user in rows:
+        if stop_event is not None and stop_event.is_set():
+            return
         telegram_id = user["telegram_id"]
         try:
             tz = _tz(user)
@@ -1806,18 +1784,20 @@ async def scheduled_mymeet_sync(bot: Bot):
             try:
                 res = await _run_mymeet_auto(user, state, now_ts)
             except Exception as e:
-                logger.error("MYmeet auto [%s] error: %s", telegram_id, type(e).__name__)
+                logger.error("MYmeet auto error: %s", type(e).__name__)
                 res = {"outcome": mymeet_sync.AUTO_TRANSIENT, "reason": "internal",
                        "days": None, "truncated": False, "stats": {}}
+            if res.get("configuration_changed"):
+                continue
             fields, notify = mymeet_sync.auto_record(
                 state, slot, res["outcome"], res["reason"], time_module.time(), now_ts)
             db.mymeet_sync_save(telegram_id, **fields)
             st = res["stats"]
             logger.info(
-                "MYmeet auto [%s] slot=%s window=%sd%s outcome=%s reason=%s attempt=%s "
+                "MYmeet auto window=%sd%s outcome=%s reason=%s attempt=%s "
                 "fetched=%s organizer=%s tasks=%s new_rows=%s proto_failed=%s "
                 "proto_missing=%s protocols_written=%s registry=%s my_tasks=%s",
-                telegram_id, slot, res["days"],
+                res["days"],
                 " (truncated)" if res["truncated"] else "", res["outcome"],
                 res["reason"] or "-", fields["slot_attempts"], st.get("fetched", "-"),
                 st.get("after_org", "-"), st.get("total_tasks", "-"),
@@ -1829,40 +1809,70 @@ async def scheduled_mymeet_sync(bot: Bot):
                                        text=_mymeet_auto_notice(res["reason"], state, tz),
                                        disable_notification=True)
         except Exception as e:
-            logger.error("MYmeet auto [%s] record/notify error: %s", telegram_id,
-                         type(e).__name__)
+            logger.error("MYmeet auto record/notify error: %s", type(e).__name__)
 
 
 # ─── «Мои задачи»: Google Tasks + пересланные сообщения ───────
 
 MY_TASKS_REFRESH_DELAY = 20          # сек: пачка пересланных → одна запись листа
 _my_tasks_refresh_tasks: dict[int, asyncio.Task] = {}
+_my_tasks_refresh_running: dict[int, asyncio.Task] = {}
+_my_tasks_refresh_stopping = False
 
 
 async def _run_my_tasks_sync(telegram_id: int, with_gtasks: bool) -> dict:
     async with _user_lock(telegram_id):
-        return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: my_tasks.run_sync(telegram_id, with_gtasks=with_gtasks)
-        )
+        worker = asyncio.create_task(asyncio.to_thread(
+            my_tasks.run_sync, telegram_id, with_gtasks=with_gtasks,
+        ))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Cancellation of the waiter does not stop an executor write.
+            # Hold the user's lock until the worker has actually finished.
+            await asyncio.gather(worker, return_exceptions=True)
+            raise
 
 
 def _schedule_my_tasks_refresh(telegram_id: int) -> None:
-    """Отложенная перезапись листа (debounce) после пересланных сообщений."""
+    """Объединяет ожидающие обновления без отмены уже начатой записи."""
+    if _my_tasks_refresh_stopping:
+        return
     prev = _my_tasks_refresh_tasks.get(telegram_id)
-    if prev and not prev.done():
+    if prev is not None:
         prev.cancel()
 
-    async def _later():
-        try:
-            await asyncio.sleep(MY_TASKS_REFRESH_DELAY)
-            res = await _run_my_tasks_sync(telegram_id, with_gtasks=False)
-            logger.info("My tasks refresh [%s]: outcome=%s", telegram_id, res["outcome"])
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error("My tasks refresh error [%s]: %s", telegram_id, type(e).__name__)
+    def forget_waiting(task: asyncio.Task) -> None:
+        if _my_tasks_refresh_tasks.get(telegram_id) is task:
+            _my_tasks_refresh_tasks.pop(telegram_id, None)
 
-    _my_tasks_refresh_tasks[telegram_id] = asyncio.create_task(_later())
+    async def _later():
+        await asyncio.sleep(MY_TASKS_REFRESH_DELAY)
+        active = _my_tasks_refresh_running.get(telegram_id)
+        if active is not None:
+            # A new update can cancel this wait, without cancelling the write.
+            await asyncio.shield(active)
+        task = asyncio.current_task()
+        forget_waiting(task)
+        _my_tasks_refresh_running[telegram_id] = task
+        try:
+            res = await _run_my_tasks_sync(telegram_id, with_gtasks=False)
+            logger.info("My tasks refresh: outcome=%s", res["outcome"])
+        except Exception as exc:
+            logger.error("My tasks refresh failed: %s", type(exc).__name__)
+        finally:
+            _my_tasks_refresh_running.pop(telegram_id, None)
+
+    task = asyncio.create_task(_later())
+    _my_tasks_refresh_tasks[telegram_id] = task
+    task.add_done_callback(forget_waiting)
+
+
+async def _drain_my_tasks_refresh() -> None:
+    waiting = tuple(_my_tasks_refresh_tasks.values())
+    for task in waiting:
+        task.cancel()
+    await asyncio.gather(*waiting, *_my_tasks_refresh_running.values(), return_exceptions=True)
 
 
 async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1877,7 +1887,7 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if info is None:
         return
     try:
-        created = await asyncio.get_event_loop().run_in_executor(
+        created = await asyncio.get_running_loop().run_in_executor(
             None, lambda: my_tasks.add_forwarded(telegram_id, info))
     except Exception as e:
         logger.error("handle_forwarded: ошибка сохранения [%s]: %s", telegram_id,
@@ -1948,19 +1958,21 @@ async def cmd_sync_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   next_attempt_ts=0, last_outcome=res["outcome"])
         await msg.edit_text(res["text"])
     except Exception as e:
-        logger.error("cmd_sync_tasks error [%s]: %s", telegram_id, type(e).__name__)
+        logger.error("cmd_sync_tasks error: %s", type(e).__name__)
         await msg.edit_text("❌ Синхронизация не выполнена (внутренняя ошибка). Попробуй позже.")
 
 
-async def scheduled_my_tasks_daily(bot: Bot):
+async def scheduled_my_tasks_daily(bot: Bot, *, stop_event=None):
     """Каждые 15 минут.  Для каждого пользователя с Google: если наступил
     слот 19:00 по его поясу и он ещё не выполнен полностью — сверка.
     Неудача (частичная/временная/аномалия) не отмечает слот выполненным:
     повтор с паузой 15→30→60→120 мин, в том числе после 19:59 и ночью,
     пока не будет успеха (дальше — уже следующий слот)."""
-    users = await asyncio.get_event_loop().run_in_executor(None, db.get_all_active_users)
+    users = await asyncio.get_running_loop().run_in_executor(None, db.get_all_active_users)
     now_utc = datetime.now(timezone.utc)
     for user in users:
+        if stop_event is not None and stop_event.is_set():
+            return
         telegram_id = user["telegram_id"]
         try:
             local = now_utc.astimezone(_tz(user))
@@ -1973,11 +1985,10 @@ async def scheduled_my_tasks_daily(bot: Bot):
         try:
             res = await _run_my_tasks_sync(telegram_id, with_gtasks=True)
         except Exception as e:
-            logger.error("My tasks daily error [%s]: %s", telegram_id, type(e).__name__)
+            logger.error("My tasks daily error: %s", type(e).__name__)
             res = {"outcome": my_tasks.OUT_TRANSIENT,
                    "text": my_tasks._HEADINGS[my_tasks.OUT_TRANSIENT]}
-        logger.info("My tasks daily [%s] slot=%s outcome=%s", telegram_id, slot,
-                    res["outcome"])
+        logger.info("My tasks daily outcome=%s", res["outcome"])
         try:
             notify = _record_daily_result(telegram_id, slot, res, state)
             if notify:
@@ -1987,8 +1998,7 @@ async def scheduled_my_tasks_daily(bot: Bot):
                     disable_notification=True,
                 )
         except Exception as e:
-            logger.error("My tasks daily record/notify error [%s]: %s", telegram_id,
-                         type(e).__name__)
+            logger.error("My tasks daily record/notify error: %s", type(e).__name__)
 
 
 # ─── OAuth callback (aiohttp web server) ─────────────────────
@@ -2000,30 +2010,29 @@ async def oauth_callback(request: web.Request) -> web.Response:
     error = request.rel_url.query.get("error")
 
     if error or not code or not state:
+        category = "user_denied" if error == "access_denied" else "invalid_request"
+        logger.info("OAuth callback: category=%s", category)
         return web.Response(
             text="<h2>Ошибка авторизации</h2><p>Попробуй снова: /connect в боте.</p>",
-            content_type="text/html",
+            content_type="text/html", status=400,
         )
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: auth.exchange_code(code, state)
-        )
+        result = await asyncio.to_thread(auth.exchange_code, code, state)
     except Exception as e:
-        # Не 500: state уже израсходован — пользователю нужна новая ссылка.
-        # В лог — только тип и классификация (без текста исключения).
         err = auth.classify_google_error(e)
-        logger.error("OAuth: обмен кода не удался: %s category=%s status=%s reason=%s",
-                     type(e).__name__, err.category, err.status, err.reason)
+        category = "token_invalid" if getattr(e, "error", None) == "invalid_grant" else err.category
+        status = {"transient": 503, "token_invalid": 400}.get(category, 502)
+        logger.warning("OAuth exchange failed: category=%s response_status=%s", category, status)
         return web.Response(
             text="<h2>Ошибка авторизации</h2>"
                  "<p>Не удалось завершить авторизацию, запросите ссылку заново: /connect</p>",
-            content_type="text/html",
+            content_type="text/html", status=status,
         )
     if not result:
         return web.Response(
-            text="<h2>Неверный или просроченный state</h2><p>Запроси ссылку заново: /connect</p>",
-            content_type="text/html",
+            text="<h2>Ссылка недействительна</h2><p>Запроси ссылку заново: /connect</p>",
+            content_type="text/html", status=400,
         )
 
     telegram_id, granted = result
@@ -2066,13 +2075,13 @@ def _format_tasks(tasks: list) -> str:
     """Форматирует список задач для вывода в Telegram."""
     if not tasks:
         return "✅ Нет открытых задач!"
-    lines = ["📋 *Открытые задачи:*\n"]
+    lines = ["📋 <b>Открытые задачи:</b>\n"]
     for i, t in enumerate(tasks, 1):
-        title = t.get("title", "(без названия)").strip()
-        due   = (t.get("due") or "")[:10]
-        note  = f" _({due})_" if due else ""
-        lines.append(f"{i}\. {title}{note}")
-    lines.append("\nНапиши *скип* — закрыть первую, *скип 2* — конкретную\.")
+        title = html_lib.escape((t.get("title") or "(без названия)").strip())
+        due   = html_lib.escape((t.get("due") or "")[:10])
+        note  = f" <i>({due})</i>" if due else ""
+        lines.append(f"{i}. {title}{note}")
+    lines.append("\nНапиши <b>скип</b> — закрыть первую, <b>скип 2</b> — конкретную.")
     return "\n".join(lines)
 
 
@@ -2096,27 +2105,27 @@ async def _handle_pending_tasks(
 
     if idx < 0 or idx >= len(tasks):
         await update.message.reply_text(
-            f"⚠️ Нет задачи с номером {idx + 1}\.",
-            parse_mode="MarkdownV2",
+            f"⚠️ Нет задачи с номером {idx + 1}.",
+            parse_mode="HTML",
         )
         return True
 
     task = tasks[idx]
-    ok = await asyncio.get_event_loop().run_in_executor(
+    ok = await asyncio.get_running_loop().run_in_executor(
         None, lambda: gtasks.complete_task(telegram_id, task["id"], task["_listId"])
     )
 
     if ok:
         tasks.pop(idx)
         context.user_data["tasks"] = tasks
-        title = task.get("title", "").strip()
-        reply = f"✅ Закрыто: _{title}_\n\n" + _format_tasks(tasks)
+        title = html_lib.escape((task.get("title") or "(без названия)").strip())
+        reply = f"✅ Закрыто: <i>{title}</i>\n\n" + _format_tasks(tasks)
         if not tasks:
             context.user_data.pop("tasks", None)
     else:
-        reply = "⚠️ Не удалось закрыть задачу, попробуй ещё раз\."
+        reply = "⚠️ Не удалось закрыть задачу, попробуй ещё раз."
 
-    await update.message.reply_text(reply, parse_mode="MarkdownV2")
+    await update.message.reply_text(reply, parse_mode="HTML")
     return True
 
 
@@ -2128,7 +2137,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _track(telegram_id, "tasks_used", source="tasks")   # как в /sync_tasks: после проверки Google
 
-    tasks, err = await asyncio.get_event_loop().run_in_executor(
+    tasks, err = await asyncio.get_running_loop().run_in_executor(
         None, lambda: gtasks.list_all_tasks(telegram_id)
     )
 
@@ -2138,7 +2147,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["tasks"] = tasks
-    await update.message.reply_text(_format_tasks(tasks), parse_mode="MarkdownV2")
+    await update.message.reply_text(_format_tasks(tasks), parse_mode="HTML")
     _track(telegram_id, "first_value", source="tasks")
 
 
@@ -2149,15 +2158,14 @@ async def cmd_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text(
             "📒 Список контактов пуст.\n"
-            "Добавь через: /add\_contact Имя email@example.com",
-            parse_mode="Markdown",
+            "Добавь через: /add_contact Имя email@example.com",
         )
         return
-    lines = ["📒 *Контакты для приглашений:*\n"]
+    lines = ["📒 Контакты для приглашений:\n"]
     for r in rows:
-        lines.append(f"👤 *{r['display_name']}* — `{r['email']}`")
-    lines.append("\n_/del\_contact Имя — удалить контакт_")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"👤 {r['display_name']} — {r['email']}")
+    lines.append("\n/del_contact Имя — удалить контакт")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_add_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2166,9 +2174,8 @@ async def cmd_add_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args  # список аргументов после команды
     if not args or len(args) < 2:
         await update.message.reply_text(
-            "Использование: `/add_contact Имя email@example.com`\n\n"
-            "Пример: `/add_contact Анастасия bragina@hsk.ru`",
-            parse_mode="Markdown",
+            "Использование: /add_contact Имя email@example.com\n\n"
+            "Пример: /add_contact Анастасия bragina@hsk.ru",
         )
         return
     email = args[-1]          # последний аргумент — email
@@ -2178,9 +2185,8 @@ async def cmd_add_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.add_contact(telegram_id, name, email)
     await update.message.reply_text(
-        f"✅ Сохранено: *{name}* → `{email}`\n\n"
+        f"✅ Сохранено: {name} → {email}\n\n"
         f"Теперь можно приглашать: просто напиши «{name}» когда бот спросит «Кого пригласить?»",
-        parse_mode="Markdown",
     )
 
 
@@ -2189,8 +2195,7 @@ async def cmd_del_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "Использование: `/del\_contact Имя`",
-            parse_mode="Markdown",
+            "Использование: /del_contact Имя",
         )
         return
     name = " ".join(context.args)
@@ -2204,16 +2209,15 @@ async def cmd_del_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_bot():
-    global _bot
-
     # Инициализируем БД
     db.init_db()
     logger.info("База данных инициализирована: %s", db.DB_PATH)
 
     # Telegram Application
     request = HTTPXRequest(connect_timeout=60, read_timeout=60, write_timeout=60, pool_timeout=60)
-    app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
-    _bot = app.bot
+    polling_request = HTTPXRequest()
+    app = (Application.builder().token(TELEGRAM_TOKEN).request(request)
+           .get_updates_request(polling_request).build())
 
     # Аналитика (#46): группа -1 — раньше всех обработчиков, обработку не прерывает
     app.add_handler(TypeHandler(Update, _track_activity), group=-1)
@@ -2232,8 +2236,9 @@ async def run_bot():
     app.add_handler(CommandHandler("sync_tasks",    cmd_sync_tasks))
     app.add_handler(CommandHandler("sync_mymeet",      cmd_sync_mymeet))
     app.add_handler(CommandHandler("sync_mymeet_full", cmd_sync_mymeet_full))
-    app.add_handler(CommandHandler("setup_mymeet",     cmd_setup_mymeet))
-    app.add_handler(CommandHandler("reset_mymeet",     cmd_setup_mymeet))
+    app.add_handler(CommandHandler("setup_mymeet", cmd_setup_mymeet, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("reset_mymeet", cmd_setup_mymeet, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cancel", cmd_cancel_mymeet, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(
         lambda u, c: _handle_mymeet_ws_callback(u, c),
         pattern=r"^mymeet_ws:",
@@ -2245,13 +2250,34 @@ async def run_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.error("Необработанное исключение в хендлере:", exc_info=context.error)
+        logger.error("Telegram handler failed: %s", type(context.error).__name__)
     app.add_error_handler(error_handler)
 
     # APScheduler
     scheduler = AsyncIOScheduler()
+    stop_event = asyncio.Event()
+    active_jobs: set[asyncio.Task] = set()
+    active_callbacks: set[asyncio.Task] = set()
+
+    def scheduled(job, *, stop_between_users=False):
+        async def run(*args):
+            if stop_event.is_set():
+                return
+            task = asyncio.current_task()
+            active_jobs.add(task)
+            try:
+                if stop_between_users:
+                    await job(*args, stop_event=stop_event)
+                else:
+                    await job(*args)
+            except Exception as exc:
+                logger.error("Scheduled job %s failed: %s", job.__name__, type(exc).__name__)
+            finally:
+                active_jobs.discard(task)
+        return run
+
     scheduler.add_job(
-        scheduled_telemost_all_users,
+        scheduled(scheduled_telemost_all_users, stop_between_users=True),
         "interval",
         hours=3,
         args=[app.bot],
@@ -2259,7 +2285,7 @@ async def run_bot():
         replace_existing=True,
     )
     scheduler.add_job(
-        send_daily_schedule,
+        scheduled(send_daily_schedule, stop_between_users=True),
         "cron",
         day_of_week="mon-fri",
         hour=5,
@@ -2270,7 +2296,7 @@ async def run_bot():
         timezone="UTC",
     )
     scheduler.add_job(
-        scheduled_mymeet_sync,
+        scheduled(scheduled_mymeet_sync, stop_between_users=True),
         "cron",
         minute="*/15",   # 19:00 по поясу пользователя + догон пропущенных вечеров
         args=[app.bot],
@@ -2281,7 +2307,7 @@ async def run_bot():
         timezone="UTC",
     )
     scheduler.add_job(
-        scheduled_my_tasks_daily,
+        scheduled(scheduled_my_tasks_daily, stop_between_users=True),
         "cron",
         minute="*/15",   # 19:00 по поясу пользователя — проверяется на каждом тике
         args=[app.bot],
@@ -2292,7 +2318,7 @@ async def run_bot():
         timezone="UTC",
     )
     scheduler.add_job(
-        scheduled_analytics_cleanup,
+        scheduled(scheduled_analytics_cleanup),
         "cron",
         hour=3,
         minute=30,
@@ -2300,29 +2326,128 @@ async def run_bot():
         replace_existing=True,
         timezone="UTC",
     )
-    scheduler.start()
+    async def tracked_oauth_callback(request: web.Request) -> web.Response:
+        if stop_event.is_set():
+            return web.Response(status=503)
+        task = asyncio.current_task()
+        active_callbacks.add(task)
+        try:
+            return await oauth_callback(request)
+        except Exception as exc:
+            logger.error("OAuth callback failed: %s", type(exc).__name__)
+            return web.Response(status=500, text="Не удалось завершить авторизацию. Попробуй /connect.")
+        finally:
+            active_callbacks.discard(task)
 
-    # OAuth callback web server
     web_app = web.Application()
-    web_app.router.add_get("/oauth/callback", oauth_callback)
+    web_app.router.add_get("/oauth/callback", tracked_oauth_callback)
     web_app.router.add_get("/health", lambda r: web.Response(text="ok"))
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", OAUTH_CALLBACK_PORT)
-    await site.start()
-    logger.info("OAuth callback server: http://0.0.0.0:%s/oauth/callback", OAUTH_CALLBACK_PORT)
+    runner = web.AppRunner(web_app, access_log=None)
+    await _run_bot_lifecycle(
+        app, scheduler, runner, stop_event, active_jobs, active_callbacks,
+        (request, polling_request),
+    )
 
-    # Запускаем бота
-    logger.info("ZinaidaSergeevnaBot (multi-user) запущен...")
-    async with app:
+
+async def _run_bot_lifecycle(
+    app, scheduler, runner, stop_event, active_jobs, active_callbacks, requests,
+):
+    global _bot, _my_tasks_refresh_stopping
+
+    loop = asyncio.get_running_loop()
+    previous_handlers = {}
+    initialized = False
+    site = None
+    listening = False
+    _my_tasks_refresh_stopping = False
+
+    async def drain_http():
+        try:
+            if listening:
+                await site.stop()
+            # AppRunner can cancel HTTP handlers on shutdown timeout.
+            # Drain accepted OAuth writes while Telegram is still initialized.
+            await asyncio.gather(*active_callbacks, return_exceptions=True)
+        finally:
+            await runner.cleanup()
+
+    async def drain_scheduler():
+        try:
+            await asyncio.gather(*active_jobs, return_exceptions=True)
+        finally:
+            if scheduler.running:
+                scheduler.shutdown(wait=True)
+                # AsyncIOScheduler schedules shutdown on the event loop.
+                await asyncio.sleep(0)
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous = signal.getsignal(sig)
+            loop.add_signal_handler(sig, stop_event.set)
+            previous_handlers[sig] = previous
+
+        await app.initialize()
+        initialized = True
+        if stop_event.is_set():
+            return
+        _bot = app.bot
         await app.start()
-        await app.updater.start_polling()
-        await asyncio.Event().wait()
-        await app.updater.stop()
-        await app.stop()
-
-    scheduler.shutdown()
-    await runner.cleanup()
+        if stop_event.is_set():
+            return
+        await app.updater.start_polling(bootstrap_retries=0)
+        if stop_event.is_set():
+            return
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", OAUTH_CALLBACK_PORT)
+        if stop_event.is_set():
+            return
+        await site.start()
+        listening = True
+        if not stop_event.is_set():
+            scheduler.start()
+            logger.info("ZinaidaSergeevnaBot (multi-user) запущен.")
+        await stop_event.wait()
+    finally:
+        stop_event.set()
+        _my_tasks_refresh_stopping = True
+        try:
+            if scheduler.running:
+                scheduler.pause()
+        finally:
+            try:
+                if app.updater.running:
+                    await app.updater.stop()
+            finally:
+                try:
+                    if app.running:
+                        await app.stop()
+                finally:
+                    try:
+                        # Let accepted operations finish before scheduler and client shutdown.
+                        # Fly can still enforce kill_timeout if a remote call stalls.
+                        outcomes = await asyncio.gather(
+                            drain_http(), drain_scheduler(), _drain_my_tasks_refresh(),
+                            return_exceptions=True,
+                        )
+                        for result in outcomes:
+                            if isinstance(result, Exception):
+                                logger.error("Bot cleanup failed: %s", type(result).__name__)
+                    finally:
+                        try:
+                            if initialized:
+                                await app.shutdown()
+                            else:
+                                # PTB cannot shut down an Application whose initialize()
+                                # failed after opening one of its HTTP clients.
+                                await asyncio.gather(
+                                    *(client.shutdown() for client in requests),
+                                    return_exceptions=True,
+                                )
+                        finally:
+                            _bot = None
+                            for sig, previous in previous_handlers.items():
+                                loop.remove_signal_handler(sig)
+                                signal.signal(sig, previous)
 
 
 def main():

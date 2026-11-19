@@ -20,9 +20,11 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import gspread
 import requests
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "")
 ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
 
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 
 # ── Sheet formatting constants ────────────────────────────────────────────────
 STATUS_VALUES = [
@@ -150,13 +153,32 @@ def _gs_call(fn, *args, retries: int = 7, **kwargs):
 
 # ── Google Sheets client ──────────────────────────────────────────────────────
 
-def _gs_client() -> gspread.Client:
+def _service_account_credentials(scopes):
     creds_json = os.environ.get("GOOGLE_SA_KEY")
     if not creds_json:
         raise RuntimeError("GOOGLE_SA_KEY env var is not set")
     creds_data = json.loads(creds_json)
-    creds = Credentials.from_service_account_info(creds_data, scopes=GS_SCOPES)
-    return gspread.authorize(creds)
+    return Credentials.from_service_account_info(creds_data, scopes=scopes)
+
+
+def _gs_client() -> gspread.Client:
+    return gspread.authorize(_service_account_credentials(GS_SCOPES))
+
+
+def require_spreadsheet_editor(sheet_id: str) -> None:
+    """Check the file-level edit capability for the Sheets service account."""
+    creds = _service_account_credentials([DRIVE_METADATA_SCOPE])
+    url = "https://www.googleapis.com/drive/v3/files/" + quote(sheet_id, safe="")
+    with AuthorizedSession(creds, refresh_timeout=15) as session:
+        response = session.get(
+            url, params={"fields": "capabilities(canEdit,canModifyContent)", "supportsAllDrives": "true"},
+            timeout=15, allow_redirects=False,
+        )
+    if response.status_code != 200:
+        raise RuntimeError("Spreadsheet edit capability unavailable")
+    capabilities = response.json().get("capabilities") or {}
+    if capabilities.get("canEdit") is not True or capabilities.get("canModifyContent") is not True:
+        raise PermissionError("Spreadsheet is not editable")
 
 
 def _apply_full_format(
@@ -282,7 +304,7 @@ def _apply_full_format(
     try:
         _gs_call(spreadsheet.batch_update, {"requests": requests})
     except Exception as e:
-        msg = f"batch_update: {e}"
+        msg = "Не удалось применить форматирование листа"
         logger.warning("Sheet formatting error: %s", _err_brief(e))
         fmt_warnings.append(msg)
 
@@ -300,7 +322,7 @@ def _apply_full_format(
                 }
             }]})
         except Exception as e:
-            msg = f"auto-resize: {e}"
+            msg = "Не удалось подобрать ширину столбцов"
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             fmt_warnings.append(msg)
     return fmt_warnings
@@ -384,7 +406,7 @@ def verify_token_and_get_workspace(token: str) -> dict:
             timeout=15,
         )
     except requests.RequestException as exc:
-        logger.warning("verify_token_and_get_workspace: network error: %s", exc)
+        logger.warning("MYmeet token verification network error: %s", type(exc).__name__)
         raise
     if resp.status_code == 401:
         raise MymeetTokenError(401, "Неверный API-токен (401 Unauthorized)")
@@ -515,7 +537,7 @@ def _extract_tasks(protocol: dict | None) -> list:
                                          item.get("status") == "done"),
                     })
     except Exception as e:
-        logger.debug("Task extraction error: %s", e)
+        logger.debug("Task extraction error: %s", type(e).__name__)
     return tasks
 
 
@@ -599,8 +621,7 @@ def _is_organizer(m: dict, organizer_email: str | None = None) -> bool:
         return False
 
     # Can't determine — include the meeting and log for later inspection
-    logger.debug("_is_organizer: could not determine for %s, keys=%s",
-                 m.get("id", "?"), list(m.keys()))
+    logger.debug("MYmeet: could not determine organizer from legacy fields")
     return True
 
 
@@ -680,8 +701,7 @@ def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
     event_id = _extract_gcal_event_id(m)
     if event_id is not None:
         result = event_id in gcal_ids
-        logger.debug("_is_organizer_by_gcal: id=%s gcal_match=%s meeting=%s",
-                     event_id, result, m.get("id", "?"))
+        logger.debug("MYmeet calendar organizer ID match=%s", result)
         return result
 
     # 2. Time-based fallback (approximate -- may mis-match concurrent meetings)
@@ -690,11 +710,7 @@ def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
         return False  # unknown date -> exclude per spec
     ts_min = int(ts / 60_000) * 60_000
     matched = any(ts_min + delta in gcal_times for delta in (0, 60_000, -60_000))
-    logger.debug(
-        "_is_organizer_by_gcal: no GCal event ID found in MYmeet meeting %s; "
-        "time fallback ts_min=%d matched=%s",
-        m.get("id", "?"), ts_min, matched,
-    )
+    logger.debug("MYmeet calendar organizer time fallback match=%s", matched)
     return matched
 
 
@@ -1045,7 +1061,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
                 "addProtectedRange": {"protectedRange": prot}
             }]})
         except Exception as e:
-            msg = f"{title} (защита листа): {e}"
+            msg = "Не удалось настроить защиту листа"
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
@@ -1064,7 +1080,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             _gs_call(spreadsheet.batch_update, {"requests": [
                 _my_tasks_link_request(ws.id, rows, link_spans)]})
         except Exception as e:
-            msg = f"{title} (ссылки на письма): {e}"
+            msg = "Не удалось добавить ссылки на письма"
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     # Clear leftovers of a previous (longer) run only after a successful write.
@@ -1072,7 +1088,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
         try:
             _gs_call(ws.batch_clear, [f"A{need_rows + 1}:H{cur_rows}"])
         except Exception as e:
-            msg = f"{title} (очистка старых строк): {e}"
+            msg = "Не удалось очистить старые строки"
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
 
@@ -1097,7 +1113,7 @@ def _write_my_tasks_sheet(spreadsheet, title: str, exists: bool, rows: list,
             }
         }]})
     except Exception as e:
-        msg = f"{title} (фильтр): {e}"
+        msg = "Не удалось обновить фильтр листа"
         logger.warning("Sheet formatting error: %s", _err_brief(e))
         warnings.append(msg)
     return ws
@@ -1270,9 +1286,10 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                                 try:
                                     _gs_call(spreadsheet.batch_update, {"requests": preqs})
                                 except Exception as e:
-                                    warnings.append(f"{my_title} (защита листа): {e}")
+                                    logger.warning("Sheet protection failed: %s", _err_brief(e))
+                                    warnings.append("Не удалось настроить защиту листа «Мои задачи»")
             except Exception as e:
-                msg = f"{my_title}: {e}"
+                msg = "Не удалось обновить лист «Мои задачи»"
                 logger.warning("Sheet formatting error: %s", _err_brief(e))
                 warnings.append(msg)
 
@@ -1280,7 +1297,7 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
         try:
             _ensure_status_colors(spreadsheet, meta, color_targets)
         except Exception as e:
-            msg = f"цвета статусов: {e}"
+            msg = "Не удалось обновить цвета статусов"
             logger.warning("Sheet formatting error: %s", _err_brief(e))
             warnings.append(msg)
     return warnings, my_count, my_title
@@ -1321,7 +1338,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     st.update(fetched=0, after_date=0, after_org=0, protocols_failed=0,
               protocols_missing=0, total_tasks=0, new_rows=0, skipped_known=0,
               protocols_written=False, registry="skipped", my_tasks="skipped")
-    logger.info("MYmeet sync started (days=%d, append=%s, ws=%s)", days, append, cfg["ws_id"])
+    logger.info("MYmeet sync started (days=%d, append=%s)", days, append)
 
     raw_meetings = _fetch_meetings(days=days, token=cfg["token"], ws_id=cfg["ws_id"])
     _fetched_count = len(raw_meetings)
@@ -1809,7 +1826,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
-        all_fmt_warnings.append(f"Мои задачи / цвета статусов: {e}")
+        all_fmt_warnings.append("Не удалось обновить лист «Мои задачи» или цвета статусов")
     # Итог доставки в личный лист — отдельно от записи протоколов
     if not full_name:
         st["my_tasks"] = "no_name"          # личного листа нет по настройке
@@ -1943,7 +1960,7 @@ def _format_one_time_groupers(spreadsheet, ws, rows: list, known: set) -> list:
         _gs_call(spreadsheet.batch_update, {"requests": reqs})
     except Exception as e:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
-        return [f"Разовые встречи (заголовки встреч): {e}"]
+        return ["Не удалось оформить заголовки разовых встреч"]
     return []
 
 
@@ -2412,7 +2429,7 @@ async def sync_to_sheets_async(
     user_config: dict | None = None,
     stats: dict | None = None,
 ) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
         lambda: sync_to_sheets(days=days, append=append, user_config=user_config,

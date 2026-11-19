@@ -2,7 +2,10 @@
 Тесты для исправлений MYmeet: API-интеграция, шифрование токенов, безопасность.
 Запуск: pytest test_mymeet_workspace.py -v
 """
+import asyncio
 import os
+import time
+from types import SimpleNamespace
 import re
 import sys
 import logging
@@ -10,7 +13,7 @@ import sqlite3
 import tempfile
 import pathlib
 import threading
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, call
 
 import pytest
 import requests
@@ -292,10 +295,10 @@ class TestTelegramDeleteMessage:
         mock_update.message = mock_message
         mock_update.effective_user.id = 12345678
         mock_context = MagicMock()
-        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token"}}
+        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token", "expires": time.monotonic() + 60}}
 
         ws_result = {"id": "active", "name": "Test WS"}
-        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result),              patch("db.save_mymeet_pending"):  # атомарная запись требует реальной БД
+        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result):
             # Импортируем и вызываем handler
             import main as main_module
             await main_module._handle_mymeet_setup(
@@ -316,10 +319,10 @@ class TestTelegramDeleteMessage:
         mock_update.message = mock_message
         mock_update.effective_user.id = 12345678
         mock_context = MagicMock()
-        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token"}}
+        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token", "expires": time.monotonic() + 60}}
 
         ws_result = {"id": "active", "name": "Test WS"}
-        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result),              patch("db.save_mymeet_pending"):  # атомарная запись требует реальной БД
+        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result):
             import main as main_module
             result = await main_module._handle_mymeet_setup(
                 telegram_id=12345678,
@@ -422,7 +425,8 @@ class TestManualSyncDecryption:
         mock_context = MagicMock()
         mock_context.user_data = {}
 
-        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.upsert_user", side_effect=db_mod.upsert_user),              patch("mymeet_sync.sync_to_sheets_async", side_effect=fake_sync):
+        with patch("main._get_gcal_organizer_data", return_value={}), \
+             patch("main.sync_to_sheets_async", side_effect=fake_sync):
             import main as main_mod
             await main_mod.cmd_sync_mymeet(mock_update, mock_context)
 
@@ -456,7 +460,8 @@ class TestManualSyncDecryption:
         mock_context.user_data = {}
         mock_context.args = ["30"]
 
-        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.upsert_user", side_effect=db_mod.upsert_user),              patch("mymeet_sync.sync_to_sheets_async", side_effect=fake_sync):
+        with patch("main._get_gcal_organizer_data", return_value={}), \
+             patch("main.sync_to_sheets_async", side_effect=fake_sync):
             import main as main_mod
             await main_mod.cmd_sync_mymeet_full(mock_update, mock_context)
 
@@ -498,9 +503,8 @@ class TestManualSyncDecryption:
         mock_context = MagicMock()
         mock_context.user_data = {}
 
-        with patch("db.get_user", side_effect=db_mod.get_user), \
-             patch("db.upsert_user", side_effect=db_mod.upsert_user), \
-             patch("mymeet_sync.sync_to_sheets_async", side_effect=fake_sync):
+        with patch("main._get_gcal_organizer_data", return_value={}), \
+             patch("main.sync_to_sheets_async", side_effect=fake_sync):
             import main as main_mod
             await main_mod.cmd_sync_mymeet(mock_update, mock_context)
 
@@ -513,204 +517,138 @@ class TestManualSyncDecryption:
 
 
 # ---------------------------------------------------------------------------
-# БЛОК 7: Полный двухшаговый сценарий /setup_mymeet (шаг1 токен → шаг2 таблица)
+# БЛОК 7: безопасная замена действующей настройки MYmeet
 # ---------------------------------------------------------------------------
 
 class TestMymeetSetupTwoStep:
-    """Интеграционные тесты всего визарда /setup_mymeet."""
-
     @pytest.fixture
-    def db_mod(self, tmp_path, monkeypatch):
-        """Временная БД с созданным пользователем (имитирует upsert_user из cmd_setup_mymeet)."""
-        db_path = tmp_path / "setup_test.db"
-        monkeypatch.setenv("DB_PATH", str(db_path))
-        import sys
-        if "db" in sys.modules:
-            del sys.modules["db"]
-        import db as db_module
-        db_module.init_db()
-        db_module.upsert_user(55667788, "setup_tester")
-        yield db_module
-        if "db" in sys.modules:
-            del sys.modules["db"]
+    def wizard(self, tmp_path, monkeypatch):
+        import main
+        monkeypatch.setattr(main.db, "DB_PATH", tmp_path / "setup.db")
+        main.db.init_db()
+        uid = 55667788
+        main.db.upsert_user(uid, "setup_tester")
+        main.db.save_mymeet_config(uid, _mk_tok("old_active_key"), "old-workspace", "O" * 30)
+        mon = AsyncMock()
+        mon.reply_text.return_value = AsyncMock()
+        update = SimpleNamespace(message=mon, effective_chat=SimpleNamespace(type="private"),
+                                 effective_user=SimpleNamespace(id=uid, username="setup_tester"))
+        return main, uid, update, SimpleNamespace(user_data={})
 
-    # ------------------------------------------------------------------ шаг 1
-
-    @pytest.mark.asyncio
-    async def test_step1_token_accepted_transitions_to_step2(self):
-        """Верный токен переводит setup.step в _SETUP_STEP_SHEET."""
-        mock_message = AsyncMock()
-        mock_message.delete = AsyncMock()
-        edited = AsyncMock()
-        mock_message.reply_text = AsyncMock(return_value=edited)
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-        mock_context = MagicMock()
-        mock_context.user_data = {"mymeet_setup": {"step": "mymeet_token"}}
-
-        ws_result = {"id": "active", "name": "Тест-WS"}
-        with patch("mymeet_sync.verify_token_and_get_workspace", return_value=ws_result),              patch("db.save_mymeet_pending"):  # атомарная запись требует реальной БД
-            import main as m
-            result = await m._handle_mymeet_setup(
-                telegram_id=55667788,
-                text=_mk_tok("good_token_abcdef123456789"),
-                update=mock_update,
-                context=mock_context,
-            )
-
-        assert result is True
-        setup = mock_context.user_data["mymeet_setup"]
-        assert setup["step"] == "mymeet_sheet"
-        assert setup["token"].startswith("mm_")
-        assert setup["ws_id"] == "active"
-
-    # ------------------------------------------------------------------ шаг 2 — успех
+    async def submit_token(self, main, uid, update, context, token):
+        with patch.object(main, "verify_token_and_get_workspace", return_value={"id": "active"}):
+            assert await main._handle_mymeet_setup(uid, token, update, context)
 
     @pytest.mark.asyncio
-    async def test_step2_full_url_success_saves_config(self, db_mod):
-        """Шаг 2: полный URL Google Sheets → конфиг сохранён, пользователь получает 🎉."""
-        mock_message = AsyncMock()
-        mock_message.reply_text = AsyncMock()
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-        mock_context = MagicMock()
-        mock_context.user_data = {
-            "mymeet_setup": {
-                "step": "mymeet_sheet",
-                "token": _mk_tok("good_token_abcdef123456789"),
-                "ws_id": "active",
-            }
-        }
-
-        sheet_url = "https://docs.google.com/spreadsheets/d/1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0/edit?gid=0#gid=0"
-        with patch("db.save_mymeet_config", side_effect=db_mod.save_mymeet_config), \
-             patch("db.get_user", side_effect=db_mod.get_user):
-            import main as m
-            result = await m._handle_mymeet_setup(
-                telegram_id=55667788,
-                text=sheet_url,
-                update=mock_update,
-                context=mock_context,
+    async def test_success_requires_metadata_check_and_promotes_whole_draft(self, wizard):
+        main, uid, update, context = wizard
+        old = main.db.get_user(uid)
+        await main.cmd_setup_mymeet(update, context)
+        token = _mk_tok("new_candidate_key")
+        await self.submit_token(main, uid, update, context, token)
+        update.message.delete.assert_awaited_once()
+        row = main.db.get_user(uid)
+        assert row["mymeet_pending_token"] is None
+        assert row["mymeet_token"] == old["mymeet_token"]
+        assert token not in repr(context.user_data)
+        with patch.object(main, "_check_mymeet_sheet_access") as verify:
+            assert await main._handle_mymeet_setup(
+                uid, "https://docs.google.com/spreadsheets/d/" + "N" * 30 + "/edit?gid=0", update, context
             )
-
-        assert result is True
-        # Сессия очищена
-        assert "mymeet_setup" not in mock_context.user_data
-        # Пользователь получил сообщение об успехе
-        reply_text = mock_message.reply_text.call_args[0][0]
-        assert "🎉" in reply_text
-        # Конфиг сохранён в БД
-        user = db_mod.get_user(55667788)
-        assert user["mymeet_setup_done"] == 1
-        assert user["mymeet_spreadsheet_id"] == "1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0"
-        # Токен зашифрован
-        import crypto
-        assert crypto.is_encrypted(user["mymeet_token"])
-
-    # ------------------------------------------------------------------ шаг 2 — ошибка DB показывается
+        verify.assert_called_once_with("N" * 30)
+        row = main.db.get_user(uid)
+        assert main._crypto.decrypt_token(row["mymeet_token"]) == token
+        assert (row["mymeet_ws_id"], row["mymeet_spreadsheet_id"]) == ("active", "N" * 30)
+        assert row["mymeet_setup_done"] == 1 and row["mymeet_setup_in_progress"] == 0
+        assert not context.user_data
 
     @pytest.mark.asyncio
-    async def test_step2_db_error_shown_to_user(self):
-        """Если save_mymeet_config падает — пользователь получает ❌, а не тишину."""
-        mock_message = AsyncMock()
-        mock_message.reply_text = AsyncMock()
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-        mock_context = MagicMock()
-        mock_context.user_data = {
-            "mymeet_setup": {
-                "step": "mymeet_sheet",
-                "token": _mk_tok("good_token_abcdef123456789"),
-                "ws_id": "active",
-            }
-        }
-
-        with patch("db.save_mymeet_config", side_effect=RuntimeError("БД недоступна")):
-            import main as m
-            result = await m._handle_mymeet_setup(
-                telegram_id=55667788,
-                text="1_c3rMhDnA-hKJu_NTkq0pca_clyrgFoQRj1Iu9Re0_XXXX",
-                update=mock_update,
-                context=mock_context,
-            )
-
-        assert result is True
-        # Пользователь получил понятное сообщение — без внутренних деталей
-        reply_text = str(mock_message.reply_text.call_args)
-        assert "❌" in reply_text
-        assert "Не удалось сохранить" in reply_text or "setup_mymeet" in reply_text
-        # Технические детали (тип исключения) НЕ должны попасть пользователю
-        assert "RuntimeError" not in reply_text
-        assert "Traceback" not in reply_text
-
-    # ------------------------------------------------------------------ шаг 2 — устаревшая сессия
+    async def test_access_error_then_cancel_preserves_active_config(self, wizard, caplog):
+        main, uid, update, context = wizard
+        old = main.db.get_user(uid)
+        await main.cmd_setup_mymeet(update, context)
+        await self.submit_token(main, uid, update, context, _mk_tok("candidate_secret"))
+        with patch.object(main, "_check_mymeet_sheet_access", side_effect=ValueError("sheet-secret")):
+            assert await main._handle_mymeet_setup(uid, "N" * 30, update, context)
+        assert "mymeet_setup" in context.user_data
+        assert "sheet-secret" not in caplog.text + repr(update.message.reply_text.call_args_list)
+        await main.cmd_cancel_mymeet(update, context)
+        row = main.db.get_user(uid)
+        assert row["mymeet_setup_in_progress"] == 0 and not context.user_data
+        assert row["mymeet_token"] == old["mymeet_token"]
+        assert row["mymeet_spreadsheet_id"] == old["mymeet_spreadsheet_id"]
 
     @pytest.mark.asyncio
-    async def test_step2_expired_session_shown_to_user(self):
-        """Если токен/ws_id потеряны (рестарт бота) — пользователь получает понятное сообщение."""
-        mock_message = AsyncMock()
-        mock_message.reply_text = AsyncMock()
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-        mock_context = MagicMock()
-        # Имитируем потерю данных после рестарта: step есть, но токен и ws_id — нет
-        mock_context.user_data = {
-            "mymeet_setup": {"step": "mymeet_sheet"}
-        }
+    async def test_restart_with_legacy_pending_starts_safely(self, wizard):
+        main, uid, update, context = wizard
+        main.db.save_mymeet_pending(uid, _mk_tok("legacy_draft_key"), "legacy-draft-space")
+        update.message.text = "https://docs.google.com/spreadsheets/d/" + "N" * 30 + "/edit"
+        with patch.object(main, "_check_mymeet_sheet_access") as verify:
+            await main.handle_text(update, context)
+        verify.assert_not_called()
+        assert "/setup_mymeet" in update.message.reply_text.call_args.args[0]
+        row = main.db.get_user(uid)
+        assert row["mymeet_spreadsheet_id"] == "O" * 30
+        assert row["mymeet_pending_token"] is not None
+        await main.cmd_setup_mymeet(update, context)
+        assert main.db.get_user(uid)["mymeet_pending_token"] is None
 
-        with patch("db.save_mymeet_config") as mock_save, \
-             patch("db.set_mymeet_setup_in_progress") as mock_clr:
-            import main as m
-            result = await m._handle_mymeet_setup(
-                telegram_id=55667788,
-                text="1_c3rMhDnA-hKJu_NTkq0pca_clyrgFoQRj1Iu9Re0_XXXX",
-                update=mock_update,
-                context=mock_context,
-            )
+    @pytest.mark.asyncio
+    async def test_replaced_draft_cannot_commit_stale_sheet_validation(self, wizard):
+        main, uid, update, context = wizard
+        await main.cmd_setup_mymeet(update, context)
+        await self.submit_token(main, uid, update, context, _mk_tok("first_draft_key"))
+        checked = asyncio.Event()
+        proceed = asyncio.Event()
 
-        assert result is True
-        mock_save.assert_not_called()          # save не должен вызываться
-        mock_clr.assert_called_once_with(55667788, False)   # DB-флаг очищен
-        assert "mymeet_setup" not in mock_context.user_data  # сессия очищена
-        reply_text = str(mock_message.reply_text.call_args)
-        assert "setup_mymeet" in reply_text    # подсказка что делать
+        async def fake_thread(func, sheet_id):
+            checked.set()
+            await proceed.wait()
 
-    # ------------------------------------------------------------------ шаг 2 — URL parsing
+        with patch.object(main.asyncio, "to_thread", side_effect=fake_thread):
+            stale = asyncio.create_task(main._handle_mymeet_setup(uid, "N" * 30, update, context))
+            await asyncio.wait_for(checked.wait(), 1)
+            await main.cmd_setup_mymeet(update, context)
+            proceed.set()
+            assert await asyncio.wait_for(stale, 1)
+        row = main.db.get_user(uid)
+        assert row["mymeet_spreadsheet_id"] == "O" * 30
+        assert context.user_data["mymeet_setup"]["step"] == main._SETUP_STEP_TOKEN
 
-    def test_step2_url_id_extraction(self):
-        """Регулярка корректно извлекает ID из полного URL Google Sheets."""
-        import re
-        pattern = r"/spreadsheets/d/([A-Za-z0-9_-]+)"
-        cases = [
-            (
-                "https://docs.google.com/spreadsheets/d/1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0/edit?gid=0#gid=0",
-                "1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0",
-            ),
-            (
-                "https://docs.google.com/spreadsheets/d/ABCDEF1234567890GHIJKL/edit",
-                "ABCDEF1234567890GHIJKL",
+    @pytest.mark.asyncio
+    async def test_expired_draft_cannot_commit(self, wizard):
+        main, uid, update, context = wizard
+        await main.cmd_setup_mymeet(update, context)
+        await self.submit_token(main, uid, update, context, _mk_tok("expired_draft_key"))
+        context.user_data["mymeet_setup"]["expires"] = time.monotonic() - 1
+        with patch.object(main, "_check_mymeet_sheet_access") as verify:
+            assert await main._handle_mymeet_setup(uid, "N" * 30, update, context)
+        verify.assert_not_called()
+        assert main.db.get_user(uid)["mymeet_spreadsheet_id"] == "O" * 30
+
+    def test_only_spreadsheet_id_or_google_sheets_url_is_accepted(self):
+        import main
+        sheet_id = "A" * 30
+        assert main._mymeet_sheet_id(sheet_id) == sheet_id
+        assert main._mymeet_sheet_id("https://docs.google.com/spreadsheets/d/" + sheet_id + "/edit") == sheet_id
+        assert main._mymeet_sheet_id("https://example.test/spreadsheets/d/" + sheet_id) is None
+        assert main._mymeet_sheet_id("abc") is None
+
+    def test_metadata_probe_does_not_write(self):
+        import main
+        client = MagicMock()
+        with patch.object(main.mymeet_sync, "_gs_client", return_value=client), \
+                patch.object(main.mymeet_sync, "require_spreadsheet_editor") as require_editor:
+            main._check_mymeet_sheet_access("A" * 30)
+        require_editor.assert_called_once_with("A" * 30)
+        assert client.method_calls == [
+            call.http_client.set_timeout(15),
+            call.http_client.fetch_sheet_metadata(
+                "A" * 30, params={"fields": "spreadsheetId"}
             ),
         ]
-        for url, expected_id in cases:
-            m = re.search(pattern, url)
-            assert m is not None, f"Паттерн не нашёл ID в: {url}"
-            assert m.group(1) == expected_id, f"Ожидался {expected_id!r}, получен {m.group(1)!r}"
 
-    def test_step2_short_id_rejected(self):
-        """Строка короче 20 символов не проходит проверку длины."""
-        # Прямая проверка условия из кода: len(sheet_id) < 20
-        short_ids = ["1234", "abc", "ABCDEFGHIJ"]
-        for sid in short_ids:
-            assert len(sid) < 20, f"Тест неправильный: {sid!r} длиннее 20"
-
-    # ------------------------------------------------------------------ проверка saved = 1
-
-    @pytest.mark.asyncio
-    async def test_repeated_save_does_not_wipe_google_tokens(self, tmp_path, monkeypatch):
+    def test_repeated_save_does_not_wipe_google_tokens(self, tmp_path, monkeypatch):
         """Повторный /setup_mymeet не затирает Google-токены пользователя."""
         import sys, sqlite3
         db_path = tmp_path / "resave_test.db"
@@ -752,340 +690,6 @@ class TestMymeetSetupTwoStep:
         import crypto
         assert crypto.is_encrypted(user["mymeet_token"])
 
-    @pytest.mark.asyncio
-    async def test_step2_setup_done_flag_set_in_db(self, db_mod):
-        """После шага 2 mymeet_setup_done=1 в реальной БД."""
-        mock_message = AsyncMock()
-        mock_message.reply_text = AsyncMock()
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-        mock_context = MagicMock()
-        mock_context.user_data = {
-            "mymeet_setup": {
-                "step": "mymeet_sheet",
-                "token": _mk_tok("good_token_abcdef123456789"),
-                "ws_id": "active",
-            }
-        }
-
-        with patch("db.save_mymeet_config", side_effect=db_mod.save_mymeet_config), \
-             patch("db.get_user", side_effect=db_mod.get_user):
-            import main as m
-            await m._handle_mymeet_setup(
-                telegram_id=55667788,
-                text="1_c3rMhDnA-hKJu_NTkq0pca-_-clyrgFoQRj1Iu9Re0",
-                update=mock_update,
-                context=mock_context,
-            )
-
-        user = db_mod.get_user(55667788)
-        assert user["mymeet_setup_done"] == 1, \
-            f"mymeet_setup_done={user['mymeet_setup_done']} — ожидался 1"
-        # После синка доступен расшифрованный токен
-        users = db_mod.get_mymeet_users()
-        assert len(users) == 1
-        assert users[0]["mymeet_token"] == _mk_tok("good_token_abcdef123456789")
-    # ------------------------------------------------------------------ restart guard
-
-    @pytest.mark.asyncio
-    async def test_restart_guard_notifies_via_handle_text(self, db_mod, monkeypatch):
-        """
-        Полная потеря context.user_data (перезапуск бота) при mymeet_setup_in_progress=1.
-        Тест идёт через handle_text — реальный диспетчер — а не прямой вызов
-        _handle_mymeet_setup. Пользователь должен получить уведомление об устаревшей
-        сессии; in_progress должен очиститься.
-        """
-        # Выставляем DB-флаг, имитируя, что wizard был запущен до перезапуска
-        db_mod.set_mymeet_setup_in_progress(55667788, True)
-        user_before = db_mod.get_user(55667788)
-        assert user_before["mymeet_setup_in_progress"] == 1
-
-        # Мок апдейта — пользователь прислал что-то (не команду) после перезапуска бота
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(side_effect=lambda *a, **kw: reply_calls.append((a, kw)))
-        mock_message.text = "some_random_message_or_sheet_id"
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-
-        # context.user_data полностью пусто — имитирует потерю при перезапуске
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-
-        # Патчим db и _require_google чтобы не выходить за рамки теста
-        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.set_mymeet_setup_in_progress",
-                   side_effect=db_mod.set_mymeet_setup_in_progress),              patch("main._require_google", new=AsyncMock(return_value=False)):
-            import main as m
-            await m.handle_text(mock_update, mock_context)
-
-        # Пользователь получил уведомление об устаревшей сессии
-        assert len(reply_calls) == 1, f"Ожидался 1 ответ, получено {len(reply_calls)}"
-        reply_text = reply_calls[0][0][0]
-        assert "устарела" in reply_text or "перезапуск" in reply_text.lower(), (
-            f"Ожидалось сообщение об устаревшей сессии, получено: {reply_text!r}"
-        )
-        assert "/setup_mymeet" in reply_text, "Нет подсказки /setup_mymeet в ответе"
-
-        # DB-флаг очищен
-        user_after = db_mod.get_user(55667788)
-        assert user_after["mymeet_setup_in_progress"] == 0, (
-            "mymeet_setup_in_progress не сброшен после уведомления"
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_wizard_no_intercept_via_handle_text(self, db_mod, monkeypatch):
-        """
-        Если mymeet_setup_in_progress=0 (обычный пользователь), handle_text
-        НЕ перехватывает сообщение — wizard не мешает другим сценариям.
-        """
-        # in_progress=0 — не трогали wizard
-        user_row = db_mod.get_user(55667788)
-        assert user_row["mymeet_setup_in_progress"] == 0
-
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(side_effect=lambda *a, **kw: reply_calls.append((a, kw)))
-        mock_message.text = "привет, помоги мне"
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-
-        # _require_google = False означает, что Google не подключён, бот ответит об этом —
-        # но главное, что wizard-уведомление НЕ сработает
-        require_google_calls = []
-
-        async def fake_require_google(upd):
-            require_google_calls.append(upd)
-            return False  # имитируем: Google не подключён, дальнейшая обработка не нужна
-
-        with patch("db.get_user", side_effect=db_mod.get_user),              patch("db.set_mymeet_setup_in_progress",
-                   side_effect=db_mod.set_mymeet_setup_in_progress),              patch("main._require_google", side_effect=fake_require_google):
-            import main as m
-            await m.handle_text(mock_update, mock_context)
-
-        # Wizard не перехватил — _require_google был вызван (нормальный сценарий)
-        assert len(require_google_calls) == 1, (
-            "Ожидалось что _require_google вызван, wizard не должен перехватывать"
-        )
-        # Пользователь НЕ получил "сессия устарела"
-        for call in reply_calls:
-            text = call[0][0]
-            assert "устарела" not in text, f"Wizard неожиданно перехватил: {text!r}"
-
-
-    # ── P1 regression: Google Sheets URL routing ─────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_p1_sheets_url_reconstructs_wizard_via_pending(self, db_mod, monkeypatch):
-        """
-        P1 regression: бот перезапустился после шага 1 (токен принят, pending сохранён).
-        Пользователь присылает ссылку на Google Таблицу.
-        Ожидаем: wizard восстанавливается из DB, save_mymeet_config вызывается успешно.
-        """
-        # Выставляем состояние: wizard в прогрессе, pending-данные в DB
-        db_mod.set_mymeet_setup_in_progress(55667788, True)
-        db_mod.save_mymeet_pending(55667788, _mk_tok("valid_pending_tok_xyz"), "ws-active")
-
-        user_before = db_mod.get_user(55667788)
-        assert user_before["mymeet_setup_in_progress"] == 1
-        assert user_before["mymeet_pending_token"] is not None
-
-        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
-
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(
-            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
-        )
-        mock_message.text = SHEET_URL
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-
-        # context.user_data пусто — имитирует потерю при перезапуске бота
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-
-        # Захватываем реальную функцию ДО патча, чтобы избежать рекурсии
-        _real_save = db_mod.save_mymeet_config
-        save_calls = []
-
-        def fake_save_mymeet_config(telegram_id, token, ws_id, spreadsheet_id, **kw):
-            save_calls.append(dict(
-                telegram_id=telegram_id, token=token,
-                ws_id=ws_id, spreadsheet_id=spreadsheet_id,
-            ))
-            # Вызываем реальную функцию (не патч) для сброса pending/in_progress
-            _real_save(telegram_id, token, ws_id, spreadsheet_id, **kw)
-
-        with patch("db.get_user", side_effect=db_mod.get_user), \
-             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
-             patch("db.set_mymeet_setup_in_progress",
-                   side_effect=db_mod.set_mymeet_setup_in_progress), \
-             patch("db.save_mymeet_config", side_effect=fake_save_mymeet_config):
-            import main as m
-            await m.handle_text(mock_update, mock_context)
-
-        # save_mymeet_config должен быть вызван с правильным spreadsheet_id
-        assert len(save_calls) == 1, (
-            f"save_mymeet_config должен быть вызван 1 раз, вызвано {len(save_calls)}\n"
-            f"reply_calls: {reply_calls}"
-        )
-        assert save_calls[0]["ws_id"] == "ws-active"
-        expected_sheet_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
-        assert save_calls[0]["spreadsheet_id"] == expected_sheet_id, (
-            f"spreadsheet_id={save_calls[0]['spreadsheet_id']!r}"
-        )
-
-        # Ответ пользователю — успех, НЕ "Не понял дату"
-        assert reply_calls, "Ожидался ответ пользователю"
-        reply_text = reply_calls[-1][0][0]
-        assert "Не понял дату" not in reply_text, f"P1 regression: дата-парсер ответил: {reply_text!r}"
-        assert "MYmeet" in reply_text or "настроен" in reply_text.lower(), (
-            f"Ожидалось подтверждение настройки, получено: {reply_text!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_p1_sheets_url_no_wizard_shows_helpful_message(self, db_mod, monkeypatch):
-        """
-        P1 safety net: пользователь присылает ссылку на Google Таблицу,
-        но in_progress=0 (старый код до PR #6 не выставил флаг).
-        Ожидаем: НЕ «Не понял дату», а подсказку запустить /setup_mymeet.
-        """
-        # in_progress=0 — не выставляли (имитируем старый код)
-        user_row = db_mod.get_user(55667788)
-        assert user_row["mymeet_setup_in_progress"] == 0
-
-        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
-
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(
-            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
-        )
-        mock_message.text = SHEET_URL
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-
-        with patch("db.get_user", side_effect=db_mod.get_user), \
-             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
-             patch("main._require_google", new=AsyncMock(return_value=False)):
-            import main as m
-            await m.handle_text(mock_update, mock_context)
-
-        # НЕ «Не понял дату» — safety net перехватила
-        assert reply_calls, "Ожидался ответ пользователю"
-        reply_text = reply_calls[-1][0][0]
-        assert "Не понял дату" not in reply_text, (
-            f"P1 regression: дата-парсер ответил вместо safety net: {reply_text!r}"
-        )
-        assert "setup_mymeet" in reply_text or "MYmeet" in reply_text, (
-            f"Ожидалась подсказка /setup_mymeet, получено: {reply_text!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_p1_restart_no_pending_shows_expired(self, db_mod, monkeypatch):
-        """
-        P1 regression (граничный случай): in_progress=1 но pending-данных нет.
-        Пользователь получает «сессия устарела», НЕ «Не понял дату».
-        """
-        db_mod.set_mymeet_setup_in_progress(55667788, True)
-        # НЕ сохраняем pending — имитируем ситуацию когда pending был очищен или не сохранён
-
-        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
-
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(
-            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
-        )
-        mock_message.text = SHEET_URL
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55667788
-
-        mock_context = MagicMock()
-        mock_context.user_data = {}
-
-        with patch("db.get_user", side_effect=db_mod.get_user), \
-             patch("db.get_mymeet_pending", side_effect=db_mod.get_mymeet_pending), \
-             patch("db.set_mymeet_setup_in_progress",
-                   side_effect=db_mod.set_mymeet_setup_in_progress):
-            import main as m
-            await m.handle_text(mock_update, mock_context)
-
-        assert reply_calls, "Ожидался ответ пользователю"
-        reply_text = reply_calls[-1][0][0]
-        assert "Не понял дату" not in reply_text, f"P1 regression: дата-парсер ответил: {reply_text!r}"
-        assert "устарела" in reply_text or "перезапуск" in reply_text.lower() or "setup_mymeet" in reply_text, (
-            f"Ожидалось сообщение об устаревшей сессии, получено: {reply_text!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# БЛОК 8: Регрессионные тесты порядка хендлеров и атомарности pending
-# ---------------------------------------------------------------------------
-
-class TestHandlerRegistrationOrder:
-    """Проверяем, что Google Sheets URL доходит до handle_text,
-    а не перехватывается другим MessageHandler (если он когда-то появится выше)."""
-
-    @pytest.mark.asyncio
-    async def test_sheets_url_reaches_handle_text_not_intercepted(self):
-        """Регрессия: Sheets URL не должен уходить в обработчик дат.
-
-        Порядок регистрации в main.py:
-          1. CommandHandler — срабатывает только на /команды
-          2. CallbackQueryHandler(mymeet_ws:) — только inline-кнопки
-          3. MessageHandler(VOICE) — только голосовые
-          4. MessageHandler(TEXT & ~COMMAND) = handle_text — весь текст
-
-        Нет TEXT-хендлера выше handle_text, который мог бы перехватить Sheets URL.
-        Этот тест проверяет, что handle_text получает управление и safety-net работает.
-        """
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        SHEET_URL = "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit"
-
-        mock_message = AsyncMock()
-        reply_calls = []
-        mock_message.reply_text = AsyncMock(
-            side_effect=lambda *a, **kw: reply_calls.append((a, kw))
-        )
-        mock_message.text = SHEET_URL
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 99991111
-
-        mock_context = MagicMock()
-        mock_context.user_data = {}  # нет активного wizard
-
-        with patch("db.get_user", return_value=None), \
-             patch("db.get_mymeet_pending", return_value=None), \
-             patch("main._require_google", new=AsyncMock(return_value=False)):
-            import main as m
-            result = await m.handle_text(mock_update, mock_context)
-
-        # handle_text вернул True (обработал) или False (передал дальше без ошибки)
-        # Главное — НЕТ вызовов «Не понял дату» или «Введи дату»
-        for args, kwargs in reply_calls:
-            msg_text = args[0] if args else ""
-            assert "Не понял дату" not in msg_text, (
-                f"Регрессия порядка хендлеров: Sheets URL попал в дата-парсер: {msg_text!r}"
-            )
-            assert "Введи дату" not in msg_text, (
-                f"Регрессия порядка хендлеров: Sheets URL попал в дата-парсер: {msg_text!r}"
-            )
-
 
 class TestPendingSaveAtomicity:
     """Проверяем атомарное сохранение pending-состояния wizard'а."""
@@ -1118,55 +722,3 @@ class TestPendingSaveAtomicity:
         """Для несуществующего пользователя RuntimeError — данные не запишутся."""
         with pytest.raises(RuntimeError, match="не подтвердились"):
             db_mod.save_mymeet_pending(999888777, "tok_abc123def456", "ws-000")
-
-    @pytest.mark.asyncio
-    async def test_pending_save_failure_shows_error_to_user(self, db_mod):
-        """Если save_mymeet_pending выбрасывает — wizard останавливается,
-        пользователь видит ошибку (не '✅ Токен принят!')."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-        import main as m
-
-        FAKE_TOKEN = "mm_valid_token_12345678"
-        FAKE_WS = {"id": "ws-test", "name": "Test WS"}
-
-        db_mod.upsert_user(55500001, "ErrUser")
-        db_mod.set_mymeet_setup_in_progress(55500001, True)
-
-        mock_message = AsyncMock()
-        edit_calls = []
-        # msg = await update.message.reply_text(...) — edit_text вызывается на нём
-        mock_reply_msg = AsyncMock()
-        mock_reply_msg.edit_text = AsyncMock(
-            side_effect=lambda *a, **kw: edit_calls.append((a, kw))
-        )
-        mock_message.reply_text = AsyncMock(return_value=mock_reply_msg)
-        mock_message.text = FAKE_TOKEN
-
-        mock_update = MagicMock()
-        mock_update.message = mock_message
-        mock_update.effective_user.id = 55500001
-
-        mock_context = MagicMock()
-        mock_context.user_data = {"mymeet_setup": {"step": m._SETUP_STEP_TOKEN}}
-
-        with patch("db.get_user", side_effect=db_mod.get_user), \
-             patch("db.save_mymeet_pending",
-                   side_effect=RuntimeError("disk full")), \
-             patch("main.verify_token_and_get_workspace",
-                   return_value=FAKE_WS):
-            result = await m._handle_mymeet_setup(
-                telegram_id=55500001,
-                text=FAKE_TOKEN,
-                update=mock_update,
-                context=mock_context,
-            )
-
-        assert result is True, "_handle_mymeet_setup должен вернуть True"
-        assert edit_calls, "Ожидался вызов msg.edit_text"
-        final_msg = edit_calls[-1][0][0]
-        assert "Токен принят" not in final_msg, (
-            f"Регрессия: wizard продолжился несмотря на ошибку pending: {final_msg!r}"
-        )
-        assert "Не удалось сохранить" in final_msg or "setup_mymeet" in final_msg, (
-            f"Ожидалось сообщение об ошибке, получено: {final_msg!r}"
-        )

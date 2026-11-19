@@ -4,6 +4,7 @@ db.py — слой базы данных (SQLite).
 и поменять «?» на «%s» в запросах.
 """
 
+from contextlib import closing
 import sqlite3
 import time
 import threading
@@ -474,59 +475,24 @@ def save_mymeet_config(
     spreadsheet_id: str,
     organizer_email: Optional[str] = None,
 ) -> None:
-    """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done.
-    Токен шифруется перед записью в базу (Fernet/AES).
-
-    Raises:
-        crypto.CryptoError  — шифрование токена не удалось.
-        RuntimeError        — строка пользователя не обновилась (внутренняя ошибка БД).
-    """
+    """A single transaction promotes the validated configuration and clears its draft."""
     encrypted_token = _crypto.encrypt_token(token)
-    with _lock:
-        conn = _connect()
-        cur = conn.execute("""
-            UPDATE users SET
-                mymeet_token           = ?,
-                mymeet_ws_id           = ?,
-                mymeet_spreadsheet_id  = ?,
-                mymeet_organizer_email = ?,
-                mymeet_setup_done          = 1,
-                mymeet_setup_in_progress   = 0,
-                mymeet_pending_token       = NULL,
-                mymeet_pending_ws_id       = NULL
-            WHERE telegram_id = ?
-        """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
-        if cur.rowcount == 0:
-            # Страховка: UPDATE не нашёл строку (редкий edge-case — гонка или
-            # cmd_setup_mymeet не вызвал upsert_user перед этим).
-            # INSERT ... ON CONFLICT DO UPDATE задаёт ТОЛЬКО mymeet_*-поля
-            # и никогда не трогает google_*, telemost_token и другие данные
-            # пользователя. Если строка существует (гонка) — сработает
-            # ON CONFLICT DO UPDATE и затронет только mymeet_* колонки.
-            conn.execute("""
-                INSERT INTO users (
-                    telegram_id, mymeet_token, mymeet_ws_id,
-                    mymeet_spreadsheet_id, mymeet_organizer_email, mymeet_setup_done
-                ) VALUES (?, ?, ?, ?, ?, 1)
-                ON CONFLICT(telegram_id) DO UPDATE SET
-                    mymeet_token           = excluded.mymeet_token,
-                    mymeet_ws_id           = excluded.mymeet_ws_id,
-                    mymeet_spreadsheet_id  = excluded.mymeet_spreadsheet_id,
-                    mymeet_organizer_email = excluded.mymeet_organizer_email,
-                    mymeet_setup_done      = 1,
-                    mymeet_pending_token   = NULL,
-                    mymeet_pending_ws_id   = NULL
-            """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email))
-        conn.commit()
-        # Верифицируем: читаем обратно и убеждаемся, что setup_done = 1
-        verify = conn.execute(
-            "SELECT mymeet_setup_done FROM users WHERE telegram_id = ?", (telegram_id,)
-        ).fetchone()
-        conn.close()
-    if not verify or not verify[0]:
-        raise RuntimeError(
-            f"save_mymeet_config: данные не сохранены для telegram_id={telegram_id}"
-        )
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("""
+            INSERT INTO users (
+                telegram_id, mymeet_token, mymeet_ws_id, mymeet_spreadsheet_id,
+                mymeet_organizer_email, mymeet_setup_done, mymeet_setup_in_progress
+            ) VALUES (?, ?, ?, ?, ?, 1, 0)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                mymeet_token = excluded.mymeet_token,
+                mymeet_ws_id = excluded.mymeet_ws_id,
+                mymeet_spreadsheet_id = excluded.mymeet_spreadsheet_id,
+                mymeet_organizer_email = excluded.mymeet_organizer_email,
+                mymeet_setup_done = 1,
+                mymeet_setup_in_progress = 0,
+                mymeet_pending_token = NULL,
+                mymeet_pending_ws_id = NULL
+        """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email))
 
 
 def get_mymeet_users() -> list:
@@ -621,25 +587,14 @@ def set_full_name(telegram_id: int, name: str) -> None:
 
 
 def set_mymeet_setup_in_progress(telegram_id: int, active: bool) -> None:
-    """Помечаем пользователя как «wizard запущен» (active=True) или «завершён/отменён» (False).
-    При active=False очищаем также pending-поля (временные данные шага 1).
-    Персистируется в БД — переживает перезапуск бота."""
-    with _lock:
-        conn = _connect()
-        if active:
-            conn.execute(
-                "UPDATE users SET mymeet_setup_in_progress = 1 WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET mymeet_setup_in_progress = 0, "
-                "mymeet_pending_token = NULL, mymeet_pending_ws_id = NULL "
-                "WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-        conn.commit()
-        conn.close()
+    """Start or cancel a draft. Active MYmeet and Google settings remain available."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute(
+            """UPDATE users SET mymeet_setup_in_progress = ?,
+                mymeet_pending_token = NULL, mymeet_pending_ws_id = NULL
+                WHERE telegram_id = ?""",
+            (int(active), telegram_id),
+        )
 
 
 def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
@@ -652,23 +607,16 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
         crypto.CryptoError — шифрование не удалось.
         RuntimeError — данные не подтвердились после коммита (диск, БД).
     """
-    import logging as _diag_log
-    _diag = _diag_log.getLogger(__name__)
-    _diag.error(
-        "DIAG save_mymeet_pending: telegram_id=%s type=%s bool_ws_id=%s bool_token=%s db_path=%s",
-        telegram_id, type(telegram_id).__name__, bool(ws_id), bool(token), str(DB_PATH),
-    )
     encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
-        cur = conn.execute(
+        conn.execute(
             "UPDATE users "
             "SET mymeet_pending_token = ?, mymeet_pending_ws_id = ?, "
             "mymeet_setup_in_progress = 1 "
             "WHERE telegram_id = ?",
             (encrypted_token, ws_id, telegram_id),
         )
-        rowcount = cur.rowcount
         conn.commit()
         verify = conn.execute(
             "SELECT mymeet_pending_token, mymeet_pending_ws_id, mymeet_setup_in_progress "
@@ -676,18 +624,9 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
             (telegram_id,),
         ).fetchone()
         conn.close()
-    _diag.error(
-        "DIAG save_mymeet_pending: rowcount=%s verify_none=%s v0_bool=%s v1_bool=%s v2_bool=%s",
-        rowcount,
-        verify is None,
-        bool(verify[0]) if verify is not None else "N/A",
-        bool(verify[1]) if verify is not None else "N/A",
-        bool(verify[2]) if verify is not None else "N/A",
-    )
     if not verify or not verify[0] or not verify[1] or not verify[2]:
         raise RuntimeError(
-            "save_mymeet_pending: данные не подтвердились после записи "
-            f"(telegram_id={telegram_id})"
+            "save_mymeet_pending: данные не подтвердились после записи"
         )
 
 

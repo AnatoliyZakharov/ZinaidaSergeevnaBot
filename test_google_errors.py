@@ -544,7 +544,8 @@ class _StubFlow:
         cls.calls.append({"scopes": list(scopes), "state": state})
         return cls()
 
-    def fetch_token(self, code):
+    def fetch_token(self, code, timeout):
+        assert timeout == 15
         if _StubFlow.next_exc is not None:
             raise _StubFlow.next_exc
         self.credentials = _StubFlow.next_creds
@@ -570,11 +571,11 @@ def _callback_env(db, auth):
 
     ns = _load_main_async(["oauth_callback", "_oauth_granted_text"], {
         "auth": auth, "_bot": _Bot(), "logger": _Logger(), "html_lib": html,
-        "web": NS(Request=object, Response=lambda text, content_type: NS(
-            text=text, content_type=content_type, status=200))})
+        "web": NS(Request=object, Response=lambda text, content_type, status=200: NS(
+            text=text, content_type=content_type, status=status))})
 
-    def call(code="c0de", state="st"):
-        req = NS(rel_url=NS(query={"code": code, "state": state}))
+    def call(code="c0de", state="st", **query):
+        req = NS(rel_url=NS(query={"code": code, "state": state, **query}))
         return asyncio.run(ns["oauth_callback"](req))
     return call, sent, logs
 
@@ -614,11 +615,14 @@ def test_oauth_callback_granted_scopes():
             assert auth.exchange_code("c0de", "st") is None
 
 
-def test_oauth_callback_errors_not_500():
+def test_oauth_callback_exchange_error_status():
     import oauthlib.oauth2.rfc6749.errors as oerr
-    for exc in (Warning('Scope has changed from "a" to "b".'),
-                oerr.InvalidGrantError(description="Bad Request"),
-                ConnectionError("network"), ValueError("boom FAKE-ACCESS-TOKEN-LEAKED")):
+    for exc, expected_status in (
+        (Warning('Scope has changed from "a" to "b".'), 502),
+        (oerr.InvalidGrantError(description="Bad Request"), 400),
+        (ConnectionError("network"), 503),
+        (ValueError("boom FAKE-ACCESS-TOKEN-LEAKED"), 502),
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             db = _auth_db(tmp, refresh_token="rt-old", access="at-old")
             auth = load_auth(db)
@@ -627,11 +631,12 @@ def test_oauth_callback_errors_not_500():
             db.save_oauth_state("st", 1)
             before = _tokens(db)
             call, sent, logs = _callback_env(db, auth)
-            resp = call()                                      # не бросает → не 500
+            resp = call()
+            assert resp.status == expected_status
             assert "Не удалось завершить авторизацию, запросите ссылку заново: /connect" \
                 in resp.text, resp.text
             assert sent == [] and _tokens(db) == before
-            assert logs and type(exc).__name__ in logs[0] and "category=" in logs[0]
+            assert logs and "category=" in logs[0]
             _assert_no_leaks("\n".join(logs))
     _StubFlow.next_exc = None
     # неизвестный state
@@ -641,7 +646,21 @@ def test_oauth_callback_errors_not_500():
         auth.Flow = _StubFlow
         call, sent, logs = _callback_env(db, auth)
         resp = call(state="unknown")
-        assert "просроченный state" in resp.text and sent == []
+        assert resp.status == 400 and "unknown" not in resp.text and sent == []
+
+
+def test_oauth_callback_denial_ignores_sensitive_query():
+    from unittest.mock import Mock
+
+    exchange = Mock(side_effect=AssertionError("refused callback must not exchange a code"))
+    call, sent, logs = _callback_env(None, NS(exchange_code=exchange))
+    private = "sensitive-synthetic-callback-data"
+    resp = call(code=private, state=private, error="access_denied", error_description=private)
+    assert resp.status == 400 and "/connect" in resp.text and private not in resp.text
+    assert private not in "\n".join(logs)
+    assert sent == []
+    exchange.assert_not_called()
+    assert call(code="", state=private).status == 400
 
 
 def _fake_token_response(body: dict):
@@ -776,7 +795,8 @@ TESTS = [
     (test_cmd_tasks_uses_gt_error_text_plain, "/tasks: текст причины без MarkdownV2"),
     (test_no_legacy_no_scope_texts, "Нет ложного «переподключите»"),
     (test_oauth_callback_granted_scopes, "OAuth callback: сообщение по выданным scopes"),
-    (test_oauth_callback_errors_not_500, "OAuth callback: ошибка обмена — не 500"),
+    (test_oauth_callback_exchange_error_status, "OAuth callback: статусы ошибок обмена"),
+    (test_oauth_callback_denial_ignores_sensitive_query, "OAuth callback: отказ и безопасный ответ"),
     (test_real_oauthlib_scope_changed_no_warning, "oauthlib: частичные scopes без Warning"),
     (test_reconnect_keeps_user_data, "Повторный /connect: данные целы, refresh не затирается"),
     (test_connect_text_mentions_both_scopes, "/connect: Календарь и Google Tasks"),

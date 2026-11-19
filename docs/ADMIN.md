@@ -110,6 +110,16 @@ fly machine restart --app calendar-bot-anatolii
 
 ## 6. Частые проблемы
 
+`/setup_mymeet` и `/reset_mymeet` в личном чате запускают замену настроек.
+Прежняя связка токена и таблицы действует до успешного сохранения новой.
+`/cancel` отменяет черновик. После перезапуска начните настройку заново.
+При настройке бот проверяет токен, рабочее пространство и доступ к таблице
+от имени сервисного аккаунта. Для проверки прав редактора бот запрашивает
+только `canEdit` и `canModifyContent` файла через Drive API с областью
+`drive.metadata.readonly`. Если Drive API недоступен или прав редактора нет,
+мастер сохраняет прежнюю настройку. Защита отдельных листов и диапазонов
+проверяется при самой записи. [Drive API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/get)
+
 | Симптом | Причина | Решение |
 |---------|---------|---------|
 | «Error 403: access_denied» при Google OAuth | Не добавлен в Test users | Google Cloud Console → OAuth consent screen → Test users → Add users |

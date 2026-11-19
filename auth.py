@@ -199,11 +199,11 @@ def classify_google_error(exc) -> GoogleErr:
     return GoogleErr("api_error", None, None)
 
 
-def log_google_error(where: str, telegram_id, err: GoogleErr) -> None:
+def log_google_error(where: str, _telegram_id, err: GoogleErr) -> None:
     """Пишет в лог только категорию, HTTP-статус и reason (без message, URL,
     номера проекта, токенов и email)."""
-    logger.warning("Google API error: where=%s telegram_id=%s category=%s status=%s reason=%s",
-                   where, telegram_id, err.category, err.status, err.reason)
+    logger.warning("Google API error: where=%s category=%s status=%s reason=%s",
+                   where, err.category, err.status, err.reason)
 
 
 # ─── OAuth callback ──────────────────────────────────────────
@@ -233,7 +233,7 @@ def exchange_code(code: str, state: str) -> Optional[OAuthResult]:
     """
     telegram_id = db.pop_oauth_state(state)
     if not telegram_id:
-        logger.warning("OAuth: неизвестный или просроченный state=%s", state)
+        logger.warning("OAuth: код отклонён из-за недействительной сессии")
         return None
 
     flow = Flow.from_client_config(
@@ -242,7 +242,7 @@ def exchange_code(code: str, state: str) -> Optional[OAuthResult]:
         redirect_uri=OAUTH_REDIRECT_URI,
         state=state,
     )
-    flow.fetch_token(code=code)
+    flow.fetch_token(code=code, timeout=15)
     creds = flow.credentials
 
     expiry_ts = creds.expiry.timestamp() if creds.expiry else (time.time() + 3600)
@@ -259,8 +259,7 @@ def exchange_code(code: str, state: str) -> Optional[OAuthResult]:
         # пользователь «отключится»); обновляем только access token.
         db.update_access_token(telegram_id, creds.token, expiry_ts)
     granted = _granted_scopes(creds)
-    logger.info("OAuth: токены сохранены для telegram_id=%s (calendar=%s tasks=%s)",
-                telegram_id,
+    logger.info("OAuth: токены сохранены (calendar=%s tasks=%s)",
                 None if granted is None else SCOPE_CALENDAR in granted,
                 None if granted is None else SCOPE_TASKS in granted)
     return OAuthResult(telegram_id, granted)
@@ -295,7 +294,7 @@ def get_credentials_checked(telegram_id: int):
             creds.refresh(GoogleRequest())
             new_expiry = creds.expiry.timestamp() if creds.expiry else (time.time() + 3600)
             db.update_access_token(telegram_id, creds.token, new_expiry)
-            logger.info("OAuth: токен обновлён для telegram_id=%s", telegram_id)
+            logger.info("OAuth: токен обновлён")
         except Exception as e:
             err = classify_google_error(e)
             log_google_error("refresh", telegram_id, err)

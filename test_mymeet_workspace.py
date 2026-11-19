@@ -528,10 +528,16 @@ class TestMymeetSetupTwoStep:
         main.db.init_db()
         uid = 55667788
         main.db.upsert_user(uid, "setup_tester")
+        main.db.save_google_grant(
+            uid, access_token="synthetic-access", refresh_token="synthetic-refresh",
+            expiry=time.time() + 3600, subject="synthetic-subject",
+            granted=["https://www.googleapis.com/auth/drive.file"],
+        )
         main.db.save_mymeet_config(uid, _mk_tok("old_active_key"), "old-workspace", "O" * 30)
         mon = AsyncMock()
         mon.reply_text.return_value = AsyncMock()
-        update = SimpleNamespace(message=mon, effective_chat=SimpleNamespace(type="private"),
+        mon.reply_to_message = None
+        update = SimpleNamespace(message=mon, effective_chat=SimpleNamespace(type="private", id=uid),
                                  effective_user=SimpleNamespace(id=uid, username="setup_tester"))
         return main, uid, update, SimpleNamespace(user_data={})
 
@@ -551,11 +557,12 @@ class TestMymeetSetupTwoStep:
         assert row["mymeet_pending_token"] is None
         assert row["mymeet_token"] == old["mymeet_token"]
         assert token not in repr(context.user_data)
-        with patch.object(main, "_check_mymeet_sheet_access") as verify:
+        version = main.db.get_google_grant(uid)["version"]
+        with patch.object(main, "_check_mymeet_sheet_access", return_value=version) as verify:
             assert await main._handle_mymeet_setup(
                 uid, "https://docs.google.com/spreadsheets/d/" + "N" * 30 + "/edit?gid=0", update, context
             )
-        verify.assert_called_once_with("N" * 30)
+        verify.assert_called_once_with("N" * 30, uid)
         row = main.db.get_user(uid)
         assert main._crypto.decrypt_token(row["mymeet_token"]) == token
         assert (row["mymeet_ws_id"], row["mymeet_spreadsheet_id"]) == ("active", "N" * 30)
@@ -601,7 +608,7 @@ class TestMymeetSetupTwoStep:
         checked = asyncio.Event()
         proceed = asyncio.Event()
 
-        async def fake_thread(func, sheet_id):
+        async def fake_thread(func, sheet_id, telegram_id):
             checked.set()
             await proceed.wait()
 
@@ -634,19 +641,12 @@ class TestMymeetSetupTwoStep:
         assert main._mymeet_sheet_id("https://example.test/spreadsheets/d/" + sheet_id) is None
         assert main._mymeet_sheet_id("abc") is None
 
-    def test_metadata_probe_does_not_write(self):
+    def test_metadata_probe_uses_confirmed_user(self):
         import main
-        client = MagicMock()
-        with patch.object(main.mymeet_sync, "_gs_client", return_value=client), \
-                patch.object(main.mymeet_sync, "require_spreadsheet_editor") as require_editor:
-            main._check_mymeet_sheet_access("A" * 30)
-        require_editor.assert_called_once_with("A" * 30)
-        assert client.method_calls == [
-            call.http_client.set_timeout(15),
-            call.http_client.fetch_sheet_metadata(
-                "A" * 30, params={"fields": "spreadsheetId"}
-            ),
-        ]
+        with patch.object(main.mymeet_sync, "require_spreadsheet_editor",
+                          return_value="synthetic-grant") as require_editor:
+            assert main._check_mymeet_sheet_access("A" * 30, 7001) == "synthetic-grant"
+        require_editor.assert_called_once_with("A" * 30, 7001)
 
     def test_repeated_save_does_not_wipe_google_tokens(self, tmp_path, monkeypatch):
         """Повторный /setup_mymeet не затирает Google-токены пользователя."""

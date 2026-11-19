@@ -185,7 +185,7 @@ def test_hooks_registered_in_handlers():
         return src[i:min(x for x in (j, k) if x > 0)]
     expect = {
         "cmd_connect": ['"connect_started"'],
-        "oauth_callback": ['"connect_completed"'],
+        "approve_google_link": ['"connect_completed"'],
         "cmd_tasks": ['"tasks_used"', '"first_value", source="tasks"'],
         "cmd_sync_tasks": ['"tasks_used"', '"first_value", source="sync_tasks"'],
         "handle_forwarded": ['"tasks_used", source="forward"'],

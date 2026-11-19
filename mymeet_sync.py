@@ -3,7 +3,7 @@ MYmeet → Google Sheets sync module.
 
 Env vars required:
   MYMEET_TOKEN   — MYmeet API key
-  GOOGLE_SA_KEY  — Google service account JSON (single-line, full content)
+  Google writes require a user-selected file and a verified OAuth grant.
 
 Usage:
   from mymeet_sync import sync_to_sheets_async
@@ -24,8 +24,8 @@ from urllib.parse import quote
 
 import gspread
 import requests
+from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession
-from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +33,8 @@ logger = logging.getLogger(__name__)
 MYMEET_TOKEN      = os.environ.get("MYMEET_TOKEN", "")
 MYMEET_WS_ID      = os.environ.get("MYMEET_WS_ID", "")
 MYMEET_BASE       = "https://backend.mymeet.ai"
-SPREADSHEET_ID    = os.environ.get("MYMEET_SPREADSHEET_ID", "")
 ORGANIZER_EMAIL   = os.environ.get("ORGANIZER_EMAIL", "")
 
-GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 
 # ── Sheet formatting constants ────────────────────────────────────────────────
 STATUS_VALUES = [
@@ -153,32 +150,69 @@ def _gs_call(fn, *args, retries: int = 7, **kwargs):
 
 # ── Google Sheets client ──────────────────────────────────────────────────────
 
-def _service_account_credentials(scopes):
-    creds_json = os.environ.get("GOOGLE_SA_KEY")
-    if not creds_json:
-        raise RuntimeError("GOOGLE_SA_KEY env var is not set")
-    creds_data = json.loads(creds_json)
-    return Credentials.from_service_account_info(creds_data, scopes=scopes)
+class SpreadsheetAuthorizationError(PermissionError):
+    """The current Telegram user's delegated grant does not permit this operation."""
 
 
-def _gs_client() -> gspread.Client:
-    return gspread.authorize(_service_account_credentials(GS_SCOPES))
+def _spreadsheet_grant(telegram_id: int, sheet_id: str, *, expected_version: str | None = None):
+    if not telegram_id or not isinstance(sheet_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
+        raise SpreadsheetAuthorizationError("No selected spreadsheet")
+    import auth
 
+    creds, grant, _reason = auth.get_credentials_and_grant_checked(telegram_id)
+    if (not creds or not grant or not grant.get("version")
+            or auth.SCOPE_DRIVE_FILE not in (grant.get("granted") or ())
+            or (expected_version is not None and grant["version"] != expected_version)):
+        raise SpreadsheetAuthorizationError("No matching user grant for the spreadsheet")
 
-def require_spreadsheet_editor(sheet_id: str) -> None:
-    """Check the file-level edit capability for the Sheets service account."""
-    creds = _service_account_credentials([DRIVE_METADATA_SCOPE])
     url = "https://www.googleapis.com/drive/v3/files/" + quote(sheet_id, safe="")
-    with AuthorizedSession(creds, refresh_timeout=15) as session:
-        response = session.get(
-            url, params={"fields": "capabilities(canEdit,canModifyContent)", "supportsAllDrives": "true"},
-            timeout=15, allow_redirects=False,
-        )
+    fields = "id,mimeType,trashed,isAppAuthorized,capabilities(canEdit,canModifyContent)"
+    try:
+        with AuthorizedSession(creds, refresh_timeout=15) as session:
+            response = session.get(url, params={"fields": fields, "supportsAllDrives": "true"},
+                                   timeout=15, allow_redirects=False)
+    except (requests.RequestException, GoogleAuthError):
+        raise SpreadsheetAuthorizationError("Spreadsheet rights could not be verified") from None
     if response.status_code != 200:
-        raise RuntimeError("Spreadsheet edit capability unavailable")
-    capabilities = response.json().get("capabilities") or {}
-    if capabilities.get("canEdit") is not True or capabilities.get("canModifyContent") is not True:
-        raise PermissionError("Spreadsheet is not editable")
+        raise SpreadsheetAuthorizationError("Spreadsheet rights could not be verified")
+    try:
+        metadata = response.json()
+    except ValueError:
+        raise SpreadsheetAuthorizationError("Spreadsheet rights could not be verified") from None
+    capabilities = metadata.get("capabilities") if isinstance(metadata, dict) else None
+    if (not isinstance(capabilities, dict) or metadata.get("id") != sheet_id
+            or metadata.get("mimeType") != "application/vnd.google-apps.spreadsheet"
+            or metadata.get("trashed") is not False or metadata.get("isAppAuthorized") is not True
+            or capabilities.get("canEdit") is not True or capabilities.get("canModifyContent") is not True):
+        raise SpreadsheetAuthorizationError("The selected spreadsheet is not editable by this user")
+    return creds, grant["version"]
+
+
+def require_spreadsheet_editor(sheet_id: str, telegram_id: int) -> str:
+    """Read-only validation of the exact file selected for MYmeet."""
+    creds, version = _spreadsheet_grant(telegram_id, sheet_id)
+    client = gspread.authorize(creds)
+    client.http_client.set_timeout(15)
+    with client.http_client.session:
+        client.open_by_key(sheet_id)
+    return version
+
+
+def _open_user_spreadsheet(telegram_id: int, sheet_id: str):
+    """Require a stored selection and recheck its current delegated rights."""
+    import db
+
+    version = db.get_sheet_grant_binding(telegram_id, sheet_id)
+    if not version:
+        raise SpreadsheetAuthorizationError("No verified selection for this spreadsheet")
+    creds, _version = _spreadsheet_grant(telegram_id, sheet_id, expected_version=version)
+    client = gspread.authorize(creds)
+    client.http_client.set_timeout(15)
+    try:
+        return client.open_by_key(sheet_id)
+    except (gspread.exceptions.GSpreadException, PermissionError, requests.RequestException, GoogleAuthError):
+        client.http_client.session.close()
+        raise SpreadsheetAuthorizationError("The selected spreadsheet could not be opened") from None
 
 
 def _apply_full_format(
@@ -733,7 +767,7 @@ def _build_user_config(user_config: dict | None) -> dict:
     cfg = user_config or {}
     token    = cfg.get("mymeet_token")          or MYMEET_TOKEN
     ws_id    = cfg.get("mymeet_ws_id")          or MYMEET_WS_ID
-    sheet_id = cfg.get("mymeet_spreadsheet_id") or SPREADSHEET_ID
+    sheet_id = cfg.get("mymeet_spreadsheet_id")
     email    = cfg.get("mymeet_organizer_email") or ORGANIZER_EMAIL
 
     # HTTP headers must be latin-1 encodable. Catch bad token early with
@@ -1303,12 +1337,11 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
     return warnings, my_count, my_title
 
 
-def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder) -> tuple:
+def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder, *, telegram_id: int) -> tuple:
     """Rewrite only the personal «Мои задачи» sheet (+ status colours) without
     touching MYmeet: used by the daily Google Tasks sync and after a forwarded
     Telegram task.  Returns the same tuple as _sync_my_tasks_and_colors."""
-    gc = _gs_client()
-    spreadsheet = gc.open_by_key(sheet_id or SPREADSHEET_ID)
+    spreadsheet = _open_user_spreadsheet(telegram_id, sheet_id)
     return _sync_my_tasks_and_colors(spreadsheet, full_name, rows_builder=rows_builder)
 
 
@@ -1334,6 +1367,8 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     max_new_rows is exceeded, ImportVolumeError is raised with nothing written.
     """
     cfg = _build_user_config(user_config)
+    telegram_id = user_config.get("telegram_id") if user_config else None
+    spreadsheet = _open_user_spreadsheet(telegram_id, cfg["sheet_id"])
     st = stats if stats is not None else {}
     st.update(fetched=0, after_date=0, after_org=0, protocols_failed=0,
               protocols_missing=0, total_tasks=0, new_rows=0, skipped_known=0,
@@ -1412,8 +1447,6 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         else:
             one_time.append(m)
 
-    gc          = _gs_client()
-    spreadsheet = gc.open_by_key(cfg["sheet_id"])
     sheets_written = 0
     all_fmt_warnings: list[str] = []
 
@@ -2357,7 +2390,7 @@ def classify_sync_error(exc: BaseException) -> tuple:
         return AUTO_TRANSIENT, "mymeet_api"
     if isinstance(exc, requests.RequestException):
         return AUTO_TRANSIENT, "mymeet_unavailable"
-    if isinstance(exc, gspread.SpreadsheetNotFound):
+    if isinstance(exc, (SpreadsheetAuthorizationError, gspread.SpreadsheetNotFound)):
         return AUTO_CONFIG, "sheet_access"
     if isinstance(exc, gspread.exceptions.APIError):
         code = getattr(getattr(exc, "response", None), "status_code", None)

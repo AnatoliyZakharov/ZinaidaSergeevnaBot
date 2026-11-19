@@ -423,8 +423,12 @@ def test_db_upgrade_existing_database_preserves_data():
         db.init_db()
         db.init_db()                                       # идемпотентно
         conn = sqlite3.connect(db.DB_PATH)
-        assert conn.execute("SELECT * FROM users").fetchall() == before_users
-        assert [r[1] for r in conn.execute("PRAGMA table_info(users)")] == before_cols
+        after_users = conn.execute("SELECT * FROM users").fetchall()
+        after_cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+        assert after_cols[:len(before_cols)] == before_cols
+        assert [row[:len(before_cols)] for row in after_users] == before_users
+        assert all(value is None for row in after_users for value in row[len(before_cols):])
+        assert {"google_grant_version", "mymeet_sheet_grant_version"} <= set(after_cols)
         assert conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0] == 1
         cols = {r[1] for r in conn.execute("PRAGMA table_info(my_tasks)")}
         assert {"link", "gt_delete_pending", "prev_status"} <= cols
@@ -704,7 +708,7 @@ class _FakeGT:
 
 
 def _ms_with_book(ms, book):
-    def _refresh(sheet_id, full_name, builder):
+    def _refresh(sheet_id, full_name, builder, *, telegram_id):
         return ms._sync_my_tasks_and_colors(book.ss, full_name, rows_builder=builder)
     return NS(refresh_my_tasks_sheet=_refresh)
 
@@ -1049,7 +1053,7 @@ def test_legacy_sheet_migration_and_legacy_mode():
 
 def test_run_sync_outcomes_and_retry_no_duplicates():
     ms, mt = _load_ms(), _load_my_tasks()
-    never = NS(refresh_my_tasks_sheet=lambda *a: (_ for _ in ()).throw(
+    never = NS(refresh_my_tasks_sheet=lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("лист не настроен — не должен вызываться")))
     with tempfile.TemporaryDirectory() as tmp:
         db = _tmp_db(tmp)
@@ -1070,7 +1074,7 @@ def test_run_sync_outcomes_and_retry_no_duplicates():
     with tempfile.TemporaryDirectory() as tmp:
         db = _tmp_db(tmp)
         _user(db)
-        boom = NS(refresh_my_tasks_sheet=lambda *a: (_ for _ in ()).throw(
+        boom = NS(refresh_my_tasks_sheet=lambda *a, **kw: (_ for _ in ()).throw(
             RuntimeError("sheets down token=SECRET")))
         r = mt.run_sync(1, dbm=db, gt=_FakeGT([_gt("a", title="A"), _gt("b", title="B")]),
                         ms=boom)
@@ -1304,11 +1308,13 @@ def test_gtasks_api_wrappers():
 
 def test_auth_scopes_no_gmail_and_no_gt_insert():
     tree = ast.parse((REPO_ROOT / "auth.py").read_text(encoding="utf-8"))
-    scopes = None
-    for n in tree.body:
-        if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "SCOPES" for t in n.targets):
-            scopes = ast.literal_eval(n.value)
-    assert scopes and "https://www.googleapis.com/auth/tasks" in scopes
+    assignments = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                   for target in node.targets if isinstance(target, ast.Name)}
+    scopes = [ast.literal_eval(assignments[item.id] if isinstance(item, ast.Name) else item)
+              for item in assignments["SCOPES"].elts]
+    assert "https://www.googleapis.com/auth/tasks" in scopes
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
     assert not any("gmail" in s or "mail.google" in s for s in scopes), scopes
     # задачи в Google Tasks из Sheets не создаются; удаление — только в delete_task
     for f in ("gtasks.py", "my_tasks.py"):

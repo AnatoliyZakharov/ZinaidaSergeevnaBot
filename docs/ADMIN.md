@@ -41,18 +41,13 @@ fly secrets list --app calendar-bot-anatolii
 fly secrets set ИМЯ=значение --app calendar-bot-anatolii
 ```
 
-### Ротация ENCRYPTION_KEY
+### ENCRYPTION_KEY
 
-Перед ротацией проверь, что зашифрованных данных нет:
-```bash
-fly ssh console --app calendar-bot-anatolii
-sqlite3 /data/bot.db "SELECT COUNT(*) FROM users WHERE mymeet_token IS NOT NULL OR mymeet_pending_token IS NOT NULL;"
-```
-
-Если 0 — безопасно ротировать:
-```bash
-fly secrets set ENCRYPTION_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())") --app calendar-bot-anatolii
-```
+Ключ используется для зашифрованных записей приложения, включая токены и
+сообщения. При ошибке расшифровки сохраняйте записи и исходный ключ. Ротация
+требует отдельного разрешения, инвентаризации всех зашифрованных данных и
+проверенного восстановления. Порядок проверки для PR №53 описан в
+[плане безопасности](pr53-security-rollout.md).
 
 ### Текущие секреты (имена)
 
@@ -62,7 +57,7 @@ fly secrets set ENCRYPTION_KEY=$(python3 -c "from cryptography.fernet import Fer
 | ENCRYPTION_KEY | Fernet-ключ для MYmeet-токенов |
 | GOOGLE_CLIENT_ID | OAuth Client ID |
 | GOOGLE_CLIENT_SECRET | OAuth Client Secret |
-| GOOGLE_SA_KEY | Service Account JSON |
+| GOOGLE_SA_KEY | Прежний Service Account JSON. Новые операции с таблицами используют грант пользователя. |
 | YANDEX_API_KEY | Yandex Cloud API key |
 | YANDEX_FOLDER_ID | Yandex Cloud folder ID |
 | YANDEX_TELEMOST_TOKEN | Яндекс Телемост токен |
@@ -110,19 +105,21 @@ fly machine restart --app calendar-bot-anatolii
 
 ## 6. Частые проблемы
 
-`/setup_mymeet` и `/reset_mymeet` в личном чате запускают замену настроек.
-Прежняя связка токена и таблицы действует до успешного сохранения новой.
+Ссылку `/connect` бот выдаёт в личном чате. После входа в Google проверьте
+показанный аккаунт, введите код из браузера в том же чате и нажмите кнопку
+подтверждения для показанного в Telegram аккаунта.
+
+`/setup_mymeet` и `/reset_mymeet` начинают замену настроек в личном чате.
 `/cancel` отменяет черновик. После перезапуска начните настройку заново.
-При настройке бот проверяет токен, рабочее пространство и доступ к таблице
-от имени сервисного аккаунта. Для проверки прав редактора бот запрашивает
-только `canEdit` и `canModifyContent` файла через Drive API с областью
-`drive.metadata.readonly`. Если Drive API недоступен или прав редактора нет,
-мастер сохраняет прежнюю настройку. Защита отдельных листов и диапазонов
-проверяется при самой записи. [Drive API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/get)
+Выбранная таблица должна быть доступна подключённому Google-аккаунту на
+редактирование и открыта для OAuth-приложения через `drive.file`. Прежний ID
+таблицы сохраняется. Запись блокируется, пока пользователь заново не подтвердит
+связь таблицы с действующим грантом. Защита отдельных диапазонов проверяется
+при записи. [Подготовка перехода](pr53-security-rollout.md)
 
 | Симптом | Причина | Решение |
 |---------|---------|---------|
 | «Error 403: access_denied» при Google OAuth | Не добавлен в Test users | Google Cloud Console → OAuth consent screen → Test users → Add users |
 | Бот не отвечает | Машина упала | fly status, fly logs, fly machine restart |
-| /setup_mymeet — «Не удалось сохранить данные» | ENCRYPTION_KEY не задан | fly secrets set ENCRYPTION_KEY=... |
-| Токены не расшифровываются | Ключ изменился | Пользователю пересетапиться через /setup_mymeet |
+| Не удалось сохранить подключение | Ключ отсутствует, повреждён или не соответствует записям | Проверить исходный ключ с владельцем, сохранив БД и настройки |
+| Токены не расшифровываются | Ключ изменился или данные повреждены | Сохранить записи, проверить исходный ключ и процедуру восстановления |

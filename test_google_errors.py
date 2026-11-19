@@ -5,6 +5,8 @@ JSON-тела из документации/логов (номер проект�
 Запуск: python test_google_errors.py  (также входит в python test_smoke.py)
 """
 import asyncio
+import base64
+import hashlib
 import html
 import importlib.util
 import json
@@ -18,6 +20,8 @@ import time
 import types
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 
 import test_my_tasks as _tm
 from test_my_tasks import (ME, MY_TITLE, PROTO_HDR, REPO_ROOT, _Book, _FakeGT, _gt,  # noqa: F401
@@ -277,8 +281,8 @@ def _auth_db(tmp, refresh_token="rt-old", access="at-old", expiry=None):
 
 
 def _tokens(db, tid=1):
-    u = db.get_user(tid)
-    return u["google_access_token"], u["google_refresh_token"], u["google_token_expiry"]
+    grant = db.get_google_grant(tid)
+    return grant["access_token"], grant["refresh_token"], grant["expiry"]
 
 
 def test_refresh_errors_classified_tokens_kept():
@@ -533,255 +537,227 @@ def test_no_legacy_no_scope_texts():
 
 # ══ 5. OAuth callback и exchange_code ════════════════════════════════════
 
-class _StubFlow:
-    """Flow без сети: fetch_token выдаёт заданные credentials или бросает."""
-    next_creds = None
-    next_exc = None
-    calls = []
-
-    @classmethod
-    def from_client_config(cls, config, scopes, redirect_uri, state=None):
-        cls.calls.append({"scopes": list(scopes), "state": state})
-        return cls()
-
-    def fetch_token(self, code, timeout):
-        assert timeout == 15
-        if _StubFlow.next_exc is not None:
-            raise _StubFlow.next_exc
-        self.credentials = _StubFlow.next_creds
+class _Query(dict):
+    def getall(self, key, default=()):
+        return [self[key]] if key in self else default
 
 
-def _creds(granted, access="at-new", refresh="rt-new"):
-    return NS(token=access, refresh_token=refresh,
-              expiry=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=24),
-              granted_scopes=granted)
+def _oauth_main(auth):
+    response = lambda text, content_type, status, headers: NS(
+        text=text, content_type=content_type, status=status, headers=headers,
+    )
+    return _load_main_async([
+        "cmd_connect", "cmd_confirm_google", "approve_google_link",
+        "oauth_callback", "_oauth_browser_response", "_oauth_granted_text",
+    ], {
+        "auth": auth, "db": auth.db, "logger": logging.getLogger("oauth-test"), "html_lib": html,
+        "web": NS(Request=object, Response=response),
+        "InlineKeyboardMarkup": lambda rows: rows,
+        "InlineKeyboardButton": lambda text, **kw: NS(text=text, **kw),
+        "_user_lock": lambda _tid: asyncio.Lock(),
+    })
 
 
-def _callback_env(db, auth):
-    sent, logs = [], []
-
-    class _Bot:
-        async def send_message(self, chat_id, text, **kw):
-            sent.append((chat_id, text, kw))
-
-    class _Logger:
-        def error(self, msg, *a, **k):
-            logs.append(msg % a if a else msg)
-        info = warning = error
-
-    ns = _load_main_async(["oauth_callback", "_oauth_granted_text"], {
-        "auth": auth, "_bot": _Bot(), "logger": _Logger(), "html_lib": html,
-        "web": NS(Request=object, Response=lambda text, content_type, status=200: NS(
-            text=text, content_type=content_type, status=status))})
-
-    def call(code="c0de", state="st", **query):
-        req = NS(rel_url=NS(query={"code": code, "state": state, **query}))
-        return asyncio.run(ns["oauth_callback"](req))
-    return call, sent, logs
+def _connect_url(auth, user_id=1, chat_id=101):
+    url = auth.get_auth_url(user_id, chat_id)
+    return {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
 
 
-def test_oauth_callback_granted_scopes():
-    full = [SCOPE_CAL, SCOPE_TASKS, SCOPE_EMAIL, "openid"]
+def _callback(ns, state, code="synthetic-google-code", **other):
+    query = _Query(code=code, state=state, **other)
+    return asyncio.run(ns["oauth_callback"](NS(rel_url=NS(query=query))))
+
+
+def _signer_and_public_key():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    from google.auth.crypt import RSASigner
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption())
+    public = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return RSASigner.from_string(private, key_id="fixture-key"), public.decode()
+
+
+def _fake_oidc(auth, params, *, scope=None, access="candidate-access", refresh="candidate-refresh", claims=None,
+               wrong_signature=False, exchange_error=None):
+    """Drive a real OAuth Flow and Google ID-token verifier with synthetic transport."""
+    from google.auth import jwt
+
+    signer, public = _signer_and_public_key()
+    if wrong_signature:
+        signer, _ = _signer_and_public_key()
+    token_claims = dict(iss="https://accounts.google.com", aud=auth.GOOGLE_CLIENT_ID, sub="verified-subject",
+                        email="verified@example.test", email_verified=True, nonce=params["nonce"],
+                        iat=int(time.time()) - 1, exp=int(time.time()) + 300)
+    token_claims.update(claims or {})
+    signed = jwt.encode(signer, token_claims).decode()
+    issued_scopes = [SCOPE_CAL, SCOPE_EMAIL, "openid"] if scope is None else scope
+    body = {"access_token": access, "token_type": "Bearer", "expires_in": 3599,
+            "scope": " ".join(issued_scopes), "id_token": signed}
+    if refresh:
+        body["refresh_token"] = refresh
+    real_from = auth.Flow.from_client_config
+    seen = []
+
+    def request(method, url, **kw):
+        assert method == "POST" and url == "https://oauth2.googleapis.com/token" and kw["timeout"] == 15
+        payload = parse_qs(kw["data"]) if isinstance(kw["data"], str) else {k: [v] for k, v in kw["data"].items()}
+        verifier = payload["code_verifier"][0]
+        digest = hashlib.sha256(verifier.encode()).digest()
+        assert base64.urlsafe_b64encode(digest).decode().rstrip("=") == params["code_challenge"]
+        assert params["code_challenge_method"] == "S256"
+        seen.append(payload["code"][0])
+        if exchange_error:
+            raise exchange_error
+        return NS(status_code=200, text=json.dumps(body), headers={}, request=NS(url=url, headers={}, body=""))
+
+    def cert_request(url, **kw):
+        assert url == "https://www.googleapis.com/oauth2/v1/certs" and kw["timeout"] == 15
+        return NS(status=200, data=json.dumps({"fixture-key": public}).encode())
+
+    def from_config(*a, **kw):
+        flow = real_from(*a, **kw)
+        flow.oauth2session.request = request
+        return flow
+
+    auth.Flow = NS(from_client_config=from_config)
+    auth.GoogleRequest = lambda: cert_request
+    return seen
+
+
+def test_oauth_callback_then_same_telegram_chat_approves():
+    import re
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _auth_db(tmp, expiry=time.time() + 7200)
+        db.set_full_name(1, ME)
+        db.update_user_settings(1, timezone="Asia/Vladivostok")
+        db.save_mymeet_config(1, "synthetic-mymeet", "workspace", "fixture-sheet")
+        auth = load_auth(db)
+        old = _tokens(db)
+        params = _connect_url(auth)
+        assert auth.SCOPE_DRIVE_FILE in params["scope"].split()
+        calls = _fake_oidc(auth, params)
+        ns = _oauth_main(auth)
+
+        with _LogCapture() as logs:
+            browser = _callback(ns, params["state"])
+            assert browser.status == 200 and "verified@example.test" in browser.text
+            assert browser.headers["Cache-Control"] == "no-store"
+            assert browser.headers["Referrer-Policy"] == "no-referrer"
+            match = re.search(r"/confirm_google ([A-Za-z0-9_-]{43})", browser.text)
+            assert match
+            code = match.group(1)
+            assert _tokens(db) == old
+            assert _callback(ns, params["state"]).status == 400
+            assert len(calls) == 1
+            assert auth.confirm_google_link(1, 101, code) is None
+            assert auth.begin_google_confirmation(2, 101, code) is None
+            assert auth.begin_google_confirmation(1, 102, code) is None
+
+            upd = NS(effective_chat=NS(id=101, type="private"), effective_user=NS(id=1),
+                     message=NS(reply_text=AsyncMock(), delete=AsyncMock()))
+            asyncio.run(ns["cmd_confirm_google"](upd, NS(args=[code])))
+            upd.message.delete.assert_awaited_once()
+            text, = upd.message.reply_text.await_args.args
+            approval = upd.message.reply_text.await_args.kwargs["reply_markup"][0][0]
+            assert "verified@example.test" in text and code not in text
+            assert _tokens(db) == old
+            assert auth.begin_google_confirmation(1, 101, code) is None
+            assert auth.confirm_google_link(1, 102, approval.callback_data.split(":")[1]) is None
+
+            upd.callback_query = NS(data=approval.callback_data, answer=AsyncMock(), edit_message_text=AsyncMock())
+            asyncio.run(ns["approve_google_link"](upd, None))
+            assert "Календарь подключён" in upd.callback_query.edit_message_text.await_args.args[0]
+            assert auth.confirm_google_link(1, 101, approval.callback_data.split(":")[1]) is None
+
+        current = db.get_google_grant(1)
+        assert current["subject"] == "verified-subject" and "email" not in current
+        assert current["granted"] == frozenset({SCOPE_CAL, SCOPE_EMAIL, "openid"})
+        assert _tokens(db)[:2] == ("candidate-access", "candidate-refresh")
+        user = db.get_user(1)
+        assert user["mymeet_full_name"] == ME and user["timezone"] == "Asia/Vladivostok"
+        assert user["mymeet_spreadsheet_id"] == "fixture-sheet"
+        for private in (code, approval.callback_data, "verified@example.test", *old[:2], *_tokens(db)[:2]):
+            assert private not in logs.text()
+
+
+def test_oauth_unverified_identity_or_missing_refresh_rejected():
+    from oauthlib.oauth2.rfc6749 import errors as oauth_errors
+
     cases = [
-        (full, "Подключены Google Календарь и Google Tasks", None),
-        (" ".join(full), "Подключены Google Календарь и Google Tasks", None),   # строкой
-        ([SCOPE_CAL, SCOPE_EMAIL, "openid"],
-         "Календарь подключён. Доступ к Google Tasks не выдан — /connect и отметьте Google Tasks",
-         "Подключены"),
-        ([SCOPE_TASKS, "openid"],
-         "Google Tasks подключены. Доступ к Календарю не выдан — слоты и встречи работать "
-         "не будут; /connect и отметьте Календарь", "Подключены"),
-        (None, "Google подключён", "Tasks"),
-        ([], "Google подключён", "Tasks"),
+        ({"claims": {"nonce": "another-nonce"}}, 502),
+        ({"claims": {"aud": "another-client"}}, 502),
+        ({"claims": {"azp": "another-client"}}, 502),
+        ({"claims": {"iss": "https://example.test"}}, 502),
+        ({"claims": {"email_verified": False}}, 502),
+        ({"wrong_signature": True}, 502),
+        ({"refresh": None}, 502),
+        ({"exchange_error": ConnectionError("network")}, 503),
+        ({"exchange_error": oauth_errors.InvalidGrantError(description="sensitive-error")}, 400),
     ]
-    for granted, expect, absent in cases:
+    for fixture, expected_status in cases:
         with tempfile.TemporaryDirectory() as tmp:
-            db = _auth_db(tmp, refresh_token="rt-old", access="at-old")
+            db = _auth_db(tmp)
             auth = load_auth(db)
-            auth.Flow = _StubFlow
-            _StubFlow.next_exc, _StubFlow.next_creds = None, _creds(granted)
-            db.save_oauth_state("st", 1)
-            call, sent, logs = _callback_env(db, auth)
-            resp = call()
-            assert resp.status == 200 and expect in html.unescape(resp.text), resp.text
-            assert len(sent) == 1 and sent[0][0] == 1 and expect in sent[0][1]
-            assert "parse_mode" not in sent[0][2]
-            if absent:
-                assert absent not in sent[0][1], sent[0][1]
-            at, rt, exp = _tokens(db)
-            assert (at, rt) == ("at-new", "rt-new") and exp > time.time()   # токены сохранены
-            assert _StubFlow.calls[-1]["scopes"] == auth.SCOPES
-            # тот же state повторно — уже израсходован
-            assert auth.exchange_code("c0de", "st") is None
+            old = _tokens(db)
+            params = _connect_url(auth)
+            _fake_oidc(auth, params, **fixture)
+            ns = _oauth_main(auth)
+            with _LogCapture() as logs:
+                response = _callback(ns, params["state"])
+                assert response.status == expected_status, (fixture, response.status, logs.text())
+                assert _callback(ns, params["state"]).status == 400
+            assert "sensitive-error" not in response.text + logs.text()
+            assert _tokens(db) == old
 
 
-def test_oauth_callback_exchange_error_status():
-    import oauthlib.oauth2.rfc6749.errors as oerr
-    for exc, expected_status in (
-        (Warning('Scope has changed from "a" to "b".'), 502),
-        (oerr.InvalidGrantError(description="Bad Request"), 400),
-        (ConnectionError("network"), 503),
-        (ValueError("boom FAKE-ACCESS-TOKEN-LEAKED"), 502),
-    ):
-        with tempfile.TemporaryDirectory() as tmp:
-            db = _auth_db(tmp, refresh_token="rt-old", access="at-old")
-            auth = load_auth(db)
-            auth.Flow = _StubFlow
-            _StubFlow.next_exc = exc
-            db.save_oauth_state("st", 1)
-            before = _tokens(db)
-            call, sent, logs = _callback_env(db, auth)
-            resp = call()
-            assert resp.status == expected_status
-            assert "Не удалось завершить авторизацию, запросите ссылку заново: /connect" \
-                in resp.text, resp.text
-            assert sent == [] and _tokens(db) == before
-            assert logs and "category=" in logs[0]
-            _assert_no_leaks("\n".join(logs))
-    _StubFlow.next_exc = None
-    # неизвестный state
+def test_oauth_state_expiry_supersession_denial_and_restart():
     with tempfile.TemporaryDirectory() as tmp:
         db = _auth_db(tmp)
         auth = load_auth(db)
-        auth.Flow = _StubFlow
-        call, sent, logs = _callback_env(db, auth)
-        resp = call(state="unknown")
-        assert resp.status == 400 and "unknown" not in resp.text and sent == []
+        old = _tokens(db)
+        clock = NS(monotonic=Mock(return_value=200), time=time.time)
+        auth.time = clock
+        ns = _oauth_main(auth)
+        expired = _connect_url(auth)
+        clock.monotonic.return_value += auth._LOGIN_TTL
+        assert _callback(ns, expired["state"]).status == 400
+
+        stale = _connect_url(auth)
+        current = _connect_url(auth)
+        assert _callback(ns, stale["state"]).status == 400
+        denial = _callback(ns, current["state"], error="access_denied", error_description="sensitive-marker")
+        assert denial.status == 400 and "sensitive-marker" not in denial.text
+        assert _callback(ns, current["state"]).status == 400
+
+        current = _connect_url(auth)
+        _fake_oidc(auth, current)
+        result = auth.exchange_code("synthetic-google-code", current["state"])
+        assert result
+        assert load_auth(db).begin_google_confirmation(1, 101, result.confirmation_code) is None
+        clock.monotonic.return_value += auth._CONFIRM_TTL
+        assert auth.begin_google_confirmation(1, 101, result.confirmation_code) is None
+        assert _tokens(db) == old
 
 
-def test_oauth_callback_denial_ignores_sensitive_query():
-    from unittest.mock import Mock
-
-    exchange = Mock(side_effect=AssertionError("refused callback must not exchange a code"))
-    call, sent, logs = _callback_env(None, NS(exchange_code=exchange))
-    private = "sensitive-synthetic-callback-data"
-    resp = call(code=private, state=private, error="access_denied", error_description=private)
-    assert resp.status == 400 and "/connect" in resp.text and private not in resp.text
-    assert private not in "\n".join(logs)
-    assert sent == []
-    exchange.assert_not_called()
-    assert call(code="", state=private).status == 400
-
-
-def _fake_token_response(body: dict):
-    def request(method, url, **kw):
-        assert url == "https://oauth2.googleapis.com/token"
-        return NS(status_code=200, text=json.dumps(body), headers={},
-                  request=NS(url=url, headers={}, body=""))
-    return request
-
-
-def test_real_oauthlib_scope_changed_no_warning():
-    """Настоящий oauthlib: Google выдал не все scopes (granular consent)."""
-    from oauthlib.oauth2.rfc6749.parameters import parse_token_response
+def test_connect_only_private_and_scopes_explained():
     auth = load_auth()
-    assert os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE")
-    partial = {"access_token": "at", "token_type": "Bearer", "expires_in": 3599,
-               "refresh_token": "rt",
-               "scope": f"{SCOPE_CAL} {SCOPE_EMAIL} openid"}
-    tok = parse_token_response(json.dumps(partial), scope=auth.SCOPES)   # не бросает Warning
-    assert SCOPE_TASKS not in tok.scopes
-    # контроль: без переменной oauthlib действительно бросает «Scope has changed»
-    saved = os.environ.pop("OAUTHLIB_RELAX_TOKEN_SCOPE")
-    try:
-        try:
-            parse_token_response(json.dumps(partial), scope=auth.SCOPES)
-            raise AssertionError("ожидался Warning без OAUTHLIB_RELAX_TOKEN_SCOPE")
-        except Warning as w:
-            assert "Scope has changed" in str(w)
-    finally:
-        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = saved
-    # сквозной exchange_code на настоящем Flow (HTTP-запрос подменён)
-    with tempfile.TemporaryDirectory() as tmp:
-        db = _auth_db(tmp, refresh_token="rt-old", access="at-old")
-        auth = load_auth(db)
-        real_from = auth.Flow.from_client_config
-
-        class _Flow:
-            @staticmethod
-            def from_client_config(*a, **kw):
-                f = real_from(*a, **kw)
-                f.oauth2session.request = _fake_token_response(partial)
-                return f
-        auth.Flow = _Flow
-        db.save_oauth_state("st", 1)
-        res = auth.exchange_code("c0de", "st")
-        assert res.telegram_id == 1
-        assert res.granted == frozenset({SCOPE_CAL, SCOPE_EMAIL, "openid"})
-        assert _tokens(db)[:2] == ("at", "rt")
-        # все scopes
-        full = dict(partial, scope=" ".join(auth.SCOPES), access_token="at2",
-                    refresh_token="rt2")
-
-        class _Flow2:
-            @staticmethod
-            def from_client_config(*a, **kw):
-                f = real_from(*a, **kw)
-                f.oauth2session.request = _fake_token_response(full)
-                return f
-        auth.Flow = _Flow2
-        db.save_oauth_state("st2", 1)
-        res = auth.exchange_code("c0de", "st2")
-        assert SCOPE_TASKS in res.granted and SCOPE_CAL in res.granted
-        assert _tokens(db)[:2] == ("at2", "rt2")
-
-
-def test_reconnect_keeps_user_data():
-    with tempfile.TemporaryDirectory() as tmp:
-        db = _auth_db(tmp, refresh_token="rt-old", access="at-old")
-        db.set_full_name(1, ME)
-        db.save_mymeet_config(1, "mm-test-token", "ws1", "sheet1", "org@example.com")
-        db.update_user_settings(1, timezone="Asia/Vladivostok", work_start=8, work_end=20)
-        mt = _load_my_tasks()
-        mt.add_forwarded(1, {"title": "Позвонить", "assigner": "Мария",
-                             "task_date": "10.11.2026", "deadline": "",
-                             "source_key": "tg:1:1"}, dbm=db)
-
-        def snapshot():
-            conn = sqlite3.connect(db.DB_PATH)
-            conn.row_factory = sqlite3.Row
-            u = dict(conn.execute("SELECT * FROM users WHERE telegram_id=1").fetchone())
-            rows = [tuple(r) for r in conn.execute("SELECT * FROM my_tasks ORDER BY 1, 2")]
-            conn.close()
-            for k in ("google_access_token", "google_refresh_token", "google_token_expiry"):
-                u.pop(k)
-            return u, rows
-        before = snapshot()
-        assert before[1], "нет строк my_tasks"
-        auth = load_auth(db)
-        auth.Flow = _StubFlow
-        _StubFlow.next_exc = None
-        _StubFlow.next_creds = _creds([SCOPE_CAL, SCOPE_TASKS], access="at-1", refresh="rt-1")
-        db.save_oauth_state("s1", 1)
-        assert auth.exchange_code("c", "s1").telegram_id == 1
-        assert _tokens(db)[:2] == ("at-1", "rt-1") and snapshot() == before
-        # Google не прислал refresh_token — старый не затирается
-        for empty in (None, ""):
-            _StubFlow.next_creds = _creds([SCOPE_CAL, SCOPE_TASKS], access="at-2", refresh=empty)
-            db.save_oauth_state("s2", 1)
-            assert auth.exchange_code("c", "s2").telegram_id == 1
-            at, rt, exp = _tokens(db)
-            assert at == "at-2" and rt == "rt-1" and exp > time.time()
-            assert db.is_google_connected(1) and snapshot() == before
-        assert db.get_user(1)["mymeet_full_name"] == ME
-        assert db.get_user(1)["timezone"] == "Asia/Vladivostok"
-
-
-def test_connect_text_mentions_both_scopes():
-    sent = []
-
-    async def reply_text(text, **kw):
-        sent.append(text)
-    ns = _load_main_async(["cmd_connect"], {
-        "db": NS(upsert_user=lambda *a: None),
-        "auth": NS(get_auth_url=lambda tid: "https://accounts.google.com/x"),
-        "InlineKeyboardMarkup": lambda rows: rows,
-        "InlineKeyboardButton": lambda text, url: (text, url)})
-    upd = NS(effective_user=NS(id=1, username="u"), message=NS(reply_text=reply_text))
+    auth.db.upsert_user = Mock()
+    auth.get_auth_url = Mock(return_value="https://accounts.google.com/example")
+    ns = _oauth_main(auth)
+    reply = AsyncMock()
+    upd = NS(effective_chat=NS(id=101, type="group"), effective_user=NS(id=1, username="fixture"),
+             message=NS(reply_text=reply))
     asyncio.run(ns["cmd_connect"](upd, None))
-    assert sent == ["Нажми кнопку ниже и авторизуйся через Google. Бот запросит доступ к "
-                    "Google Календарю и Google Tasks — отметь обе галочки, иначе часть "
-                    "функций не будет работать."]
+    auth.get_auth_url.assert_not_called()
+    reply.assert_not_awaited()
+    upd.effective_chat.type = "private"
+    asyncio.run(ns["cmd_connect"](upd, None))
+    auth.get_auth_url.assert_called_once_with(1, 101)
+    assert all(word in reply.await_args.args[0] for word in ("Календарю", "Google Tasks", "Drive"))
 
 
 TESTS = [
@@ -794,12 +770,10 @@ TESTS = [
     (test_run_sync_each_category_no_external_ops, "run_sync: тексты по причинам, без операций в GT"),
     (test_cmd_tasks_uses_gt_error_text_plain, "/tasks: текст причины без MarkdownV2"),
     (test_no_legacy_no_scope_texts, "Нет ложного «переподключите»"),
-    (test_oauth_callback_granted_scopes, "OAuth callback: сообщение по выданным scopes"),
-    (test_oauth_callback_exchange_error_status, "OAuth callback: статусы ошибок обмена"),
-    (test_oauth_callback_denial_ignores_sensitive_query, "OAuth callback: отказ и безопасный ответ"),
-    (test_real_oauthlib_scope_changed_no_warning, "oauthlib: частичные scopes без Warning"),
-    (test_reconnect_keeps_user_data, "Повторный /connect: данные целы, refresh не затирается"),
-    (test_connect_text_mentions_both_scopes, "/connect: Календарь и Google Tasks"),
+    (test_oauth_callback_then_same_telegram_chat_approves, "OAuth: PKCE, подпись ID token и явное подтверждение"),
+    (test_oauth_unverified_identity_or_missing_refresh_rejected, "OAuth: неверная личность и неполный грант отклонены"),
+    (test_oauth_state_expiry_supersession_denial_and_restart, "OAuth: истечение, смена, отказ, перезапуск"),
+    (test_connect_only_private_and_scopes_explained, "/connect: личный чат и запрашиваемые права"),
 ]
 
 

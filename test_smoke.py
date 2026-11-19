@@ -57,6 +57,44 @@ def test_no_hardcoded_secrets():
     )
 
 
+def test_legacy_fernet_wire_format_is_not_authentication():
+    import base64
+    from unittest.mock import patch
+
+    import crypto
+    from cryptography.fernet import Fernet
+
+    fernet = Fernet(Fernet.generate_key())
+    valid = fernet.encrypt(b"synthetic fixture").decode()
+    malformed = "gAAAAA" + "not-a-Fernet-value"
+    raw = bytearray(base64.urlsafe_b64decode(valid))
+    raw[-1] ^= 1
+    damaged = base64.urlsafe_b64encode(raw).decode()
+    assert not crypto.is_encrypted(malformed)
+    assert not crypto.is_encrypted(valid[:-10])
+    assert crypto.is_encrypted(valid)
+    assert crypto.is_encrypted(damaged)
+    with patch.object(crypto, "_fernet", fernet):
+        assert crypto.decrypt_token(valid) == "synthetic fixture"
+        try:
+            crypto.decrypt_token(damaged)
+        except crypto.CryptoDecryptError:
+            pass
+        else:
+            raise AssertionError("Corrupted Fernet authenticated unexpectedly")
+
+
+def test_credential_storage_fixture_suite():
+    from io import StringIO
+    from unittest import TextTestRunner, defaultTestLoader
+
+    from test_credential_storage import CredentialStorageTests
+
+    output = StringIO()
+    tests = defaultTestLoader.loadTestsFromTestCase(CredentialStorageTests)
+    assert TextTestRunner(stream=output).run(tests).wasSuccessful(), output.getvalue()
+
+
 def _load_mymeet():
     """Загружаем mymeet_sync с минимальными env-переменными."""
     import importlib.util
@@ -776,9 +814,7 @@ def _mock_sync_env(mod, meta=None, values=None, meta_exc=None):
     else:
         ss.fetch_sheet_metadata.return_value = meta or {"sheets": []}
     ss.values_batch_get.return_value = {"valueRanges": values or []}
-    gc = MagicMock()
-    gc.open_by_key.return_value = ss
-    mod._gs_client = lambda: gc
+    mod._open_user_spreadsheet = lambda telegram_id, sheet_id: ss
     return ss, created
 
 
@@ -1629,8 +1665,12 @@ if __name__ == "__main__":
     tests += _DOCKER_PACKAGING_TESTS + _DEPLOY_MONITOR_TESTS
     from test_bot_reliability import TESTS as _BOT_RELIABILITY_TESTS
     tests += _BOT_RELIABILITY_TESTS
+    tests.append((test_legacy_fernet_wire_format_is_not_authentication, "Fernet: формат и аутентификация"))
     from test_mymeet_reconfiguration import run_mymeet_reconfiguration_tests
     tests.append((run_mymeet_reconfiguration_tests, "MYmeet: атомарная замена конфигурации"))
+    from test_sheet_authorization import run_sheet_authorization_tests
+    tests.append((run_sheet_authorization_tests, "Sheets: делегированные права и отказ без записи"))
+    tests.append((test_credential_storage_fixture_suite, "SQLite: шифрование, миграция копии и восстановление"))
     failed = []
     for fn, label in tests:
         try:

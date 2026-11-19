@@ -312,8 +312,7 @@ class Env:
             conn.commit()
             conn.close()
             self.books[f"sheet-{tid}"] = Book()
-        gc = NS(open_by_key=lambda key: self.books[key].ss)
-        self.ms._gs_client = lambda: gc
+        self.ms._open_user_spreadsheet = lambda telegram_id, sheet_id: self.books[sheet_id].ss
         mt = self.mt
         dbm = self.db
         my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None:

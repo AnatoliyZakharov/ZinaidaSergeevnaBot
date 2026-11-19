@@ -12,7 +12,6 @@ from unittest import IsolatedAsyncioTestCase, defaultTestLoader, TextTestRunner,
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from cryptography.fernet import Fernet
-from gspread.http_client import HTTPClient
 
 
 USER_ID = 700000001
@@ -50,6 +49,11 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
         ))
         self.db.init_db()
         self.db.upsert_user(USER_ID, "fixture")
+        self.grant_version = self.db.save_google_grant(
+            USER_ID, access_token="synthetic-access", refresh_token="synthetic-refresh",
+            expiry=time.time() + 3600, subject="synthetic-subject",
+            granted=["https://www.googleapis.com/auth/drive.file"],
+        )
         self.db.save_mymeet_config(USER_ID, OLD_TOKEN, "old", OLD_SHEET)
         self.update = SimpleNamespace(
             effective_user=SimpleNamespace(id=USER_ID, username="fixture"),
@@ -104,7 +108,7 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
                 CREATE TRIGGER fail_promotion BEFORE UPDATE OF mymeet_token ON users
                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END
             """)
-        metadata = MagicMock()
+        metadata = MagicMock(return_value=self.grant_version)
         with patch.dict(self.bot, _check_mymeet_sheet_access=metadata):
             self.assertTrue(await self.send(NEW_SHEET))
             self.assert_active()
@@ -120,7 +124,7 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
     async def test_expired_and_restarted_drafts_require_setup(self):
         await self.start()
         self.context.user_data["mymeet_setup"]["expires"] = time.monotonic() - 1
-        metadata = MagicMock()
+        metadata = MagicMock(return_value=self.grant_version)
         with patch.dict(self.bot, _check_mymeet_sheet_access=metadata):
             self.assertTrue(await self.send(NEW_SHEET))
             self.assert_active()
@@ -136,8 +140,8 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
         validating = asyncio.Event()
         finish = asyncio.Event()
 
-        async def validate(func, sheet_id):
-            self.assertEqual(sheet_id, NEW_SHEET)
+        async def validate(func, sheet_id, telegram_id):
+            self.assertEqual((sheet_id, telegram_id), (NEW_SHEET, USER_ID))
             validating.set()
             await finish.wait()
 
@@ -152,19 +156,12 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
         self.assert_active()
         self.assertEqual(self.context.user_data["mymeet_setup"]["step"], self.bot["_SETUP_STEP_TOKEN"])
 
-    async def test_sheet_probe_uses_metadata_get_on_pinned_gspread(self):
-        session = MagicMock()
-        session.request.return_value.ok = True
-        session.request.return_value.json.return_value = {"spreadsheetId": NEW_SHEET}
-        client = SimpleNamespace(http_client=HTTPClient(auth=None, session=session))
-        with patch.object(self.ms, "_gs_client", return_value=client), \
-                patch.object(self.ms, "require_spreadsheet_editor") as require_editor:
-            self.bot["_check_mymeet_sheet_access"](NEW_SHEET)
-        require_editor.assert_called_once_with(NEW_SHEET)
-        session.request.assert_called_once_with(
-            method="get", url="https://sheets.googleapis.com/v4/spreadsheets/" + NEW_SHEET,
-            json=None, params={"fields": "spreadsheetId"}, data=None, files=None, headers=None, timeout=15,
-        )
+    async def test_sheet_probe_returns_user_grant_version(self):
+        with patch.object(self.ms, "require_spreadsheet_editor",
+                          return_value="synthetic-grant") as require_editor:
+            version = self.bot["_check_mymeet_sheet_access"](NEW_SHEET, USER_ID)
+        self.assertEqual(version, "synthetic-grant")
+        require_editor.assert_called_once_with(NEW_SHEET, USER_ID)
 
     async def test_token_in_sheet_step_never_reaches_google(self):
         await self.start()
@@ -173,36 +170,6 @@ class MymeetReconfigurationTests(IsolatedAsyncioTestCase):
             self.assertTrue(await self.send(token))
             ns["_check_mymeet_sheet_access"].assert_not_called()
         self.assert_active()
-
-    async def test_drive_checks_editor_without_writing_or_replacing_on_denial(self):
-        session = MagicMock()
-        session.get.return_value.status_code = 200
-        authorization = MagicMock()
-        authorization.return_value.__enter__.return_value = session
-        with patch.object(self.ms, "_service_account_credentials") as creds, \
-                patch.object(self.ms, "AuthorizedSession", authorization), \
-                patch.object(self.ms, "_gs_client") as sheets:
-            for metadata in ({"capabilities": {"canEdit": False}},
-                             {"capabilities": {"canEdit": True, "canModifyContent": False}}, {}):
-                with self.subTest(metadata=metadata):
-                    session.get.return_value.json.return_value = metadata
-                    await self.start()
-                    self.assertTrue(await self.send(NEW_SHEET))
-                    self.assert_active()
-            session.get.return_value.status_code = 403
-            self.assertTrue(await self.send(NEW_SHEET))
-            self.assert_active()
-            sheets.assert_not_called()
-            session.get.return_value.status_code = 200
-            session.get.return_value.json.return_value = {"capabilities": {"canEdit": True, "canModifyContent": True}}
-            self.assertTrue(await self.send(NEW_SHEET))
-            self.assert_active(NEW_TOKEN, "active", NEW_SHEET)
-        creds.assert_called_with(["https://www.googleapis.com/auth/drive.metadata.readonly"])
-        session.get.assert_called_with(
-            "https://www.googleapis.com/drive/v3/files/" + NEW_SHEET,
-            params={"fields": "capabilities(canEdit,canModifyContent)", "supportsAllDrives": "true"},
-            timeout=15, allow_redirects=False,
-        )
 
     async def test_sync_checks_snapshot_after_calendar_fetch(self):
         def replace_during_calendar_check(telegram_id, days):

@@ -14,7 +14,6 @@ ZinaidaSergeevnaBot — мультипользовательский голос�
   WORK_START            — начало рабочего дня по умолчанию (9)
   WORK_END              — конец рабочего дня по умолчанию (19)
   WEBHOOK_HOST          — публичный домен для Telegram webhook (если используется)
-  GOOGLE_SA_KEY         — JSON сервисного аккаунта для записи в Google Sheets (MYmeet)
 """
 
 import asyncio
@@ -380,9 +379,11 @@ def create_telemost_conference(telegram_id: Optional[int] = None) -> Optional[st
     """Создаём конференцию. Используем per-user токен если есть, иначе общий."""
     token = None
     if telegram_id:
-        user = db.get_user(telegram_id)
-        if user:
-            token = user["telemost_token"]
+        try:
+            token = db.get_telemost_token(telegram_id)
+        except Exception as exc:
+            logger.warning("Telemost token unavailable: %s", type(exc).__name__)
+            return None
     if not token:
         token = YANDEX_TELEMOST_TOKEN
     if not token:
@@ -904,27 +905,81 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
     telegram_id = update.effective_user.id
     db.upsert_user(telegram_id, update.effective_user.username)
     _track(telegram_id, "connect_started")
 
-    url = auth.get_auth_url(telegram_id)
+    url = auth.get_auth_url(telegram_id, update.effective_chat.id)
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔗 Войти через Google", url=url)
     ]])
     await update.message.reply_text(
-        "Нажми кнопку ниже и авторизуйся через Google. Бот запросит доступ к "
-        "Google Календарю и Google Tasks — отметь обе галочки, иначе часть функций "
-        "не будет работать.",
+        "Открой ссылку и выбери аккаунт Google. Разреши доступ к Google Календарю и Google Tasks "
+        "для соответствующих функций. Для MYmeet разреши доступ к выбранным файлам Drive.\n\n"
+        "После входа проверь аккаунт на странице подтверждения и выполни указанную команду "
+        "в этом чате. Действующее подключение сохраняется до подтверждения.",
         reply_markup=keyboard,
     )
 
 
-async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_confirm_google(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
     telegram_id = update.effective_user.id
-    db.save_google_tokens(telegram_id, "", "", 0)
+    code = context.args[0] if len(context.args) == 1 else ""
+    if context.args:
+        try:
+            await update.message.delete()
+        except Exception as exc:
+            logger.warning("Google confirmation message deletion failed: %s", type(exc).__name__)
+    review = auth.begin_google_confirmation(telegram_id, update.effective_chat.id, code)
+    if not review:
+        await update.message.reply_text("Код подтверждения недействителен. Запроси новую ссылку: /connect.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Подключить этот аккаунт", callback_data=f"google_confirm:{review.confirmation_code}")
+    ]])
     await update.message.reply_text(
-        "🔌 Google Календарь отключён.\nДля повторного подключения: /connect"
+        f"Google подтвердил аккаунт: {review.email}\n\n"
+        "Если это твой аккаунт, подтверди подключение кнопкой. "
+        "Если аккаунт неверный, не нажимай кнопку и начни заново: /connect.",
+        reply_markup=keyboard,
+    )
+
+
+async def approve_google_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if update.effective_chat.type != "private":
+        await query.answer()
+        return
+    telegram_id = update.effective_user.id
+    await query.answer()
+    try:
+        async with _user_lock(telegram_id):
+            result = auth.confirm_google_link(telegram_id, update.effective_chat.id, query.data.split(":", 1)[1])
+    except Exception as exc:
+        logger.warning("Google grant promotion failed: %s", type(exc).__name__)
+        await query.edit_message_text("Не удалось сохранить подключение. Попробуй /connect ещё раз.")
+        return
+    if not result:
+        await query.edit_message_text("Подтверждение недействительно. Запроси новую ссылку: /connect.")
+        return
+    email, granted = result
+    _track(telegram_id, "connect_completed")
+    await query.edit_message_text(f"{_oauth_granted_text(granted)}\nАккаунт: {email}")
+
+
+async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    telegram_id = update.effective_user.id
+    async with _user_lock(telegram_id):
+        auth.cancel_google_link(telegram_id, update.effective_chat.id)
+        db.disconnect_google_grant(telegram_id)
+    await update.message.reply_text(
+        "🔌 Google отключён.\nДля повторного подключения: /connect"
     )
 
 
@@ -1369,13 +1424,8 @@ def _mymeet_sheet_id(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _check_mymeet_sheet_access(sheet_id: str) -> None:
-    """Verify the spreadsheet and edit capability without writing a cell."""
-    mymeet_sync.require_spreadsheet_editor(sheet_id)
-    client = mymeet_sync._gs_client()
-    client.http_client.set_timeout(15)
-    with client.http_client.session:
-        client.http_client.fetch_sheet_metadata(sheet_id, params={"fields": "spreadsheetId"})
+def _check_mymeet_sheet_access(sheet_id: str, telegram_id: int) -> str:
+    return mymeet_sync.require_spreadsheet_editor(sheet_id, telegram_id)
 
 
 def _is_current_mymeet_draft(context, setup: dict) -> bool:
@@ -1443,7 +1493,8 @@ async def _handle_mymeet_setup(
         setup.update(step=_SETUP_STEP_SHEET, candidate=candidate)
         await msg.edit_text(
             "✅ Токен принят. Шаг 2 из 2: отправь ссылку или ID Google Таблицы.\n"
-            "Дай сервисному аккаунту бота доступ на редактирование. Отмена: /cancel."
+            "Таблица должна быть доступна выбранному в /connect аккаунту на редактирование "
+            "и уже разрешена этому приложению в Google Drive. Отмена: /cancel."
         )
         return True
 
@@ -1457,7 +1508,9 @@ async def _handle_mymeet_setup(
         return True
     encrypted_token, ws_id = setup["candidate"]
     try:
-        await asyncio.to_thread(_check_mymeet_sheet_access, sheet_id)
+        grant_version = await asyncio.to_thread(_check_mymeet_sheet_access, sheet_id, telegram_id)
+        if not grant_version:
+            raise ValueError("Missing Google grant binding")
     except Exception as exc:
         logger.warning("MYmeet setup Sheets access check error: %s", type(exc).__name__)
         await update.message.reply_text(
@@ -1469,7 +1522,10 @@ async def _handle_mymeet_setup(
         async with _user_lock(telegram_id):
             current = _is_current_mymeet_draft(context, setup)
             if current:
-                db.save_mymeet_config(telegram_id, _crypto.decrypt_token(encrypted_token), ws_id, sheet_id)
+                db.save_mymeet_config(
+                    telegram_id, _crypto.decrypt_token(encrypted_token), ws_id, sheet_id,
+                    expected_google_grant_version=grant_version,
+                )
                 context.user_data.pop("mymeet_setup", None)
     except Exception as exc:
         logger.error("MYmeet setup commit error: %s", type(exc).__name__)
@@ -2064,51 +2120,54 @@ async def scheduled_my_tasks_daily(bot: Bot, *, stop_event=None):
 
 # ─── OAuth callback (aiohttp web server) ─────────────────────
 
-async def oauth_callback(request: web.Request) -> web.Response:
-    """GET /oauth/callback?code=…&state=…"""
-    code  = request.rel_url.query.get("code")
-    state = request.rel_url.query.get("state")
-    error = request.rel_url.query.get("error")
+def _oauth_browser_response(text: str, status: int = 200) -> web.Response:
+    """Never cache or forward a callback URL or browser-only confirmation code."""
+    return web.Response(
+        text=text, status=status, content_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
+
+async def oauth_callback(request: web.Request) -> web.Response:
+    """Stage Google credentials; only the originating Telegram chat can promote them."""
+    query = request.rel_url.query
+    code, state, error = query.get("code"), query.get("state"), query.get("error")
+    if any(len(query.getall(key, ())) > 1 for key in ("code", "state", "error")):
+        return _oauth_browser_response("<h2>Ссылка недействительна</h2><p>Запроси новую: /connect.</p>", 400)
     if error or not code or not state:
-        category = "user_denied" if error == "access_denied" else "invalid_request"
-        logger.info("OAuth callback: category=%s", category)
-        return web.Response(
-            text="<h2>Ошибка авторизации</h2><p>Попробуй снова: /connect в боте.</p>",
-            content_type="text/html", status=400,
-        )
+        if state:
+            auth.discard_login_state(state)
+        logger.info("OAuth callback: category=%s", "user_denied" if error == "access_denied" else "invalid_request")
+        return _oauth_browser_response("<h2>Ошибка авторизации</h2><p>Попробуй снова: /connect в боте.</p>", 400)
 
     try:
         result = await asyncio.to_thread(auth.exchange_code, code, state)
-    except Exception as e:
-        err = auth.classify_google_error(e)
-        category = "token_invalid" if getattr(e, "error", None) == "invalid_grant" else err.category
+    except Exception as exc:
+        err = auth.classify_google_error(exc)
+        category = "token_invalid" if getattr(exc, "error", None) == "invalid_grant" else err.category
         status = {"transient": 503, "token_invalid": 400}.get(category, 502)
         logger.warning("OAuth exchange failed: category=%s response_status=%s", category, status)
-        return web.Response(
-            text="<h2>Ошибка авторизации</h2>"
-                 "<p>Не удалось завершить авторизацию, запросите ссылку заново: /connect</p>",
-            content_type="text/html", status=status,
+        return _oauth_browser_response(
+            "<h2>Ошибка авторизации</h2><p>Не удалось завершить авторизацию. Запроси новую ссылку: /connect.</p>",
+            status,
         )
     if not result:
-        return web.Response(
-            text="<h2>Ссылка недействительна</h2><p>Запроси ссылку заново: /connect</p>",
-            content_type="text/html", status=400,
-        )
+        return _oauth_browser_response("<h2>Ссылка недействительна</h2><p>Запроси новую: /connect.</p>", 400)
 
-    telegram_id, granted = result
-    _track(telegram_id, "connect_completed")
-    text = _oauth_granted_text(granted)
-    # Уведомляем пользователя в Telegram (обычный текст, без Markdown)
-    if _bot:
-        try:
-            await _bot.send_message(chat_id=telegram_id, text=text)
-        except Exception as e:
-            logger.error("Не удалось отправить сообщение после OAuth: %s", type(e).__name__)
-
-    return web.Response(
-        text=f"<h2>Готово</h2><p>{html_lib.escape(text)}</p><p>Можешь вернуться в Telegram.</p>",
-        content_type="text/html",
+    email = html_lib.escape(result.email)
+    confirmation_code = html_lib.escape(result.confirmation_code)
+    return _oauth_browser_response(
+        f"<h2>Подтверди аккаунт Google</h2><p>Проверь, что это твой аккаунт: <strong>{email}</strong>.</p>"
+        "<p>Если всё верно, отправь команду в личном чате с ботом, где ты запросил /connect. "
+        "Затем проверь аккаунт ещё раз и подтверди кнопкой в Telegram. "
+        "Код действует 5 минут. Не пересылай его другим.</p>"
+        f"<p><code>/confirm_google {confirmation_code}</code></p>"
+        "<p>Если аккаунт неверный, закрой страницу и запусти /connect снова.</p>"
     )
 
 
@@ -2283,8 +2342,10 @@ async def run_bot():
     # Аналитика (#46): группа -1 — раньше всех обработчиков, обработку не прерывает
     app.add_handler(TypeHandler(Update, _track_activity), group=-1)
     app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("connect",      cmd_connect))
-    app.add_handler(CommandHandler("disconnect",   cmd_disconnect))
+    app.add_handler(CommandHandler("connect", cmd_connect, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("confirm_google", cmd_confirm_google, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("disconnect", cmd_disconnect, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CallbackQueryHandler(approve_google_link, pattern=r"^google_confirm:[A-Za-z0-9_-]{43}$"))
     app.add_handler(CommandHandler("settings",     cmd_settings))
     app.add_handler(CommandHandler("settz",        cmd_settz))
     app.add_handler(CommandHandler("sethours",     cmd_sethours))
@@ -2396,7 +2457,7 @@ async def run_bot():
             return await oauth_callback(request)
         except Exception as exc:
             logger.error("OAuth callback failed: %s", type(exc).__name__)
-            return web.Response(status=500, text="Не удалось завершить авторизацию. Попробуй /connect.")
+            return _oauth_browser_response("<p>Не удалось завершить авторизацию. Попробуй /connect.</p>", 500)
         finally:
             active_callbacks.discard(task)
 

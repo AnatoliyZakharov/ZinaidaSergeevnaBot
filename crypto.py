@@ -16,8 +16,10 @@ crypto.py — шифрование/дешифрование чувствител
       (например, если токен зашифрован другим ключом или повреждён).
 """
 
-import os
+import base64
+import binascii
 import logging
+import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -46,8 +48,8 @@ def _get_fernet() -> Fernet:
             )
         try:
             _fernet = Fernet(raw_key.encode())
-        except (ValueError, Exception) as exc:
-            raise RuntimeError(f"Неверный формат ключа {_ENCRYPTION_KEY_ENV}: {exc}") from exc
+        except (TypeError, ValueError):
+            raise RuntimeError(f"Неверный формат ключа {_ENCRYPTION_KEY_ENV}") from None
     return _fernet
 
 
@@ -66,12 +68,12 @@ def decrypt_token(ciphertext: str) -> str:
     Raises:
         CryptoDecryptError — если расшифровка не удалась.
     """
-    if not ciphertext:
-        raise CryptoDecryptError("Пустая строка — нечего расшифровывать")
+    if not isinstance(ciphertext, str) or not ciphertext:
+        raise CryptoDecryptError("Отсутствует шифротекст")
     f = _get_fernet()
     try:
         return f.decrypt(ciphertext.encode("ascii")).decode("utf-8")
-    except (InvalidToken, Exception) as exc:
+    except (InvalidToken, UnicodeError) as exc:
         # НЕ логируем ciphertext — он может содержать чувствительные данные
         logger.warning("decrypt_token: не удалось расшифровать токен (%s)", type(exc).__name__)
         raise CryptoDecryptError(
@@ -81,5 +83,14 @@ def decrypt_token(ciphertext: str) -> str:
 
 
 def is_encrypted(value: str) -> bool:
-    """Эвристика: зашифрованные Fernet-токены начинаются с 'gAAAAA'."""
-    return bool(value and value.startswith("gAAAAA"))
+    """Recognize the legacy Fernet wire format; decrypt_token authenticates it."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        raw = base64.b64decode(value, altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    # Version byte, timestamp, IV and authentication tag total 57 bytes.
+    # The AES-CBC ciphertext contains at least one padded 16-byte block.
+    return (len(raw) >= 73 and raw[0] == 0x80 and (len(raw) - 57) % 16 == 0
+            and base64.urlsafe_b64encode(raw).decode("ascii") == value)

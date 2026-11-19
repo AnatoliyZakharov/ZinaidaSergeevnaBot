@@ -262,7 +262,8 @@ def _quiet_logger():
 
 
 _MAIN_FUNCS = ["_run_mymeet_auto", "scheduled_mymeet_sync", "_mymeet_auto_notice",
-               "_user_row_to_mymeet_config", "_user_full_name", "_user_lock", "_tz"]
+               "_user_row_to_mymeet_config", "_user_full_name", "_user_lock", "_tz",
+               "_mymeet_config_matches"]
 _MAIN_ASSIGNS = ("MYMEET_AUTO_REASON_TEXT", "_GCAL_REASONS")
 
 
@@ -311,8 +312,7 @@ class Env:
             conn.commit()
             conn.close()
             self.books[f"sheet-{tid}"] = Book()
-        gc = NS(open_by_key=lambda key: self.books[key].ss)
-        self.ms._gs_client = lambda: gc
+        self.ms._open_user_spreadsheet = lambda telegram_id, sheet_id: self.books[sheet_id].ss
         mt = self.mt
         dbm = self.db
         my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None:
@@ -885,10 +885,29 @@ def test_parallel_jobs_serialized_by_user_lock():
         assert events == ["import-start", "import-end", "my_tasks"], events
 
 
+def test_configuration_replaced_after_snapshot_skips_stale_import():
+    """A new configuration arriving while the calendar is queried invalidates the old import."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.force_due()
+        old_state = env.db.mymeet_sync_get(1)
+        calendar = env.ns["_get_gcal_organizer_data_checked"]
+
+        def verify_calendar(tid, days):
+            env.db.save_mymeet_config(tid, "replacement-token", "new-workspace", "new-sheet")
+            return calendar(tid, days)
+
+        env.ns["_get_gcal_organizer_data_checked"] = verify_calendar
+        env.tick()
+        assert env.gcal_calls and env.mm.calls == 0
+        assert env.db.mymeet_sync_get(1) == old_state
+        assert env.db.get_user(1)["mymeet_spreadsheet_id"] == "new-sheet"
+
+
 def test_scheduler_registration():
     """Job — каждые 15 мин, без наложения; старый фиксированный 16:00 UTC убран."""
     src = (_ts.REPO_ROOT / "main.py").read_text(encoding="utf-8")
-    i = src.index("scheduled_mymeet_sync,\n")
+    i = src.index("scheduled(scheduled_mymeet_sync,")
     block = src[i:i + 400]
     assert 'minute="*/15"' in block and "max_instances=1" in block, block
     assert "hour=16" not in block
@@ -919,12 +938,15 @@ def test_logs_have_no_sheet_title_or_names():
                        logging.getLogger()):
                 lg.removeHandler(h)
         text = "\n".join(records)
-        assert "MYmeet auto [1]" in text and "outcome=ok" in text, text
+        assert "MYmeet auto window=" in text and "outcome=ok" in text, text
+        assert "MYmeet auto [1]" not in text and "telegram_id=" not in text, text
         for secret in ("Секретная", "Иван", "Петров", "tok-plain"):
             assert secret not in text, (secret, text)
 
 
 TESTS = [
+    (test_configuration_replaced_after_snapshot_skips_stale_import,
+     "MYmeet авто: перенастройка не запускает устаревший импорт"),
     (test_slot_and_due_daily, "MYmeet авто: слот 19:00, ежедневный запуск, переход даты"),
     (test_timezones_per_user, "MYmeet авто: часовые поясы пользователей"),
     (test_missed_evening_and_first_run, "MYmeet авто: пропущенный вечер, первый запуск, окно"),

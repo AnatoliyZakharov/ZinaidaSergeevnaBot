@@ -4,11 +4,18 @@ db.py — слой базы данных (SQLite).
 и поменять «?» на «%s» в запросах.
 """
 
+from contextlib import closing
+import hashlib
+import hmac
+import json
+import secrets
 import sqlite3
 import time
 import threading
 from pathlib import Path
 from typing import Optional
+
+from cryptography.fernet import Fernet, InvalidToken
 
 import os
 import re
@@ -173,9 +180,18 @@ def init_db() -> None:
         conn.commit()
         # Миграция: добавляем MYmeet-поля если их ещё нет
         _migrate_mymeet(conn)
+        _migrate_add_columns(conn, "users", _CREDENTIAL_COLUMNS)
         _migrate_add_columns(conn, "my_tasks", _MY_TASKS_NEW_COLS)
         _migrate_add_columns(conn, "my_tasks_sync", _MY_TASKS_SYNC_NEW_COLS)
         conn.close()
+
+
+_CREDENTIAL_COLUMNS = [
+    ("google_subject", "TEXT"),
+    ("google_granted_scopes", "TEXT"),
+    ("google_grant_version", "TEXT"),
+    ("mymeet_sheet_grant_version", "TEXT"),
+]
 
 
 # Колонки, добавленные после первой версии таблиц «Мои задачи» (идемпотентно)
@@ -257,50 +273,279 @@ def upsert_user(telegram_id: int, username: Optional[str] = None) -> None:
         conn.close()
 
 
-def save_google_tokens(
-    telegram_id: int,
-    access_token: str,
-    refresh_token: str,
-    expiry: float,          # Unix timestamp
-    calendar_id: str = "primary",
-) -> None:
-    with _lock:
-        conn = _connect()
-        conn.execute("""
-            UPDATE users SET
-                google_access_token  = ?,
-                google_refresh_token = ?,
-                google_token_expiry  = ?,
-                calendar_id          = ?
-            WHERE telegram_id = ?
-        """, (access_token, refresh_token, expiry, calendar_id, telegram_id))
-        conn.commit()
-        conn.close()
+_TOKEN_FIELDS = ("google_access_token", "google_refresh_token", "telemost_token")
+_GOOGLE_TOKEN_FIELDS = _TOKEN_FIELDS[:2]
+_CREDENTIAL_PREFIX = "credential:v1:"
+_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+
+
+def _seal_credential(telegram_id: int, field: str, value, *, encrypt=None):
+    if value is None or value == "":
+        return value
+    body = json.dumps([telegram_id, field, value], ensure_ascii=False)
+    return _CREDENTIAL_PREFIX + (encrypt or _crypto.encrypt_token)(body)
+
+
+def _read_credential(telegram_id: int, field: str, value, *, decrypt=None):
+    if value is None or value == "":
+        return value
+    if not isinstance(value, str):
+        raise CryptoDecryptError("Invalid stored credential type")
+    if not value.startswith("credential:"):
+        return value  # Legacy plaintext.
+    if not value.startswith(_CREDENTIAL_PREFIX):
+        raise CryptoDecryptError("Unsupported stored credential format")
+    try:
+        user, stored_field, token = json.loads(
+            (decrypt or _crypto.decrypt_token)(value[len(_CREDENTIAL_PREFIX):])
+        )
+    except (TypeError, ValueError) as error:
+        raise CryptoDecryptError("Invalid stored credential") from error
+    if user != telegram_id or stored_field != field or not isinstance(token, str) or not token:
+        raise CryptoDecryptError("Invalid stored credential context")
+    return token
+
+
+def _validate_key_witness(conn, telegram_id) -> bool:
+    row = conn.execute(
+        "SELECT mymeet_token, mymeet_pending_token FROM users WHERE telegram_id = ?",
+        (telegram_id,),
+    ).fetchone()
+    for value in row or ():
+        if _crypto.is_encrypted(value):
+            _crypto.decrypt_token(value)
+            return True
+    for field in _TOKEN_FIELDS:
+        witness = conn.execute(
+            f"SELECT telegram_id, {field} FROM users WHERE {field} LIKE 'credential:v1:%' LIMIT 1"
+        ).fetchone()
+        if witness:
+            _read_credential(witness["telegram_id"], field, witness[field])
+            return True
+    for witness in conn.execute(
+        "SELECT mymeet_token, mymeet_pending_token FROM users "
+        "WHERE mymeet_token IS NOT NULL OR mymeet_pending_token IS NOT NULL"
+    ):
+        for value in witness:
+            if _crypto.is_encrypted(value):
+                _crypto.decrypt_token(value)
+                return True
+    return False
+
+
+def _validate_existing_credentials(conn, telegram_id, fields):
+    row = conn.execute(
+        f"SELECT {', '.join(fields)} FROM users WHERE telegram_id = ?", (telegram_id,),
+    ).fetchone()
+    if row:
+        tokens = [_read_credential(telegram_id, field, row[field]) for field in fields]
+        if any(token != row[field] for field, token in zip(fields, tokens)):
+            return  # An existing envelope was authenticated.
+        if not _validate_key_witness(conn, telegram_id) and any(tokens):
+            raise CryptoDecryptError("No trusted encrypted witness for updating legacy credentials")
+
+
+def _serialize_scopes(granted):
+    return json.dumps(sorted(set(granted))) if granted is not None else None
+
+
+def get_google_grant(telegram_id: int) -> Optional[dict]:
+    """Read OAuth credentials explicitly; normal user lookups keep ciphertext."""
+    with _lock, closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT google_access_token, google_refresh_token, google_token_expiry, "
+            "calendar_id, google_subject, google_granted_scopes, google_grant_version "
+            "FROM users WHERE telegram_id = ?", (telegram_id,),
+        ).fetchone()
+    if not row or not row["google_refresh_token"]:
+        return None
+    granted = row["google_granted_scopes"]
+    granted = frozenset(json.loads(granted)) if granted is not None else None
+    return {
+        "access_token": _read_credential(telegram_id, "google_access_token", row["google_access_token"]),
+        "refresh_token": _read_credential(telegram_id, "google_refresh_token", row["google_refresh_token"]),
+        "expiry": row["google_token_expiry"],
+        "calendar_id": row["calendar_id"],
+        "subject": row["google_subject"],
+        "granted": granted,
+        "version": row["google_grant_version"],
+        "drive_file_authorized": _DRIVE_FILE_SCOPE in (granted or ()),
+    }
+
+
+def save_google_grant(telegram_id: int, *, access_token: str, refresh_token: str,
+                      expiry: float, subject: str, granted) -> str:
+    """Atomically promote the whole verified OAuth grant while preserving settings."""
+    if not all((access_token, refresh_token, subject)):
+        raise ValueError("Incomplete verified Google grant")
+    version = secrets.token_urlsafe(24)
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_existing_credentials(conn, telegram_id, _GOOGLE_TOKEN_FIELDS)
+        cur = conn.execute(
+            "UPDATE users SET google_access_token = ?, google_refresh_token = ?, "
+            "google_token_expiry = ?, google_subject = ?, "
+            "google_granted_scopes = ?, google_grant_version = ? WHERE telegram_id = ?",
+            (_seal_credential(telegram_id, "google_access_token", access_token),
+             _seal_credential(telegram_id, "google_refresh_token", refresh_token),
+             expiry, subject, _serialize_scopes(granted), version, telegram_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("No user found for confirmed Google grant")
+    return version
+
+
+def refresh_google_grant(telegram_id: int, expected_version: str | None, *,
+                         access_token: str, expiry: float, refresh_token: str | None = None,
+                         granted=None, expected_refresh_token: str | None = None) -> bool:
+    """Commit a refresh only while the credentials it used are still current."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT google_grant_version, google_refresh_token, google_access_token "
+            "FROM users WHERE telegram_id = ?", (telegram_id,),
+        ).fetchone()
+        if not row or row["google_grant_version"] != expected_version or not row["google_refresh_token"]:
+            return False
+        current_refresh = _read_credential(telegram_id, "google_refresh_token", row["google_refresh_token"])
+        if expected_refresh_token is not None and current_refresh != expected_refresh_token:
+            return False
+        _validate_existing_credentials(conn, telegram_id, _GOOGLE_TOKEN_FIELDS)
+        conn.execute(
+            "UPDATE users SET google_access_token = ?, google_token_expiry = ?, "
+            "google_refresh_token = ?, google_granted_scopes = COALESCE(?, google_granted_scopes) "
+            "WHERE telegram_id = ?",
+            (_seal_credential(telegram_id, "google_access_token", access_token), expiry,
+             (_seal_credential(telegram_id, "google_refresh_token", refresh_token)
+              if refresh_token else row["google_refresh_token"]),
+             _serialize_scopes(granted), telegram_id),
+        )
+        return True
+
+
+def disconnect_google_grant(telegram_id: int) -> None:
+    """Remove an explicit user's grant without changing calendar or Sheet settings."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_existing_credentials(conn, telegram_id, _GOOGLE_TOKEN_FIELDS)
+        conn.execute(
+            "UPDATE users SET google_access_token = '', google_refresh_token = '', "
+            "google_token_expiry = 0, google_subject = NULL, "
+            "google_granted_scopes = NULL, google_grant_version = NULL WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+
+
+def save_google_tokens(telegram_id: int, access_token: str, refresh_token: str,
+                       expiry: float, calendar_id: str = "primary") -> None:
+    """Compatibility setter for integrations without verified grant metadata."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_existing_credentials(conn, telegram_id, _GOOGLE_TOKEN_FIELDS)
+        conn.execute(
+            "UPDATE users SET google_access_token = ?, google_refresh_token = ?, "
+            "google_token_expiry = ?, calendar_id = ?, google_subject = NULL, "
+            "google_granted_scopes = NULL, google_grant_version = NULL WHERE telegram_id = ?",
+            (_seal_credential(telegram_id, "google_access_token", access_token),
+             _seal_credential(telegram_id, "google_refresh_token", refresh_token),
+             expiry, calendar_id, telegram_id),
+        )
 
 
 def update_access_token(telegram_id: int, access_token: str, expiry: float) -> None:
-    """Обновляем только access token после refresh."""
-    with _lock:
-        conn = _connect()
-        conn.execute("""
-            UPDATE users SET
-                google_access_token = ?,
-                google_token_expiry = ?
-            WHERE telegram_id = ?
-        """, (access_token, expiry, telegram_id))
-        conn.commit()
-        conn.close()
+    """Compatibility setter for a legacy access-token refresh."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_existing_credentials(conn, telegram_id, _GOOGLE_TOKEN_FIELDS)
+        conn.execute(
+            "UPDATE users SET google_access_token = ?, google_token_expiry = ? WHERE telegram_id = ?",
+            (_seal_credential(telegram_id, "google_access_token", access_token), expiry, telegram_id),
+        )
+
+
+def get_telemost_token(telegram_id: int) -> Optional[str]:
+    with _lock, closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT telemost_token FROM users WHERE telegram_id = ?", (telegram_id,),
+        ).fetchone()
+    return _read_credential(telegram_id, "telemost_token", row[0]) if row else None
 
 
 def save_telemost_token(telegram_id: int, token: str) -> None:
-    with _lock:
-        conn = _connect()
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_existing_credentials(conn, telegram_id, ("telemost_token",))
         conn.execute(
             "UPDATE users SET telemost_token = ? WHERE telegram_id = ?",
-            (token, telegram_id)
+            (_seal_credential(telegram_id, "telemost_token", token), telegram_id),
         )
-        conn.commit()
-        conn.close()
+
+
+_PRODUCTION_DB_PATH = Path("/data/bot.db")
+
+
+def migrate_credential_envelopes(database_path: Path, *,
+                                 expected_key_fingerprint: str | None = None) -> int:
+    """Explicit offline conversion for a database copy. Never called by app startup."""
+    path = Path(database_path).resolve(strict=True)
+    for active in (DB_PATH, _PRODUCTION_DB_PATH):
+        protected_path = active.resolve()
+        if path == protected_path or (protected_path.exists() and path.samefile(protected_path)):
+            raise ValueError("Credential conversion requires a separate database copy")
+    key = os.environ.get("ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Credential conversion requires ENCRYPTION_KEY")
+    fingerprint_verified = expected_key_fingerprint is not None and hmac.compare_digest(
+        hashlib.sha256(key.encode()).hexdigest(), expected_key_fingerprint,
+    )
+    if expected_key_fingerprint is not None and not fingerprint_verified:
+        raise CryptoDecryptError("Credential conversion key fingerprint did not match")
+    try:
+        fernet = Fernet(key.encode())
+    except (TypeError, ValueError):
+        raise CryptoDecryptError("Invalid credential conversion key") from None
+
+    def encrypt(value):
+        return fernet.encrypt(value.encode()).decode("ascii")
+
+    def decrypt(value):
+        try:
+            return fernet.decrypt(value.encode("ascii")).decode()
+        except (InvalidToken, UnicodeError):
+            raise CryptoDecryptError("Could not authenticate a stored credential") from None
+
+    with _lock, closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        legacy_fields = tuple(field for field in ("mymeet_token", "mymeet_pending_token") if field in columns)
+        fields = ", ".join(("telegram_id", *_TOKEN_FIELDS, *legacy_fields))
+        witnessed = False
+        updates = []
+        for row in conn.execute(f"SELECT {fields} FROM users"):
+            telegram_id = row["telegram_id"]
+            for field in legacy_fields:
+                if _crypto.is_encrypted(row[field]):
+                    decrypt(row[field])
+                    witnessed = True
+            converted = []
+            for field in _TOKEN_FIELDS:
+                previous = row[field]
+                token = _read_credential(telegram_id, field, previous, decrypt=decrypt)
+                if token != previous:
+                    witnessed = True
+                    converted.append(previous)
+                else:
+                    converted.append(_seal_credential(telegram_id, field, token, encrypt=encrypt))
+            if any(value != row[field] for field, value in zip(_TOKEN_FIELDS, converted)):
+                updates.append((*converted, telegram_id))
+        if updates and not (witnessed or fingerprint_verified):
+            raise CryptoDecryptError("No trusted encrypted witness or key fingerprint for conversion")
+        conn.executemany(
+            "UPDATE users SET google_access_token = ?, google_refresh_token = ?, "
+            "telemost_token = ? WHERE telegram_id = ?", updates,
+        )
+        return len(updates)
 
 
 def update_user_settings(
@@ -473,60 +718,54 @@ def save_mymeet_config(
     ws_id: str,
     spreadsheet_id: str,
     organizer_email: Optional[str] = None,
+    *,
+    expected_google_grant_version: str | None = None,
 ) -> None:
-    """Сохраняем MYmeet-конфиг пользователя и помечаем setup_done.
-    Токен шифруется перед записью в базу (Fernet/AES).
+    """A single transaction promotes the validated configuration and clears its draft."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_key_witness(conn, telegram_id)
+        encrypted_token = _crypto.encrypt_token(token)
+        if expected_google_grant_version is not None:
+            grant = conn.execute(
+                "SELECT google_grant_version, google_granted_scopes FROM users WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            if (not grant or grant["google_grant_version"] != expected_google_grant_version
+                    or _DRIVE_FILE_SCOPE not in json.loads(grant["google_granted_scopes"] or "[]")):
+                raise PermissionError("Google grant changed before Sheet confirmation")
+        conn.execute("""
+            INSERT INTO users (
+                telegram_id, mymeet_token, mymeet_ws_id, mymeet_spreadsheet_id,
+                mymeet_organizer_email, mymeet_setup_done, mymeet_setup_in_progress, mymeet_sheet_grant_version
+            ) VALUES (?, ?, ?, ?, ?, 1, 0, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                mymeet_token = excluded.mymeet_token,
+                mymeet_ws_id = excluded.mymeet_ws_id,
+                mymeet_spreadsheet_id = excluded.mymeet_spreadsheet_id,
+                mymeet_organizer_email = excluded.mymeet_organizer_email,
+                mymeet_setup_done = 1,
+                mymeet_setup_in_progress = 0,
+                mymeet_pending_token = NULL,
+                mymeet_pending_ws_id = NULL,
+                mymeet_sheet_grant_version = excluded.mymeet_sheet_grant_version
+        """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email,
+              expected_google_grant_version))
 
-    Raises:
-        crypto.CryptoError  — шифрование токена не удалось.
-        RuntimeError        — строка пользователя не обновилась (внутренняя ошибка БД).
-    """
-    encrypted_token = _crypto.encrypt_token(token)
-    with _lock:
-        conn = _connect()
-        cur = conn.execute("""
-            UPDATE users SET
-                mymeet_token           = ?,
-                mymeet_ws_id           = ?,
-                mymeet_spreadsheet_id  = ?,
-                mymeet_organizer_email = ?,
-                mymeet_setup_done          = 1,
-                mymeet_setup_in_progress   = 0,
-                mymeet_pending_token       = NULL,
-                mymeet_pending_ws_id       = NULL
-            WHERE telegram_id = ?
-        """, (encrypted_token, ws_id, spreadsheet_id, organizer_email, telegram_id))
-        if cur.rowcount == 0:
-            # Страховка: UPDATE не нашёл строку (редкий edge-case — гонка или
-            # cmd_setup_mymeet не вызвал upsert_user перед этим).
-            # INSERT ... ON CONFLICT DO UPDATE задаёт ТОЛЬКО mymeet_*-поля
-            # и никогда не трогает google_*, telemost_token и другие данные
-            # пользователя. Если строка существует (гонка) — сработает
-            # ON CONFLICT DO UPDATE и затронет только mymeet_* колонки.
-            conn.execute("""
-                INSERT INTO users (
-                    telegram_id, mymeet_token, mymeet_ws_id,
-                    mymeet_spreadsheet_id, mymeet_organizer_email, mymeet_setup_done
-                ) VALUES (?, ?, ?, ?, ?, 1)
-                ON CONFLICT(telegram_id) DO UPDATE SET
-                    mymeet_token           = excluded.mymeet_token,
-                    mymeet_ws_id           = excluded.mymeet_ws_id,
-                    mymeet_spreadsheet_id  = excluded.mymeet_spreadsheet_id,
-                    mymeet_organizer_email = excluded.mymeet_organizer_email,
-                    mymeet_setup_done      = 1,
-                    mymeet_pending_token   = NULL,
-                    mymeet_pending_ws_id   = NULL
-            """, (telegram_id, encrypted_token, ws_id, spreadsheet_id, organizer_email))
-        conn.commit()
-        # Верифицируем: читаем обратно и убеждаемся, что setup_done = 1
-        verify = conn.execute(
-            "SELECT mymeet_setup_done FROM users WHERE telegram_id = ?", (telegram_id,)
+
+def get_sheet_grant_binding(telegram_id: int, sheet_id: str) -> Optional[str]:
+    """A verified binding is valid only for its exact target and active grant."""
+    with _lock, closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT mymeet_sheet_grant_version, google_granted_scopes FROM users "
+            "WHERE telegram_id = ? AND mymeet_spreadsheet_id = ? AND mymeet_setup_done = 1 "
+            "AND mymeet_sheet_grant_version = google_grant_version "
+            "AND google_refresh_token IS NOT NULL AND google_refresh_token != ''",
+            (telegram_id, sheet_id),
         ).fetchone()
-        conn.close()
-    if not verify or not verify[0]:
-        raise RuntimeError(
-            f"save_mymeet_config: данные не сохранены для telegram_id={telegram_id}"
-        )
+    if row and _DRIVE_FILE_SCOPE in json.loads(row["google_granted_scopes"] or "[]"):
+        return row["mymeet_sheet_grant_version"]
+    return None
 
 
 def get_mymeet_users() -> list:
@@ -600,7 +839,8 @@ def reset_mymeet_config(telegram_id: int) -> None:
                 mymeet_setup_done        = 0,
                 mymeet_setup_in_progress = 0,
                 mymeet_pending_token     = NULL,
-                mymeet_pending_ws_id     = NULL
+                mymeet_pending_ws_id     = NULL,
+                mymeet_sheet_grant_version = NULL
             WHERE telegram_id = ?
         """, (telegram_id,))
         conn.commit()
@@ -621,25 +861,14 @@ def set_full_name(telegram_id: int, name: str) -> None:
 
 
 def set_mymeet_setup_in_progress(telegram_id: int, active: bool) -> None:
-    """Помечаем пользователя как «wizard запущен» (active=True) или «завершён/отменён» (False).
-    При active=False очищаем также pending-поля (временные данные шага 1).
-    Персистируется в БД — переживает перезапуск бота."""
-    with _lock:
-        conn = _connect()
-        if active:
-            conn.execute(
-                "UPDATE users SET mymeet_setup_in_progress = 1 WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET mymeet_setup_in_progress = 0, "
-                "mymeet_pending_token = NULL, mymeet_pending_ws_id = NULL "
-                "WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-        conn.commit()
-        conn.close()
+    """Start or cancel a draft. Active MYmeet and Google settings remain available."""
+    with _lock, closing(_connect()) as conn, conn:
+        conn.execute(
+            """UPDATE users SET mymeet_setup_in_progress = ?,
+                mymeet_pending_token = NULL, mymeet_pending_ws_id = NULL
+                WHERE telegram_id = ?""",
+            (int(active), telegram_id),
+        )
 
 
 def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
@@ -652,23 +881,16 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
         crypto.CryptoError — шифрование не удалось.
         RuntimeError — данные не подтвердились после коммита (диск, БД).
     """
-    import logging as _diag_log
-    _diag = _diag_log.getLogger(__name__)
-    _diag.error(
-        "DIAG save_mymeet_pending: telegram_id=%s type=%s bool_ws_id=%s bool_token=%s db_path=%s",
-        telegram_id, type(telegram_id).__name__, bool(ws_id), bool(token), str(DB_PATH),
-    )
     encrypted_token = _crypto.encrypt_token(token)
     with _lock:
         conn = _connect()
-        cur = conn.execute(
+        conn.execute(
             "UPDATE users "
             "SET mymeet_pending_token = ?, mymeet_pending_ws_id = ?, "
             "mymeet_setup_in_progress = 1 "
             "WHERE telegram_id = ?",
             (encrypted_token, ws_id, telegram_id),
         )
-        rowcount = cur.rowcount
         conn.commit()
         verify = conn.execute(
             "SELECT mymeet_pending_token, mymeet_pending_ws_id, mymeet_setup_in_progress "
@@ -676,18 +898,9 @@ def save_mymeet_pending(telegram_id: int, token: str, ws_id: str) -> None:
             (telegram_id,),
         ).fetchone()
         conn.close()
-    _diag.error(
-        "DIAG save_mymeet_pending: rowcount=%s verify_none=%s v0_bool=%s v1_bool=%s v2_bool=%s",
-        rowcount,
-        verify is None,
-        bool(verify[0]) if verify is not None else "N/A",
-        bool(verify[1]) if verify is not None else "N/A",
-        bool(verify[2]) if verify is not None else "N/A",
-    )
     if not verify or not verify[0] or not verify[1] or not verify[2]:
         raise RuntimeError(
-            "save_mymeet_pending: данные не подтвердились после записи "
-            f"(telegram_id={telegram_id})"
+            "save_mymeet_pending: данные не подтвердились после записи"
         )
 
 

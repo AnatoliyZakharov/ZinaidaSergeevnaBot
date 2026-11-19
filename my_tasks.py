@@ -1363,12 +1363,16 @@ def run_sync(telegram_id: int, with_gtasks: bool = True, *, dbm=None, gt=None,
         if ms is None:
             import mymeet_sync as ms   # noqa: F811
         try:
-            w, sheet_count, sheet_title = ms.refresh_my_tasks_sheet(sheet_id, full_name, builder)
+            w, sheet_count, sheet_title = ms.refresh_my_tasks_sheet(
+                sheet_id, full_name, builder, telegram_id=telegram_id)
             warnings.extend(w)
+        except PermissionError:
+            text = "Лист «Мои задачи»: подтвердите доступ к выбранной таблице."
+            return {"outcome": OUT_CONFIG, "text": text, "warnings": [text],
+                    "stats": builder.stats, "sheet_count": None, "gt_error": gt_error}
         except Exception as e:
-            logger.warning("my_tasks sheet refresh failed for %s: %s", telegram_id,
-                           type(e).__name__)
-            warnings.append(f"Лист «Мои задачи»: ошибка ({type(e).__name__})")
+            logger.warning("my_tasks sheet refresh failed: %s", type(e).__name__)
+            warnings.append("Лист «Мои задачи»: таблицу не удалось обновить.")
             sheet_error = True
     if not builder.built:
         # Лист не прочитан — сверяем только БД; удаления в GT не планируются

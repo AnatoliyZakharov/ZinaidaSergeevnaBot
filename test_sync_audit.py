@@ -114,7 +114,7 @@ def test_restart_between_protocol_sheets():
 def _load_manual(env):
     return D._load_main(["cmd_sync_mymeet", "_user_lock"], {
         **{k: env.ns[k] for k in ("db", "mymeet_sync", "logger", "asyncio",
-                                  "_user_row_to_mymeet_config", "_my_tasks_locks")},
+                                  "_user_row_to_mymeet_config", "_mymeet_config_matches", "_my_tasks_locks")},
         "Update": object, "ContextTypes": D.NS(DEFAULT_TYPE=object),
         "_get_gcal_organizer_data": lambda tid, days: env.mm.gcal(),
         "sync_to_sheets_async": env.ns["sync_to_sheets_async"],

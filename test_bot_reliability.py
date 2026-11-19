@@ -161,6 +161,186 @@ def test_slow_voice_does_not_block_another_user():
     asyncio.run(scenario())
 
 
+def test_calendar_primary_is_resolved_before_creation_and_bound_to_invitation():
+    api = Mock()
+    api.calendars.return_value.get.return_value.execute.return_value = {
+        "id": "original-calendar@example.test",
+    }
+    events = api.events.return_value
+    events.insert.return_value.execute.return_value = {"id": "synthetic-event"}
+    events.get.return_value.execute.return_value = {"attendees": []}
+    db = NS(get_user=Mock(return_value={"calendar_id": None, "timezone": "UTC"}))
+    ns = _load_main_async(
+        ["_get_calendar_id", "_tz", "create_calendar_event", "add_attendees_to_event"],
+        {"db": db, "pytz": pytz, "timedelta": timedelta,
+         "get_calendar_service": lambda _: api},
+    )
+
+    created = ns["create_calendar_event"](1, "Тестовая встреча", datetime(2026, 11, 19, 10))
+    api.calendars.return_value.get.assert_called_once_with(calendarId="primary")
+    assert events.insert.call_args.kwargs["calendarId"] == "original-calendar@example.test"
+    assert created == {"id": "synthetic-event", "calendar_id": "original-calendar@example.test"}
+
+    db.get_user.return_value["calendar_id"] = "another-calendar@example.test"
+    ns["add_attendees_to_event"](
+        1, created["id"], ["mock@example.test"], calendar_id=created["calendar_id"],
+    )
+    events.get.assert_called_once_with(
+        calendarId="original-calendar@example.test", eventId="synthetic-event",
+    )
+    events.patch.assert_called_once_with(
+        calendarId="original-calendar@example.test", eventId="synthetic-event",
+        body={"attendees": [{"email": "mock@example.test"}]}, sendUpdates="all",
+    )
+
+
+def test_voice_and_text_meetings_keep_invitations_bound_to_their_prompts():
+    async def scenario():
+        from itertools import count
+
+        from telegram import ForceReply
+
+        loop = asyncio.get_running_loop()
+        speech_started = asyncio.Event()
+        release_speech = threading.Event()
+        background = []
+        prompts = {}
+        messages = count(100)
+        bot_id = 900
+        clock = NS(monotonic=Mock(return_value=1000))
+        configured_calendar = Mock(return_value="bravo-calendar@example.test")
+        calendar = Mock(side_effect=lambda user, title, *args: {
+            "id": f"event-{title}", "calendar_id": configured_calendar(),
+        })
+        invite = Mock()
+        query = AsyncMock()
+        text_a = "создай встречу Alpha в 10:00"
+        text_b = "создай встречу Bravo в 10:00"
+
+        def transcribe(audio):
+            assert audio == b"synthetic audio"
+            loop.call_soon_threadsafe(speech_started.set)
+            if not release_speech.wait(3):
+                raise TimeoutError("synthetic SpeechKit gate")
+            return text_a
+
+        def create_task(coro, *, update):
+            background.append(asyncio.create_task(coro))
+            return background[-1]
+
+        def update(text=None, *, reply_to=None, chat_id=27, chat_type="private"):
+            chat = NS(id=chat_id, type=chat_type)
+            message = NS(text=text, reply_to_message=reply_to, message_id=next(messages),
+                         chat=chat, chat_id=chat.id, voice=NS(file_id="synthetic-file"),
+                         from_user=NS(id=1))
+
+            async def reply(text, **options):
+                result = NS(message_id=next(messages), text=text, from_user=NS(id=bot_id),
+                            chat=chat, chat_id=chat.id, edit_text=AsyncMock())
+                markup = options.get("reply_markup")
+                if isinstance(markup, ForceReply):
+                    assert markup.selective
+                    prompts[message.text] = result
+                return result
+
+            message.reply_text = AsyncMock(side_effect=reply)
+            return NS(message=message, effective_message=message, effective_user=message.from_user,
+                      effective_chat=chat)
+
+        file = NS(download_as_bytearray=AsyncMock(return_value=bytearray(b"synthetic audio")))
+        context = NS(application=NS(running=True, create_task=create_task), user_data={},
+                     bot=NS(id=bot_id, get_file=AsyncMock(return_value=file)))
+        ns = _load_main_async(
+            ["handle_voice", "_process_voice", "handle_text", "handle_create_event",
+             "_handle_pending_invite", "_invite_prompts", "_needs_invite_reply"],
+            {"_require_google": AsyncMock(return_value=True),
+             "_handle_mymeet_setup": AsyncMock(return_value=False),
+             "db": NS(get_user=lambda _: {"timezone": "UTC"},
+                      resolve_names_to_emails=lambda user, names: ([], [names])),
+             "transcribe": transcribe, "re": re, "time": clock, "time_module": clock,
+             "pytz": pytz, "timedelta": timedelta, "html_lib": html,
+             "DEFAULT_TZ": "UTC", "ForceReply": ForceReply, "logger": Mock(),
+             "TELEMOST_TRIGGER": re.compile(r"(?!)"), "CREATE_TRIGGER": re.compile("создай встречу"),
+             "TIME_IN_TEXT": re.compile(r"[0-9]{2}:[0-9]{2}"),
+             "INVITE_SKIP": re.compile(r"^готово$"),
+             "parse_date": lambda text, zone: datetime(2026, 11, 19, 10),
+             "extract_event_title": lambda text: text.split()[2],
+             "parse_duration_minutes": lambda _: 30,
+             "date_to_ru": lambda _: "19 ноября",
+             "create_telemost_conference": lambda _: "",
+             "create_calendar_event": calendar,
+             "extract_emails": lambda text: re.findall(r"[a-z]+@example\.test", text),
+             "add_attendees_to_event": invite, "process_query": query},
+            assigns=("_active_voice_users", "_MAX_ACTIVE_VOICES", "_INVITE_PROMPT_PREFIX",
+                     "_INVITE_PROMPT_TTL", "_MAX_INVITE_PROMPTS", "_INVITE_REPLY_HINT",
+                     "_INVITE_STALE_REPLY", "INVITE_VERB_PREFIX"),
+        )
+        voice = update()
+        await ns["handle_voice"](voice, context)
+        try:
+            await asyncio.wait_for(speech_started.wait(), 1)
+            await ns["handle_text"](update(text_b), context)
+            prompt_b = prompts[text_b]
+            assert [call.args[1] for call in calendar.call_args_list] == ["Bravo"]
+            configured_calendar.return_value = "alpha-calendar@example.test"
+        finally:
+            release_speech.set()
+            await asyncio.wait_for(asyncio.gather(*background), 2)
+        prompt_a = prompts[None]
+        assert prompt_a.message_id != prompt_b.message_id
+        assert [call.args[1] for call in calendar.call_args_list] == ["Bravo", "Alpha"]
+        configured_calendar.return_value = "new-primary@example.test"
+
+        normal_query = update("Когда я свободен завтра?")
+        await ns["handle_text"](normal_query, context)
+        query.assert_awaited_once_with(1, normal_query.message.text, normal_query)
+        invite.assert_not_called()
+
+        unbound = update("inviter@example.test")
+        await ns["handle_text"](unbound, context)
+        invite.assert_not_called()
+        assert "ответ" in unbound.message.reply_text.await_args.args[0].lower()
+
+        await ns["handle_text"](update("bravo@example.test", reply_to=prompt_b), context)
+        invite.assert_called_once_with(
+            1, "event-Bravo", ["bravo@example.test"], calendar_id="bravo-calendar@example.test",
+        )
+
+        # A consumed prompt cannot route a second reply to the remaining meeting.
+        stale_reply = update("stale@example.test", reply_to=prompt_b)
+        await ns["handle_text"](stale_reply, context)
+        assert invite.call_count == 1
+        stale_reply.message.reply_text.assert_awaited()
+
+        unknown = NS(**{**vars(prompt_a), "message_id": next(messages)})
+        unknown_reply = update("unknown@example.test", reply_to=unknown)
+        await ns["handle_text"](unknown_reply, context)
+        assert invite.call_count == 1
+        unknown_reply.message.reply_text.assert_awaited()
+
+        other_chat = NS(id=-28, type="group")
+        same_id = NS(**{**vars(prompt_a), "chat": other_chat, "chat_id": other_chat.id})
+        cross_chat = update("group@example.test", reply_to=same_id, chat_id=other_chat.id,
+                            chat_type=other_chat.type)
+        await ns["handle_text"](cross_chat, context)
+        assert invite.call_count == 1
+        cross_chat.message.reply_text.assert_awaited()
+
+        await ns["handle_text"](update("alpha@example.test", reply_to=prompt_a), context)
+        assert invite.call_count == 2
+        assert invite.call_args.args == (1, "event-Alpha", ["alpha@example.test"])
+        assert invite.call_args.kwargs == {"calendar_id": "alpha-calendar@example.test"}
+
+        await ns["handle_text"](update(text_b), context)
+        clock.monotonic.return_value += ns["_INVITE_PROMPT_TTL"] + 1
+        expired_reply = update("expired@example.test", reply_to=prompts[text_b])
+        await ns["handle_text"](expired_reply, context)
+        assert invite.call_count == 2
+        expired_reply.message.reply_text.assert_awaited()
+
+    asyncio.run(scenario())
+
+
 def test_mymeet_sync_command_errors_do_not_disclose_exception():
     private = "sensitive synthetic request data"
     database = NS(upsert_user=Mock(side_effect=ValueError(private)))
@@ -380,6 +560,10 @@ TESTS = [
     (test_html_tasks_and_skip, "Telegram: спецсимволы, даты и выбор задачи через «скип»"),
     (test_plain_contact_names_and_addresses, "Telegram: безопасное форматирование контактов"),
     (test_slow_voice_does_not_block_another_user, "SpeechKit: медленный запрос другого пользователя не блокирует"),
+    (test_calendar_primary_is_resolved_before_creation_and_bound_to_invitation,
+     "Calendar: приглашение сохраняет исходный календарь даже после смены настроек"),
+    (test_voice_and_text_meetings_keep_invitations_bound_to_their_prompts,
+     "Telegram: приглашения привязаны к ответам на параллельные встречи"),
     (test_mymeet_sync_command_errors_do_not_disclose_exception, "MYmeet: безопасные ответы и диагностика ошибок"),
     (test_incomplete_analytics_returns_generic_failure, "аналитика: неполный отчёт обрабатывается безопасно"),
     (test_shutdown_signals_drain_active_writes, "остановка: SIGTERM/SIGINT дожидаются записи"),

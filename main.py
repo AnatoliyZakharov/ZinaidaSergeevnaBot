@@ -37,7 +37,7 @@ from aiohttp import web
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, CallbackQueryHandler, TypeHandler,
@@ -295,6 +295,10 @@ def create_calendar_event(
     tz   = _tz(user)
     calendar_id = _get_calendar_id(user)
     service = get_calendar_service(telegram_id)
+    if calendar_id == "primary":
+        calendar_id = service.calendars().get(calendarId=calendar_id).execute()["id"]
+    if not calendar_id or calendar_id == "primary":
+        raise RuntimeError("Could not resolve the calendar ID")
 
     if start_dt.tzinfo is None:
         start_dt = tz.localize(start_dt)
@@ -307,12 +311,15 @@ def create_calendar_event(
     }
     if telemost_link:
         body["description"] = _telemost_line(telemost_link)
-    return service.events().insert(calendarId=calendar_id, body=body).execute()
+    created = service.events().insert(calendarId=calendar_id, body=body).execute()
+    return {**created, "calendar_id": calendar_id}
 
 
-def add_attendees_to_event(telegram_id: int, event_id: str, emails: list[str]) -> None:
-    user = db.get_user(telegram_id)
-    calendar_id = _get_calendar_id(user)
+def add_attendees_to_event(
+    telegram_id: int, event_id: str, emails: list[str], *, calendar_id: str,
+) -> None:
+    if not calendar_id or calendar_id == "primary":
+        raise ValueError("An explicit calendar must use its concrete ID")
     service = get_calendar_service(telegram_id)
     event    = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
     existing = {a["email"] for a in event.get("attendees", [])}
@@ -676,6 +683,7 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
             None, lambda: create_calendar_event(telegram_id, title, dt, duration, telemost_link)
         )
         event_id = created["id"]
+        calendar_id = created["calendar_id"]
         _track(telegram_id, "first_value", source="calendar_event")
         tz = pytz.timezone(tz_name)
         if dt.tzinfo is None:
@@ -687,26 +695,46 @@ async def handle_create_event(telegram_id: int, text: str, update: Update, conte
         if inline_emails:
             try:
                 await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: add_attendees_to_event(telegram_id, event_id, inline_emails)
+                    None, lambda: add_attendees_to_event(
+                        telegram_id, event_id, inline_emails, calendar_id=calendar_id
+                    )
                 )
                 invite_note = f"\n📧 Приглашены: {', '.join(inline_emails)}"
             except Exception as e:
                 logger.error("Ошибка приглашения: %s", type(e).__name__)
 
-        context.user_data["pending_invite"] = {"event_id": event_id, "title": title}
         await msg.edit_text(
             f"✅ <b>Встреча создана!</b>\n\n"
             f"📌 {html_lib.escape(title)}\n"
             f"🗓 {date_to_ru(dt)}\n"
             f"🕐 {dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}"
-            f"{html_lib.escape(telemost_line)}{html_lib.escape(invite_note)}\n\n"
-            f"📧 Кого пригласить? Напиши имя из контактов или email(ы) через запятую\n"
-            f"<i>(или напиши «готово» чтобы пропустить)</i>",
+            f"{html_lib.escape(telemost_line)}{html_lib.escape(invite_note)}",
             parse_mode="HTML",
         )
     except Exception as e:
         logger.error("Ошибка создания события: %s", type(e).__name__)
-        await msg.edit_text("😔 Не удалось создать встречу. Попробуй позже.")
+        await msg.edit_text("😔 Не удалось сообщить результат создания встречи. Проверь Google Calendar.")
+        return
+
+    try:
+        prompt = await update.message.reply_text(
+            f"{_INVITE_PROMPT_PREFIX} «{title}»\n\n"
+            "Ответь именно на это сообщение. Укажи имя из контактов или email через запятую. "
+            "Ответь «готово», чтобы пропустить.",
+            reply_markup=ForceReply(selective=True),
+            do_quote=True,
+        )
+        prompts = _invite_prompts(context)
+        prompts[(update.effective_chat.id, prompt.message_id)] = {
+            "event_id": event_id,
+            "calendar_id": calendar_id,
+            "expires": time_module.monotonic() + _INVITE_PROMPT_TTL,
+        }
+        while len(prompts) > _MAX_INVITE_PROMPTS:
+            del prompts[next(iter(prompts))]
+    except Exception as e:
+        logger.warning("Не удалось открыть приглашения для созданной встречи: %s", type(e).__name__)
+        await update.message.reply_text("Встреча создана. Приглашения можно добавить в Google Calendar.")
 
 
 # ─── Handlers ────────────────────────────────────────────────
@@ -1079,64 +1107,98 @@ SKIP_TASK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INVITE_PROMPT_PREFIX = "📧 Приглашения для встречи"
+_INVITE_PROMPT_TTL = 30 * 60
+_MAX_INVITE_PROMPTS = 10
+_INVITE_REPLY_HINT = "Чтобы пригласить участников, ответь на сообщение бота о приглашениях для нужной встречи."
+_INVITE_STALE_REPLY = (
+    "Это приглашение больше не активно. Ответь на действующий запрос для нужной встречи, "
+    "если он есть, или добавь участников в Google Calendar."
+)
+
+
+def _invite_prompts(context) -> dict:
+    prompts = context.user_data.setdefault("pending_invites", {})
+    now = time_module.monotonic()
+    for key, pending in tuple(prompts.items()):
+        if pending["expires"] <= now:
+            del prompts[key]
+    return prompts
+
+
 async def _handle_pending_invite(telegram_id: int, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    pending = context.user_data.get("pending_invite")
-    if not pending:
+    reply = getattr(update.message, "reply_to_message", None)
+    if not reply:
         return False
 
-    # Если текст похож на новую команду — завершаем режим приглашения и пропускаем дальше
-    if CREATE_TRIGGER.search(text) or TELEMOST_TRIGGER.search(text):
-        context.user_data.pop("pending_invite", None)
+    prompts = _invite_prompts(context)
+    key = (update.effective_chat.id, reply.message_id)
+    pending = prompts.get(key)
+    if pending is None:
+        reply_text = reply.text
+        if (isinstance(reply_text, str) and reply_text.startswith(_INVITE_PROMPT_PREFIX)
+                and reply.from_user and reply.from_user.id == context.bot.id):
+            await update.message.reply_text(_INVITE_STALE_REPLY)
+            return True
         return False
 
-    if INVITE_SKIP.search(text):
-        context.user_data.pop("pending_invite", None)
+    if INVITE_SKIP.fullmatch(text.strip(" \t\n.!")):
+        del prompts[key]
         await update.message.reply_text("👍 Без приглашений — окей!")
         return True
 
-    # Убираем глагольный префикс: «Пригласи Анастасию» → «Анастасию»
-    text_clean = INVITE_VERB_PREFIX.sub("", text).strip()
-
-    # Сначала ищем email-адреса напрямую
-    emails = extract_emails(text_clean)
-
-    # Если email-ов нет — пробуем резолвить имена через глоссарий
-    if not emails:
-        found, unknown = db.resolve_names_to_emails(telegram_id, text_clean)
-        if found:
-            emails = found
-            if unknown:
-                await update.message.reply_text(
-                    f"⚠️ Не нашёл в контактах: {', '.join(unknown)}\n"
-                    f"Продолжаю с найденными: {', '.join(emails)}"
-                )
-        else:
-            # Ничего не нашлось — сообщаем и сбрасываем режим, чтобы бот не завис
-            context.user_data.pop("pending_invite", None)
-            await update.message.reply_text(
-                f"🤷 Не нашёл в контактах: «{text_clean}»\n"
-                f"Встреча создана без приглашений.\n"
-                f"Добавь контакт через /add_contact Имя email@example.com",
-            )
-            return True
-
-    if emails:
-        context.user_data.pop("pending_invite", None)
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                None, lambda: add_attendees_to_event(telegram_id, pending["event_id"], emails)
-            )
-            await update.message.reply_text(f"📧 Приглашения отправлены:\n{', '.join(emails)}")
-        except Exception as e:
-            logger.error("Ошибка добавления участников: %s", type(e).__name__)
-            await update.message.reply_text("😔 Не удалось отправить приглашения.")
+    if not await _require_google(update):
         return True
-    return False
+    if _invite_prompts(context).get(key) is not pending:
+        await update.message.reply_text(_INVITE_STALE_REPLY)
+        return True
+
+    text_clean = INVITE_VERB_PREFIX.sub("", text).strip()
+    emails = extract_emails(text_clean)
+    unknown = []
+    if not emails:
+        emails, unknown = db.resolve_names_to_emails(telegram_id, text_clean)
+    if not emails:
+        await update.message.reply_text(
+            "Не нашёл адресов в контактах. Ответь на запрос той же встречи с email "
+            "или напиши «готово», чтобы пропустить."
+        )
+        return True
+
+    # Consume before yielding so concurrent replies cannot send twice.
+    del prompts[key]
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: add_attendees_to_event(
+                telegram_id, pending["event_id"], emails, calendar_id=pending["calendar_id"]
+            )
+        )
+    except Exception as e:
+        logger.error("Ошибка добавления участников: %s", type(e).__name__)
+        await update.message.reply_text("Не удалось подтвердить отправку. Проверь участников в Google Calendar.")
+        return True
+    note = "\nНекоторые имена не найдены в контактах." if unknown else ""
+    await update.message.reply_text(f"📧 Приглашения отправлены:\n{', '.join(emails)}{note}")
+    return True
+
+
+def _needs_invite_reply(telegram_id: int, text: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if INVITE_VERB_PREFIX.match(text) or extract_emails(text):
+        return True
+    if not any(key[0] == chat_id for key in _invite_prompts(context)):
+        return False
+    if INVITE_SKIP.fullmatch(text.strip(" \t\n.!")):
+        return True
+    emails, _ = db.resolve_names_to_emails(telegram_id, text.strip())
+    return bool(emails)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     text = update.message.text
+
+    if not text.lstrip().startswith("mm_") and await _handle_pending_invite(telegram_id, text, update, context):
+        return
 
     # MYmeet визард перехватывает сообщения до проверки Google
     if update.effective_chat.type == "private":
@@ -1148,9 +1210,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await _require_google(update):
-        return
-
-    if await _handle_pending_invite(telegram_id, text, update, context):
         return
 
     if TELEMOST_TRIGGER.search(text):
@@ -1167,6 +1226,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("😔 Ошибка при обходе встреч. Попробуй позже.")
     elif CREATE_TRIGGER.search(text):
         await handle_create_event(telegram_id, text, update, context)
+    elif _needs_invite_reply(telegram_id, text, update.effective_chat.id, context):
+        await update.message.reply_text(_INVITE_REPLY_HINT)
     else:
         await process_query(telegram_id, text, update)
 

@@ -1403,6 +1403,41 @@ def test_protocol_verification_db_restore_and_migration():
         assert db3.my_tasks_load(1)[0]["verified"] == 0
 
 
+def test_assigned_mymeet_persists_without_feed_and_keeps_manual_edits():
+    mt = _load_my_tasks()
+    key = "mymeet_assigned:" + "a" * 64
+    own_row = [1, "10.11.2026", "Собственная встреча", "Своё поручение", ME, "", "В работе", "own"]
+    legacy_row = [2, "10.11.2026", "Старый лист", "Сохранённая строка", ME, "", "Выполнено", "old"]
+    assigned = [None, "11.11.2026", "Тестовая встреча", "Тестовое поручение", ME,
+                "12.11.2026", "Выполнено", "other", key]
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+
+        def build(candidates, sheet, user=1, *, commit=True):
+            builder = mt.MyTasksBuilder(user, ME, dbm=db, assigned_mymeet_only=True)
+            rows = builder.build(candidates, sheet)
+            if commit:
+                builder.commit()
+            return rows
+
+        rows = build([own_row, assigned, assigned], [mt.HEADER_V2, legacy_row], commit=False)
+        assert {r[3]: r[6] for r in rows} == {
+            "Тестовое поручение": mt.ST_UNVERIFIED, "Сохранённая строка": mt.ST_DONE,
+        }
+        assert len(db.my_tasks_load(1)) == 1  # legacy sheet-only row stays on the sheet only
+        # Sheet write can fail after DB persistence. Recovery needs no fresh MYmeet feed.
+        rows = build(None, [mt.HEADER_V2, legacy_row])
+        task = next(r for r in rows if r[7] == key)
+        task[3], task[6] = "Ручное название", mt.ST_DONE
+        updated = [*assigned[:5], "13.11.2026", *assigned[6:]]
+        rows = build([updated], [mt.HEADER_V2, *rows])
+        task = next(r for r in rows if r[7] == key)
+        assert (task[3], task[5], task[6]) == ("Ручное название", "13.11.2026", mt.ST_DONE)
+        assert build([], [mt.HEADER_V2, *rows]) == rows
+        assert build([], [mt.HEADER_V2], user=2) == []
+        assert db.my_tasks_get(1, key)["source"] == mt.SRC_MYMEET_ASSIGNED
+
+
 def test_gtasks_task_date_not_invented():
     """5–6: дата постановки GT не подставляется (ни импорт, ни updated);
     сохранённая дата не стирается."""
@@ -1588,6 +1623,8 @@ TESTS = [
     (test_auth_scopes_no_gmail_and_no_gt_insert, "OAuth без Gmail; задачи в GT не создаются"),
     (test_protocol_verification_only_by_manual_change, "Протоколы: подтверждение только вручную"),
     (test_protocol_verification_db_restore_and_migration, "Протоколы: восстановление БД, лист V1"),
+    (test_assigned_mymeet_persists_without_feed_and_keeps_manual_edits,
+     "MYmeet: чужие поручения, повтор, сбой записи, ручные правки и изоляция"),
     (test_gtasks_task_date_not_invented, "GT: дата постановки не выдумывается"),
     (test_manual_field_edits_preserved, "Лист: ручные правки полей сохраняются"),
     (test_concurrent_edit_any_field_conflict, "Гонка: правка любого поля → конфликт"),

@@ -291,7 +291,8 @@ def _load_main(names, extra_ns, assigns):
 class Env:
     """Реальные функции main.py + реальный mymeet_sync + временная БД."""
 
-    def __init__(self, tmp, users=((1, "Europe/Moscow"),), gcal_reason=None):
+    def __init__(self, tmp, users=((1, "Europe/Moscow"),), gcal_reason=None, *,
+                 assigned_only=False):
         import test_my_tasks as tmt
         self.db = _tmp_db(tmp)
         self.ms = _ms()
@@ -315,8 +316,9 @@ class Env:
         self.ms._gs_client = lambda: gc
         mt = self.mt
         dbm = self.db
-        my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None:
-                         mt.MyTasksBuilder(tid, name, tz_name=tz_name, dbm=dbm))
+        my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None, **kwargs:
+                         mt.MyTasksBuilder(tid, name, tz_name=tz_name, dbm=dbm,
+                                           assigned_mymeet_only=assigned_only))
 
         def _gcal_checked(tid, days):
             self.gcal_calls.append((tid, days))
@@ -924,7 +926,87 @@ def test_logs_have_no_sheet_title_or_names():
             assert secret not in text, (secret, text)
 
 
+def test_assigned_foreign_pipeline_and_backfill():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp, assigned_only=True, users=((1, "Europe/Moscow"), (2, "Europe/Moscow")))
+        now = _now()
+        env.mm.add("own", "Своя", now - timedelta(hours=3), [("Своя задача", ME, False)])
+        env.mm.add("other", "Чужая", now - timedelta(hours=4),
+                   [("Личное", "Петров И.", False), ("Коллеги", "Анна Смирнова", False)])
+        env.mm.add("unknown", "Неясно", now - timedelta(hours=5), [("Неясное", ME, False)])
+        env.mm.add("old", "Пропущенная", now - timedelta(days=11), [("Догон", ME, False)])
+        env.mm.gcal = lambda: {"ids": {"ev-own"}, "times": set(),
+                              "other_ids": {"ev-other", "ev-old"}}
+        original = env.ms._fetch_protocol
+        fetched = []
+
+        def protocol(mid, token=None):
+            fetched.append((mid, token))
+            return original(mid, token=token)
+
+        env.ms._fetch_protocol = protocol
+        env.mm.proto_fail.add("other")
+        env.force_due()
+        env.ns["_get_gcal_organizer_data_checked"] = (
+            lambda tid, days: (env.mm.gcal(), None) if tid == 1
+            else ({"ids": set(), "times": set(), "other_ids": set()}, None))
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "partial"
+        assert not env.my_tasks_sheet()[1:]
+        env.mm.proto_fail.clear()
+        env.force_due()
+        env.tick()
+        rows = env.my_tasks_sheet()
+        assert any("Личное" in row and UNVERIFIED in row for row in rows[1:]), rows
+        assert not any({"Своя задача", "Коллеги", "Неясное"}.intersection(row)
+                       for row in rows[1:]), rows
+        assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
+        assert not env.my_tasks_sheet(2)[1:]
+        assert "unknown" not in {mid for mid, _ in fetched}
+        assert all(token == "tok-plain" for _, token in fetched)
+
+        task = next(row for row in rows[1:] if "Личное" in row)
+        task[env.ms.MY_TASKS_STATUS_COL] = "В работе"
+        for _ in range(2):
+            cfg = env.ns["_user_row_to_mymeet_config"](env.db.get_user(1))
+            cfg["gcal_organizer_data"] = env.mm.gcal()
+            env.ms.sync_to_sheets(days=14, append=True, user_config=cfg)
+        rows = env.my_tasks_sheet()
+        personal = [row for row in rows[1:] if "Личное" in row]
+        assert len(personal) == 1 and "В работе" in personal[0], rows
+        assert sum("Догон" in row for row in rows[1:]) == 1, rows
+        assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
+
+
+def test_foreign_import_is_disabled_in_default_runtime():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp)
+        env.mm.add("other", "Чужая", _now() - timedelta(hours=3), [("Личное", ME, False)])
+        env.mm.gcal = lambda: {"ids": set(), "times": set(), "other_ids": {"ev-other"}}
+        env.ms._fetch_protocol = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default runtime must not request a foreign report"))
+        env.force_due()
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "ok"
+        assert not env.db.my_tasks_load(1)
+        assert not env.my_tasks_sheet()[1:]
+
+
+def test_foreign_calendar_link_must_be_explicit_and_unambiguous():
+    ms = _ms()
+    gcal = {"ids": {"mine"}, "times": set(), "other_ids": {"mine", "theirs"}}
+    assert ms._foreign_calendar_id({"googleEventId": "theirs"}, gcal)
+    assert not ms._foreign_calendar_id({"googleEventId": "mine"}, gcal)
+    assert not ms._foreign_calendar_id({"googleEventId": "unknown"}, gcal)
+    assert not ms._foreign_calendar_id({"eventId": "theirs"}, gcal)
+    assert not ms._foreign_calendar_id(
+        {"googleEventId": "theirs", "calendarEventId": "mine"}, gcal)
+
+
 TESTS = [
+    (test_foreign_import_is_disabled_in_default_runtime, "MYmeet: рабочий импорт выключен"),
+    (test_assigned_foreign_pipeline_and_backfill, "MYmeet: личные поручения и догон"),
+    (test_foreign_calendar_link_must_be_explicit_and_unambiguous, "MYmeet: точная связь с Calendar"),
     (test_slot_and_due_daily, "MYmeet авто: слот 19:00, ежедневный запуск, переход даты"),
     (test_timezones_per_user, "MYmeet авто: часовые поясы пользователей"),
     (test_missed_evening_and_first_run, "MYmeet авто: пропущенный вечер, первый запуск, окно"),

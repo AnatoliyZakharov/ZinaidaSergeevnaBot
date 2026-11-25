@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -504,7 +505,13 @@ def _extract_tasks(protocol: dict | None) -> list:
                     else:
                         assignee = str(assignee_raw).strip()
 
+                    assignee_email = assignee_raw.get("email") if isinstance(assignee_raw, dict) else None
+                    assigner = item.get("assigner")
+                    if isinstance(assigner, dict):
+                        assigner = assigner.get("speaker")
                     tasks.append({
+                        "assignee_email": assignee_email,
+                        "assigner": assigner.strip() if isinstance(assigner, str) else "",
                         "id":       item.get("id", ""),
                         "name":     (item.get("task") or item.get("name") or
                                      item.get("text") or "").strip(),
@@ -515,7 +522,7 @@ def _extract_tasks(protocol: dict | None) -> list:
                                          item.get("status") == "done"),
                     })
     except Exception as e:
-        logger.debug("Task extraction error: %s", e)
+        logger.debug("Task extraction error: %s", type(e).__name__)
     return tasks
 
 
@@ -658,6 +665,47 @@ def _extract_gcal_event_id(m: dict) -> str | None:
         if obj and isinstance(obj, str):
             return obj
     return None
+
+
+def _foreign_calendar_id(m: dict, gcal_data: dict) -> str | None:
+    # Generic meeting/event IDs can identify objects outside Google Calendar.
+    ids = {m[field] for field in ("googleEventId", "gcalEventId", "google_event_id",
+                                  "calendarEventId", "calendar_event_id")
+           if isinstance(m.get(field), str) and m[field]}
+    if len(ids) != 1:
+        return None
+    event_id = next(iter(ids))
+    if (event_id in gcal_data.get("other_ids", ())
+            and event_id not in gcal_data.get("ids", ())):
+        return event_id
+    return None
+
+
+def _assigned_mymeet_rows(meetings: list, builder, primary_email: str | None) -> list:
+    matcher = builder.matcher()
+    rows = []
+    for meeting in meetings:
+        names = Counter(" ".join(task["name"].casefold().split())
+                        for task in meeting["tasks"])
+        for task in meeting["tasks"]:
+            name = " ".join(task["name"].casefold().split())
+            if not name or not matcher(task["assignee"], meeting["id"]):
+                continue
+            assignee_email = task.get("assignee_email")
+            if assignee_email is not None and (not isinstance(assignee_email, str)
+                    or assignee_email.strip().casefold() != primary_email):
+                continue
+            if names[name] != 1:
+                continue
+            # The report may gain native item IDs on a subsequent fetch.
+            # Keep the same key for the unique title in this Calendar instance.
+            key = hashlib.sha256(json.dumps([meeting["calendar_id"], name]).encode()).hexdigest()
+            label = meeting["name"]
+            if task.get("assigner"):
+                label += f" · постановщик: {task['assigner']}"
+            rows.append([None, meeting["date"], label, task["name"], task["assignee"],
+                         task["deadline"], "", meeting["id"], f"mymeet_assigned:{key}"])
+    return rows
 
 
 def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
@@ -1152,7 +1200,8 @@ def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -
     return rows_builder.sheet_unchanged(before_rows, fresh)
 
 
-def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) -> tuple:
+def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None, *,
+                              assigned_candidates=()) -> tuple:
     """Post-sync step: status colours on protocol sheets and on every
     «Мои задачи — …» sheet; when full_name is set, the user's personal
     «Мои задачи — {ФИО}» sheet is (re)written.  Other users' sheets are never
@@ -1222,8 +1271,11 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
                     rows = _build_my_tasks_rows(proto, full_name)
                 else:
                     my_rows = values.get(my_title) if exists else None
-                    candidates = _build_my_tasks_rows(
-                        proto, full_name, matcher=rows_builder.matcher())
+                    if getattr(rows_builder, "assigned_mymeet_only", False):
+                        candidates = assigned_candidates
+                    else:
+                        candidates = _build_my_tasks_rows(
+                            proto, full_name, matcher=rows_builder.matcher())
                     rows = rows_builder.build(candidates, my_rows)
                     before = _count_my_task_rows(my_rows)
                     if rows is None:
@@ -1343,7 +1395,15 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             "проверки организатора. "
             "Синхронизация отменена — Google Sheets не изменён."
         )
+    builder = cfg.get("my_tasks_builder")
+    personal_config = user_config or {}
+    foreign_meetings = []
+    if (getattr(builder, "assigned_mymeet_only", False) and cfg["full_name"].strip()
+            and personal_config.get("mymeet_token")
+            and personal_config.get("mymeet_spreadsheet_id")):
+        foreign_meetings = [m for m in raw_meetings if _foreign_calendar_id(m, _gcal_data)]
     raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
+    foreign_meetings = [m for m in foreign_meetings if not _is_organizer_by_gcal(m, _gcal_data)]
     _after_org_count = len(raw_meetings)
     st.update(fetched=_fetched_count, after_date=_after_date_count, after_org=_after_org_count)
     logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
@@ -1356,6 +1416,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
         protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
         return {
+            "calendar_id": _foreign_calendar_id(m, _gcal_data),
             "missing": protocol is None,   # ещё не готов (404) — догонится позже
             "id":    mid,
             "name":  name,
@@ -1364,14 +1425,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         }
 
     all_meetings = []
+    personal_meetings = []
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
+        futures = {pool.submit(_fetch_one, m): all_meetings for m in raw_meetings}
+        futures.update({pool.submit(_fetch_one, m): personal_meetings for m in foreign_meetings})
         for fut in as_completed(futures):
             try:
                 res_m = fut.result()
                 if res_m.pop("missing", False):
                     st["protocols_missing"] += 1
-                all_meetings.append(res_m)
+                futures[fut].append(res_m)
             except Exception as e:
                 st["protocols_failed"] += 1
                 logger.warning("Protocol fetch error: %s", type(e).__name__)
@@ -1804,8 +1867,12 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     my_tasks_title = None
     _builder = cfg.get("my_tasks_builder")
     try:
+        kwargs = {"rows_builder": _builder}
+        if personal_meetings:
+            kwargs["assigned_candidates"] = _assigned_mymeet_rows(
+                personal_meetings, _builder, _gcal_data.get("primary_email"))
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name, rows_builder=_builder)
+            spreadsheet, full_name, **kwargs)
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error: %s", _err_brief(e))

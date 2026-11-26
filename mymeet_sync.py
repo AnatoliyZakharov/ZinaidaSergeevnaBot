@@ -681,25 +681,23 @@ def _foreign_calendar_id(m: dict, gcal_data: dict) -> str | None:
     return None
 
 
-def _assigned_mymeet_rows(meetings: list, builder, primary_email: str | None) -> list:
-    matcher = builder.matcher()
+def _assigned_mymeet_rows(meetings: list, primary_email: str | None) -> list:
+    if not isinstance(primary_email, str) or not primary_email.strip():
+        return []
+    primary_email = primary_email.strip().casefold()
     rows = []
     for meeting in meetings:
-        names = Counter(" ".join(task["name"].casefold().split())
-                        for task in meeting["tasks"])
+        ids = Counter(task["id"] for task in meeting["tasks"]
+                      if isinstance(task.get("id"), str) and task["id"].strip())
         for task in meeting["tasks"]:
-            name = " ".join(task["name"].casefold().split())
-            if not name or not matcher(task["assignee"], meeting["id"]):
-                continue
+            task_id = task.get("id")
             assignee_email = task.get("assignee_email")
-            if assignee_email is not None and (not isinstance(assignee_email, str)
+            if (not isinstance(task_id, str) or ids[task_id] != 1 or not task["name"].strip()
+                    or not isinstance(assignee_email, str)
                     or assignee_email.strip().casefold() != primary_email):
                 continue
-            if names[name] != 1:
-                continue
-            # The report may gain native item IDs on a subsequent fetch.
-            # Keep the same key for the unique title in this Calendar instance.
-            key = hashlib.sha256(json.dumps([meeting["calendar_id"], name]).encode()).hexdigest()
+            # Titles can change after MYmeet regenerates the report.
+            key = hashlib.sha256(json.dumps([meeting["calendar_id"], task_id]).encode()).hexdigest()
             label = meeting["name"]
             if task.get("assigner"):
                 label += f" · постановщик: {task['assigner']}"
@@ -1268,7 +1266,17 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None, *,
                 proto = {t: values[t] for t in protocol_titles}
                 exists = my_title in sheet_ids
                 if rows_builder is None:
-                    rows = _build_my_tasks_rows(proto, full_name)
+                    from my_tasks import KEY_MYMEET_ASSIGNED
+
+                    existing_rows = values.get(my_title, [])
+                    if any(len(row) > 7 and str(row[7]).strip().startswith(KEY_MYMEET_ASSIGNED)
+                           for row in existing_rows):
+                        rows = None
+                        warnings.append(
+                            "Лист с личными поручениями MYmeet сохранён до проверки доступа."
+                        )
+                    else:
+                        rows = _build_my_tasks_rows(proto, full_name)
                 else:
                     my_rows = values.get(my_title) if exists else None
                     if getattr(rows_builder, "assigned_mymeet_only", False):
@@ -1870,7 +1878,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         kwargs = {"rows_builder": _builder}
         if personal_meetings:
             kwargs["assigned_candidates"] = _assigned_mymeet_rows(
-                personal_meetings, _builder, _gcal_data.get("primary_email"))
+                personal_meetings, _gcal_data.get("primary_email"))
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
             spreadsheet, full_name, **kwargs)
         all_fmt_warnings.extend(_mt_warnings)

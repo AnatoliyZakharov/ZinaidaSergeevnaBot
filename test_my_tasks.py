@@ -1043,6 +1043,15 @@ def test_legacy_sheet_migration_and_legacy_mode():
     _, cnt, _ = ms._sync_my_tasks_and_colors(book.ss, ME)
     assert cnt == 1 and book.data[MY_TITLE][0] == ms.MY_TASKS_HEADER_ROW
     assert not [r for r in book.requests() if "setDataValidation" in r]
+    private_row = [1, "10.11.2026", "MYmeet", "Тестовое поручение", ME, "",
+                   "В работе", mt.KEY_MYMEET_ASSIGNED + "a" * 64]
+    expected = [ms.MY_TASKS_HEADER_ROW_V2, private_row]
+    book = _Book({MY_TITLE: [list(row) for row in expected]})
+    warnings, cnt, _ = ms._sync_my_tasks_and_colors(book.ss, ME)
+    assert cnt is None and any("проверки доступа" in msg for msg in warnings)
+    assert book.data[MY_TITLE] == expected
+    assert book.ws[MY_TITLE].update.call_count == 0
+    assert book.ws[MY_TITLE].batch_clear.call_count == 0
 
 
 # ══ 7. run_sync: итоги ═══════════════════════════════════════════════════
@@ -1436,6 +1445,12 @@ def test_assigned_mymeet_persists_without_feed_and_keeps_manual_edits():
         assert build([], [mt.HEADER_V2, *rows]) == rows
         assert build([], [mt.HEADER_V2], user=2) == []
         assert db.my_tasks_get(1, key)["source"] == mt.SRC_MYMEET_ASSIGNED
+
+        builder = mt.MyTasksBuilder(1, ME, dbm=db)
+        assert builder.build([assigned], [mt.HEADER_V2]) == []
+        assert db.my_tasks_get(1, key)["status"] == mt.ST_DONE
+        assert builder.build([], [mt.HEADER_V2, *rows]) is None
+        assert builder.block_reason == "unverified_mymeet_destination"
 
 
 def test_gtasks_task_date_not_invented():

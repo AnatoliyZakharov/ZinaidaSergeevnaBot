@@ -932,17 +932,27 @@ def test_assigned_foreign_pipeline_and_backfill():
         now = _now()
         env.mm.add("own", "Своя", now - timedelta(hours=3), [("Своя задача", ME, False)])
         env.mm.add("other", "Чужая", now - timedelta(hours=4),
-                   [("Личное", "Петров И.", False), ("Коллеги", "Анна Смирнова", False)])
+                   [("Личное", "Петров И.", False), ("Однофамилец", ME, False),
+                    ("Не указан email", ME, False), ("Коллеги", "Анна Смирнова", False)])
         env.mm.add("unknown", "Неясно", now - timedelta(hours=5), [("Неясное", ME, False)])
         env.mm.add("old", "Пропущенная", now - timedelta(days=11), [("Догон", ME, False)])
         env.mm.gcal = lambda: {"ids": {"ev-own"}, "times": set(),
-                              "other_ids": {"ev-other", "ev-old"}}
+                              "other_ids": {"ev-other", "ev-old"},
+                              "primary_email": "participant@example.test"}
         original = env.ms._fetch_protocol
         fetched = []
 
         def protocol(mid, token=None):
             fetched.append((mid, token))
-            return original(mid, token=token)
+            report = original(mid, token=token)
+            items = report["followup_v2"]["templates"][0]["entities"][0]["html_text"]
+            for item in items:
+                if item["task"] in {"Личное", "Личное уточнено", "Догон"}:
+                    item["id"] = "assigned-task"
+                    item["assignee"]["email"] = " Participant@example.test "
+                elif item["task"] in {"Однофамилец", "Коллеги"}:
+                    item["assignee"]["email"] = "colleague@example.test"
+            return report
 
         env.ms._fetch_protocol = protocol
         env.mm.proto_fail.add("other")
@@ -958,8 +968,8 @@ def test_assigned_foreign_pipeline_and_backfill():
         env.tick()
         rows = env.my_tasks_sheet()
         assert any("Личное" in row and UNVERIFIED in row for row in rows[1:]), rows
-        assert not any({"Своя задача", "Коллеги", "Неясное"}.intersection(row)
-                       for row in rows[1:]), rows
+        rejected = {"Своя задача", "Коллеги", "Неясное", "Однофамилец", "Не указан email"}
+        assert not any(rejected.intersection(row) for row in rows[1:]), rows
         assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
         assert not env.my_tasks_sheet(2)[1:]
         assert "unknown" not in {mid for mid, _ in fetched}
@@ -967,15 +977,27 @@ def test_assigned_foreign_pipeline_and_backfill():
 
         task = next(row for row in rows[1:] if "Личное" in row)
         task[env.ms.MY_TASKS_STATUS_COL] = "В работе"
+        env.mm.add("other", "Чужая", now - timedelta(hours=4),
+                   [("Личное уточнено", "Петров И.", False)])
         for _ in range(2):
             cfg = env.ns["_user_row_to_mymeet_config"](env.db.get_user(1))
             cfg["gcal_organizer_data"] = env.mm.gcal()
             env.ms.sync_to_sheets(days=14, append=True, user_config=cfg)
         rows = env.my_tasks_sheet()
-        personal = [row for row in rows[1:] if "Личное" in row]
+        personal = [row for row in rows[1:] if "Личное уточнено" in row]
         assert len(personal) == 1 and "В работе" in personal[0], rows
         assert sum("Догон" in row for row in rows[1:]) == 1, rows
         assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
+
+
+def test_assigned_task_requires_unique_provider_id():
+    ms = _ms()
+    tasks = [
+        {"id": "", "name": "Без ID", "assignee_email": "participant@example.test"},
+        {"id": "duplicate", "name": "Первое", "assignee_email": "participant@example.test"},
+        {"id": "duplicate", "name": "Второе", "assignee_email": "other@example.test"},
+    ]
+    assert not ms._assigned_mymeet_rows([{"tasks": tasks}], "participant@example.test")
 
 
 def test_foreign_import_is_disabled_in_default_runtime():
@@ -1004,6 +1026,7 @@ def test_foreign_calendar_link_must_be_explicit_and_unambiguous():
 
 
 TESTS = [
+    (test_assigned_task_requires_unique_provider_id, "MYmeet: только уникальный ID поручения"),
     (test_foreign_import_is_disabled_in_default_runtime, "MYmeet: рабочий импорт выключен"),
     (test_assigned_foreign_pipeline_and_backfill, "MYmeet: личные поручения и догон"),
     (test_foreign_calendar_link_must_be_explicit_and_unambiguous, "MYmeet: точная связь с Calendar"),

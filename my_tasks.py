@@ -682,7 +682,7 @@ def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
     for row in candidates:
         candidate_key = row[8] if len(row) > 8 else None
         assigned = _is_assigned_key(candidate_key)
-        if assigned_only and not assigned:
+        if assigned != assigned_only:
             continue
         key = candidate_key if assigned else row_key(row)
         if not key or key in seen:
@@ -1099,8 +1099,19 @@ class MyTasksBuilder:
               sheet_available: bool = True) -> list | None:
         """Возвращает строки листа или None (аномалия — лист не писать)."""
         self.built = True
-        store = self._store()
-        loaded = store.my_tasks_load(self.telegram_id)
+        sheet_read = bool(sheet_available and my_rows)
+        sheet_cells = sheet_rows_by_key(my_rows) if sheet_read else {}
+        if not self.assigned_mymeet_only and any(map(_is_assigned_key, sheet_cells)):
+            self.blocked("unverified_mymeet_destination")
+            self.warnings.append(
+                "В листе найдены личные поручения MYmeet. Лист сохранён без изменений "
+                "до проверки доступа и назначения."
+            )
+            return None
+        loaded = self._store().my_tasks_load(self.telegram_id)
+        if not self.assigned_mymeet_only:
+            loaded = [r for r in loaded if r.get("source") != SRC_MYMEET_ASSIGNED
+                      and not _is_assigned_key(r["source_key"])]
         bad = [r for r in loaded if r.get("_decrypt_error")]
         if bad:
             self.anomaly = "decrypt"
@@ -1112,8 +1123,6 @@ class MyTasksBuilder:
         for r in records.values():
             if r.pop("_plaintext", False):
                 r["_dirty"] = True              # старая запись → будет зашифрована
-        sheet_read = bool(sheet_available and my_rows)
-        sheet_cells = sheet_rows_by_key(my_rows) if sheet_read else {}
         sheet_vals = {k: c[6] for k, c in sheet_cells.items()}
         v2 = is_v2_sheet(my_rows) if sheet_read else False
 

@@ -8,7 +8,7 @@ from datetime import date
 
 
 _SOURCES = ("Telegram", "Google Tasks", "MYmeet")
-_HEADER = "my-tasks-group:"
+GROUP_HEADER_PREFIX = "my-tasks-group:"
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ def _date_order(task: TaskRow):
 
 
 def _layout(tasks: list[TaskRow]):
-    if any(task.source not in _SOURCES or not task.key or task.key.startswith(_HEADER)
+    if any(task.source not in _SOURCES or not task.key or task.key.startswith(GROUP_HEADER_PREFIX)
            for task in tasks):
         raise ValueError("Unknown source or invalid stable task key")
     task_rows = {task.key: task.values for task in tasks}
@@ -52,7 +52,7 @@ def _layout(tasks: list[TaskRow]):
         return len(keys) + 1
 
     for source in _SOURCES:
-        source_key = f"{_HEADER}source:{source}"
+        source_key = f"{GROUP_HEADER_PREFIX}source:{source}"
         start = add_header(source_key, source)
         if source != "MYmeet":
             keys.extend(task.key for task in sorted(tasks, key=_date_order)
@@ -71,7 +71,7 @@ def _layout(tasks: list[TaskRow]):
                 meetings.setdefault(task.meeting_id, []).append(task)
             order = sorted(meetings, key=lambda key: (-meeting_labels[key][0].toordinal(), key))
             for meeting_id in order:
-                meeting_key = f"{_HEADER}meeting:{meeting_id}"
+                meeting_key = f"{GROUP_HEADER_PREFIX}meeting:{meeting_id}"
                 meeting_date, title = meeting_labels[meeting_id]
                 meeting_start = add_header(meeting_key, f"{title} · {meeting_date:%d.%m.%Y}")
                 keys.extend(task.key for task in sorted(meetings[meeting_id], key=_date_order))

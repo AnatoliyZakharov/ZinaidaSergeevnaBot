@@ -102,6 +102,25 @@ class GroupingTests(unittest.TestCase):
             owned_groups=ownership).requests
         restored = [op["dimensionGroup"] for op in requests_of(requests, "updateDimensionGroup")]
         self.assertEqual(restored, [group(11, 13, 2, True), group(7, 13, 1, True)])
+        metadata = {
+            "formula": '=IF(A2=1,"Готово","")',
+            "note": "Уточнить у участника",
+            "threaded_comment": {"text": "Проверить срок", "replies": ["Принято"]},
+            "hyperlink": "https://example.test/task/1",
+            "dataValidation": {"condition": {"type": "ONE_OF_LIST"}},
+            "userEnteredFormat": {"textFormat": {"bold": True}},
+        }
+        originals = {
+            key: (1, "26.11.2026", "", "Тестовое поручение", "", "30.11.2026",
+                  "В работе", key, metadata.copy())
+            for key in old_keys
+        }
+        updated = apply_row_plan(requests, ["header", *originals.values()])
+        for row in updated[1:]:
+            if row[7] in originals:
+                self.assertIs(row, originals[row[7]])
+        self.assertEqual(set(originals) - {row[7] for row in updated[1:]}, set())
+        self.assertEqual(updated[-1][6:], ("В работе", "my-old", metadata))
         deleted = [op["range"] for op in requests_of(requests, "deleteDimensionGroup")]
         self.assertEqual(deleted[:2], [old_groups[3]["range"], old_groups[4]["range"]])
 

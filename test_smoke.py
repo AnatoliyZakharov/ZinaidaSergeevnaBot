@@ -1599,6 +1599,8 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    from test_my_tasks_grouping import TESTS as _MY_TASKS_GROUPING_TESTS
+    tests += _MY_TASKS_GROUPING_TESTS
     # issue #36: иерархия Google Tasks, ссылки на письма, ссылка Телемоста
     from test_gt_hierarchy_links import TESTS as _ISSUE36_TESTS
     tests += _ISSUE36_TESTS

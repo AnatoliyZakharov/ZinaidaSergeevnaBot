@@ -1,4 +1,5 @@
 """Offline regression checks for Google Sheets DimensionGroup requests."""
+from dataclasses import replace
 from datetime import date
 import unittest
 
@@ -135,6 +136,44 @@ class GroupingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing stable"):
             plan_grouped_sheet_update(SHEET, 20, [], [], [task("mine", "MYmeet")])
 
+    def test_google_tasks_sorts_roots_and_siblings_without_separating_subtasks(self):
+        parent = task("parent", "Google Tasks", YESTERDAY)
+        late = replace(task("late-child", "Google Tasks"), parent_key=parent.key)
+        early = replace(task("early-child", "Google Tasks", TODAY), parent_key=parent.key)
+        standalone = task("standalone", "Google Tasks", TODAY)
+        tasks = [late, standalone, early, parent]
+        plan = plan_grouped_sheet_update(SHEET, 1, [], [], tasks)
+        rows = apply_row_plan(plan.requests, ["header"])
+        self.assertEqual([row[7] for row in rows[1:] if not row[7].startswith("my-tasks-group:")],
+                         ["parent", "early-child", "late-child", "standalone"])
+        with self.assertRaisesRegex(ValueError, "Missing Google Tasks parent"):
+            plan_grouped_sheet_update(SHEET, 1, [], [], [early])
+        with self.assertRaisesRegex(ValueError, "Cyclic Google Tasks hierarchy"):
+            plan_grouped_sheet_update(SHEET, 1, [], [], [early, replace(parent, parent_key=early.key)])
+
+    def test_renamed_meeting_updates_only_managed_header_value(self):
+        meeting = replace(self.tasks[3], meeting_name="Уточнённое название")
+        keys = [SOURCE + "Telegram", SOURCE + "Google Tasks", SOURCE + "MYmeet",
+                MEETING + "old", meeting.key]
+        owned = (GroupSpan(SOURCE + "MYmeet", 4, 6, 1), GroupSpan(MEETING + "old", 5, 6, 2))
+        groups = [group(4, 6, 1, True), group(5, 6, 2, True)]
+        before = "Одинаковое название · 25.11.2026"
+        after = "Уточнённое название · 25.11.2026"
+        plan = plan_grouped_sheet_update(SHEET, 6, keys, groups, [meeting],
+                                         owned_groups=owned,
+                                         existing_header_labels={MEETING + "old": before})
+        self.assertEqual(plan.requests, [{"updateCells": {
+            "start": {"sheetId": SHEET, "rowIndex": 4, "columnIndex": 2},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": after}}]}],
+            "fields": "userEnteredValue",
+        }}])
+        self.assertEqual(plan_grouped_sheet_update(
+            SHEET, 6, keys, groups, [meeting], owned_groups=owned,
+            existing_header_labels={MEETING + "old": after}).requests, [])
+        with self.assertRaisesRegex(ValueError, "non-text meeting header"):
+            plan_grouped_sheet_update(SHEET, 6, keys, groups, [meeting], owned_groups=owned,
+                                      existing_header_labels={MEETING + "old": "=A1"})
+
     def test_empty_sheets_append_only_and_duplicate_meeting_titles_do_not_merge(self):
         tasks = [task("first", "MYmeet", meeting="instance1", meeting_day=TODAY),
                  task("second", "MYmeet", meeting="instance2", meeting_day=TODAY)]
@@ -146,6 +185,10 @@ class GroupingTests(unittest.TestCase):
 
 
 TESTS = [
+    (GroupingTests("test_renamed_meeting_updates_only_managed_header_value").debug,
+     "Мои задачи: обновление заголовка встречи по постоянному ID"),
+    (GroupingTests("test_google_tasks_sorts_roots_and_siblings_without_separating_subtasks").debug,
+     "Мои задачи: сортировка без разрыва дерева Google Tasks"),
     (GroupingTests("test_moves_whole_rows_and_nests_meetings_in_native_groups").debug,
      "Мои задачи: группы источников и встреч, целые строки, повтор"),
     (GroupingTests("test_restores_collapsed_by_meeting_id_after_insertion_and_reorder").debug,

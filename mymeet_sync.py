@@ -22,6 +22,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import gspread
 import requests
@@ -1207,6 +1208,15 @@ class VerifiedGroupedDestination:
     sheet_id: int
 
 
+@dataclass(frozen=True)
+class PendingGroupedWrite:
+    receipt: str
+    owned_groups: tuple
+
+
+_GROUPED_RECEIPT_KEY = "my_tasks_structural_write"
+
+
 def _verify_grouped_destination(provider, rows_builder, spreadsheet_id):
     if provider is None or rows_builder is None or not spreadsheet_id:
         return None
@@ -1219,8 +1229,9 @@ def _verify_grouped_destination(provider, rows_builder, spreadsheet_id):
     return destination
 
 
-def _grouped_sheet_snapshot(spreadsheet, sheet_id):
-    fields = "sheets(properties(sheetId,title,gridProperties(rowCount),sheetType),rowGroups)"
+def _grouped_sheet_metadata(spreadsheet, sheet_id):
+    fields = ("sheets(properties(sheetId,title,gridProperties(rowCount),sheetType),rowGroups,"
+              "developerMetadata(metadataId,metadataKey,metadataValue,location,visibility))")
     metadata = _gs_call(spreadsheet.fetch_sheet_metadata, params={"fields": fields})
     for sheet in metadata["sheets"]:
         properties = sheet["properties"]
@@ -1228,31 +1239,71 @@ def _grouped_sheet_snapshot(spreadsheet, sheet_id):
             continue
         if properties["sheetType"] != "GRID":
             raise ValueError("Grouped task destination must be a grid sheet")
-        title = properties["title"]
-        data_filter = {"gridRange": {"sheetId": sheet_id, "endColumnIndex": 8}}
-        response = _gs_call(
-            spreadsheet.client.request, "post",
-            (SPREADSHEET_URL % spreadsheet.id) + "/values:batchGetByDataFilter",
-            json={"dataFilters": [data_filter], "valueRenderOption": "FORMULA"},
-        ).json()
-        matched = response["valueRanges"]
-        if (response["spreadsheetId"] != spreadsheet.id or len(matched) != 1
-                or matched[0]["dataFilters"] != [data_filter]):
-            raise ValueError("Grouped task sheet snapshot did not match the verified destination")
-        rows = matched[0]["valueRange"].get("values", [])
-        if not rows or rows[0] != MY_TASKS_HEADER_ROW_V2:
-            raise ValueError("Grouped task destination needs a pre-provisioned V2 task sheet")
-        return title, properties["gridProperties"]["rowCount"], rows, sheet.get("rowGroups", [])
+        return sheet
     raise ValueError("Verified task sheet is absent")
+
+
+def _grouped_write_receipt(sheet, sheet_id):
+    receipts = [item for item in sheet.get("developerMetadata", [])
+                if item.get("metadataKey") == _GROUPED_RECEIPT_KEY]
+    if not receipts:
+        return None
+    receipt = receipts[0]
+    location = receipt.get("location", {})
+    if (len(receipts) != 1 or receipt.get("visibility") != "PROJECT"
+            or location.get("locationType") != "SHEET" or location.get("sheetId", 0) != sheet_id
+            or not isinstance(receipt.get("metadataId"), int) or receipt["metadataId"] <= 0
+            or not isinstance(receipt.get("metadataValue"), str)):
+        raise ValueError("Grouped write receipt metadata is ambiguous")
+    return receipt["metadataId"], receipt["metadataValue"]
+
+
+def _grouped_receipt_request(sheet_id, previous, value):
+    if previous is None:
+        return {"createDeveloperMetadata": {"developerMetadata": {
+            "metadataKey": _GROUPED_RECEIPT_KEY, "metadataValue": value,
+            "location": {"sheetId": sheet_id}, "visibility": "PROJECT",
+        }}}
+    return {"updateDeveloperMetadata": {
+        "dataFilters": [{"developerMetadataLookup": {"metadataId": previous[0]}}],
+        "developerMetadata": {"metadataValue": value},
+        "fields": "metadataValue",
+    }}
+
+
+def _grouped_sheet_snapshot(spreadsheet, sheet_id):
+    sheet = _grouped_sheet_metadata(spreadsheet, sheet_id)
+    properties = sheet["properties"]
+    data_filter = {"gridRange": {"sheetId": sheet_id, "endColumnIndex": 8}}
+    response = _gs_call(
+        spreadsheet.client.request, "post",
+        (SPREADSHEET_URL % spreadsheet.id) + "/values:batchGetByDataFilter",
+        json={"dataFilters": [data_filter], "valueRenderOption": "FORMULA"},
+    ).json()
+    matched = response["valueRanges"]
+    if (response["spreadsheetId"] != spreadsheet.id or len(matched) != 1
+            or matched[0]["dataFilters"] != [data_filter]):
+        raise ValueError("Grouped task sheet snapshot did not match the verified destination")
+    rows = matched[0]["valueRange"].get("values", [])
+    if not rows or rows[0] != MY_TASKS_HEADER_ROW_V2:
+        raise ValueError("Grouped task destination needs a pre-provisioned V2 task sheet")
+    return (properties["title"], properties["gridProperties"]["rowCount"], rows,
+            sheet.get("rowGroups", []), _grouped_write_receipt(sheet, sheet_id))
 
 
 def _sync_grouped_my_tasks(
     spreadsheet, rows_builder, provider, assigned_candidates, preflight_destination,
 ):
-    from my_tasks_grouping import plan_grouped_sheet_update
+    from my_tasks_grouping import GROUP_HEADER_PREFIX, plan_grouped_sheet_update
 
-    # Provider authorization must perform a fresh ACL/account check. Its group
-    # ledger is separate from row identifiers editors can change in the sheet.
+    # The provider must prove a window that excludes external editors and other
+    # writers, not merely acquire a process-local lock. It must also implement
+    # a durable journal keyed by this user, spreadsheet and sheet. Begin must
+    # reject an existing entry. Finalize must atomically store the entry's
+    # owned groups and remove that exact entry. The exclusive window must
+    # survive context exit and worker crash while a journal entry is pending.
+    # External edits may resume only after proof of application or conclusive
+    # proof the original request cannot apply. A timeout is neither.
     title = None
     try:
         destination = _verify_grouped_destination(
@@ -1261,29 +1312,54 @@ def _sync_grouped_my_tasks(
                 or (preflight_destination is not None and destination != preflight_destination)
                 or (assigned_candidates and preflight_destination is None)):
             raise ValueError("Private task destination was not verified")
-        snapshot = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
-        title, row_count, rows, groups = snapshot
-        # The provider must supply the complete trusted inventory, including
-        # stable meeting metadata for previously imported tasks.
-        tasks = provider.task_rows(destination, rows_builder, assigned_candidates)
-        existing_keys = [
-            str(row[7]).strip() if len(row) > 7 and row[7] is not None else None
-            for row in rows[1:]
-        ]
-        owned = tuple(provider.load_groups(destination))
-        plan = plan_grouped_sheet_update(
-            destination.sheet_id, row_count, existing_keys, groups, tasks,
-            owned_groups=owned,
-        )
-        if (destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id)
-                or snapshot != _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
-                or owned != tuple(provider.load_groups(destination))):
-            raise ValueError("Task destination changed while planning")
-        if plan.requests:
-            # Position-based edits may already have applied after a transport
-            # timeout. Never retry the same batch with stale row indices.
-            _gs_call(spreadsheet.batch_update, {"requests": plan.requests}, retries=1)
-            provider.save_groups(destination, tuple(plan.owned_groups))
+        with provider.exclusive_write(destination) as exclusive:
+            if (exclusive is not True or destination != _verify_grouped_destination(
+                    provider, rows_builder, spreadsheet.id)):
+                raise ValueError("Exclusive structural write window was not verified")
+            snapshot = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
+            title, row_count, rows, groups, receipt = snapshot
+            pending = provider.load_pending_grouped_write(destination)
+            if pending is not None:
+                if (not isinstance(pending, PendingGroupedWrite)
+                        or receipt is None or receipt[1] != pending.receipt):
+                    # An earlier request might still reach Google. Never clear
+                    # the journal or send further positional writes based on
+                    # a missing receipt.
+                    raise ValueError("Earlier structural write has an unknown outcome")
+                provider.finalize_grouped_write(destination, pending)
+
+            # The provider supplies the complete trusted inventory, including
+            # stable meeting metadata and revalidated provenance of saved tasks.
+            tasks = provider.task_rows(destination, rows_builder, assigned_candidates)
+            existing_keys = [
+                str(row[7]).strip() if len(row) > 7 and row[7] is not None else None
+                for row in rows[1:]
+            ]
+            owned = tuple(provider.load_groups(destination))
+            meeting_keys = {group.key for group in owned
+                            if group.key.startswith(GROUP_HEADER_PREFIX + "meeting:")}
+            labels = {row[7]: row[2] for row in rows[1:]
+                      if len(row) > 7 and isinstance(row[7], str) and row[7] in meeting_keys}
+            plan = plan_grouped_sheet_update(
+                destination.sheet_id, row_count, existing_keys, groups, tasks,
+                owned_groups=owned, existing_header_labels=labels,
+            )
+            if (destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id)
+                    or snapshot != _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
+                    or owned != tuple(provider.load_groups(destination))):
+                raise ValueError("Task destination changed while planning")
+            if plan.requests:
+                pending = PendingGroupedWrite(uuid4().hex, tuple(plan.owned_groups))
+                provider.begin_grouped_write(destination, pending)
+                marker = _grouped_receipt_request(destination.sheet_id, receipt, pending.receipt)
+                # The receipt is in the same atomic Sheets batch as the moves.
+                # The journal is retained if delivery or finalization fails.
+                _gs_call(spreadsheet.batch_update, {"requests": [*plan.requests, marker]}, retries=1)
+                receipt_sheet = _grouped_sheet_metadata(spreadsheet, destination.sheet_id)
+                applied = _grouped_write_receipt(receipt_sheet, destination.sheet_id)
+                if applied is None or applied[1] != pending.receipt:
+                    raise ValueError("Structural write receipt was not confirmed")
+                provider.finalize_grouped_write(destination, pending)
         return [], len(tasks), title
     except Exception as exc:
         if rows_builder is not None:

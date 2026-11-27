@@ -20,6 +20,7 @@ class TaskRow:
     meeting_id: str = ""
     meeting_name: str = ""
     meeting_date: date | None = None
+    parent_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,25 @@ class GroupSpan:
 
 def _date_order(task: TaskRow):
     return task.deadline or date.max, task.key
+
+
+def _google_task_order(tasks: list[TaskRow]) -> list[str]:
+    by_key = {task.key: task for task in tasks}
+    children: dict[str, list[TaskRow]] = {}
+    for task in sorted(tasks, key=_date_order):
+        if task.parent_key and task.parent_key not in by_key:
+            raise ValueError("Missing Google Tasks parent")
+        children.setdefault(task.parent_key, []).append(task)
+
+    ordered = []
+    pending = list(reversed(children.get("", [])))
+    while pending:
+        task = pending.pop()
+        ordered.append(task.key)
+        pending.extend(reversed(children.get(task.key, [])))
+    if len(ordered) != len(tasks):
+        raise ValueError("Cyclic Google Tasks hierarchy")
+    return ordered
 
 
 def _layout(tasks: list[TaskRow]):
@@ -54,9 +74,11 @@ def _layout(tasks: list[TaskRow]):
     for source in _SOURCES:
         source_key = f"{GROUP_HEADER_PREFIX}source:{source}"
         start = add_header(source_key, source)
-        if source != "MYmeet":
+        if source == "Telegram":
             keys.extend(task.key for task in sorted(tasks, key=_date_order)
                         if task.source == source)
+        elif source == "Google Tasks":
+            keys.extend(_google_task_order([task for task in tasks if task.source == source]))
         else:
             meetings = {}
             meeting_labels = {}
@@ -109,12 +131,13 @@ def plan_grouped_sheet_update(
     tasks: list[TaskRow],
     *,
     owned_groups: tuple[GroupSpan, ...] = (),
+    existing_header_labels: dict[str, str] | None = None,
 ) -> GroupedSheetPlan:
     """Plan one batchUpdate for rows after the fixed column header.
 
     existing_keys covers the used rows in physical order. Non-task rows with
     absent keys can be represented by None. Unlisted rows keep their contents and
-    relative order. Existing cells are moved as whole rows and never rewritten.
+    relative order. Existing task cells move as whole rows. Only managed meeting labels may change.
     Only ranges previously recorded as owned by the bot for the same spreadsheet
     and sheet may be removed. A header key from the sheet alone is insufficient.
     Persist plan.owned_groups only after confirming the batch was applied.
@@ -145,8 +168,21 @@ def plan_grouped_sheet_update(
         collapsed[key] = bool(group.get("collapsed", False))
 
     old_group_set = set(old_groups)
+    labels = existing_header_labels or {}
+    managed_meetings = {group.key for group in old_groups if group.depth == 2}
+    header_updates = []
+    for index, key in enumerate(desired, start=1):
+        if key not in managed_meetings or key not in labels or labels[key] == values[key][2]:
+            continue
+        if not isinstance(labels[key], str) or labels[key].startswith("="):
+            raise ValueError("Cannot replace a non-text meeting header")
+        header_updates.append({"updateCells": {
+            "start": {"sheetId": sheet_id, "rowIndex": index, "columnIndex": 2},
+            "rows": [{"values": [_value(values[key][2])]}],
+            "fields": "userEnteredValue",
+        }})
     if keys[:len(desired)] == desired and old_group_set == set(expected_groups):
-        return GroupedSheetPlan([], expected_groups)
+        return GroupedSheetPlan(header_updates, expected_groups)
 
     requests = []
     for group in sorted(old_groups, key=lambda group: (-group.depth, group.start)):
@@ -190,4 +226,4 @@ def plan_grouped_sheet_update(
                                    "depth": group.depth, "collapsed": True},
                 "fields": "collapsed",
             }})
-    return GroupedSheetPlan(requests, expected_groups)
+    return GroupedSheetPlan([*requests, *header_updates], expected_groups)

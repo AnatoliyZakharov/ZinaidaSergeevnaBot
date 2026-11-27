@@ -801,8 +801,15 @@ def _record_params(telegram_id: int, r: dict, cols: list) -> list:
     return [telegram_id] + vals
 
 
+_MY_TASK_REKEY_SQL = (
+    "UPDATE my_tasks SET source_key = ? WHERE telegram_id = ? AND source_key = ? "
+    "AND NOT EXISTS (SELECT 1 FROM my_tasks WHERE telegram_id = ? AND source_key = ?)"
+)
+
+
 def my_tasks_upsert(telegram_id: int, records: list[dict]) -> None:
     """Вставка/обновление записей по (telegram_id, source_key). Ничего не удаляет.
+    Переносы ключей из _old_keys и обновления выполняются в одной транзакции.
     Записи с ошибкой расшифровки не сохраняются (защита от затирания)."""
     records = [r for r in records if not r.get("_decrypt_error")]
     if not records:
@@ -818,9 +825,16 @@ def my_tasks_upsert(telegram_id: int, records: list[dict]) -> None:
     params = [_record_params(telegram_id, r, cols) for r in records]
     with _lock:
         conn = _connect()
-        conn.executemany(sql, params)
-        conn.commit()
-        conn.close()
+        try:
+            with conn:
+                for record in records:
+                    key = record["source_key"]
+                    for old in record.get("_old_keys", ()):
+                        conn.execute(_MY_TASK_REKEY_SQL,
+                                     (key, telegram_id, old, telegram_id, key))
+                conn.executemany(sql, params)
+        finally:
+            conn.close()
 
 
 def my_tasks_insert_new(telegram_id: int, record: dict) -> bool:
@@ -845,8 +859,7 @@ def my_tasks_rekey(telegram_id: int, old_key: str, new_key: str) -> bool:
     with _lock:
         conn = _connect()
         cur = conn.execute(
-            "UPDATE my_tasks SET source_key = ? WHERE telegram_id = ? AND source_key = ? "
-            "AND NOT EXISTS (SELECT 1 FROM my_tasks WHERE telegram_id = ? AND source_key = ?)",
+            _MY_TASK_REKEY_SQL,
             (new_key, telegram_id, old_key, telegram_id, new_key),
         )
         conn.commit()

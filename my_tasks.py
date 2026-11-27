@@ -1080,12 +1080,12 @@ class MyTasksBuilder:
         return self.dbm or _db()
 
     def _save(self, records) -> None:
-        dirty = [r for r in records if r.pop("_dirty", False)]
-        for r in dirty:
-            for old in r.pop("_old_keys", []):
-                self._store().my_tasks_rekey(self.telegram_id, old, r["source_key"])
+        dirty = [r for r in records if r.get("_dirty")]
         if dirty:
             self._store().my_tasks_upsert(self.telegram_id, dirty)
+            for record in dirty:
+                record.pop("_dirty", None)
+                record.pop("_old_keys", None)
 
     def matcher(self):
         name = self.full_name

@@ -988,6 +988,53 @@ def test_concurrent_manual_edit_not_overwritten():
         assert book.rows(MY_TITLE)["B"][6] == "Выполнено"
 
 
+def test_build_rolls_back_legacy_rekey_on_partial_sqlite_failure():
+    import sqlite3
+
+    mt = _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        old_key, new_key = "gtasks:a", "gtasks:L1:a"
+        db.my_tasks_upsert(1, [{
+            "source": "gtasks", "source_key": old_key, "title": "Старое название",
+            "status": "В работе", "gtasks_list_id": "L1", "gtasks_task_id": "a",
+        }])
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript("""
+                PRAGMA journal_mode = WAL;
+                CREATE TRIGGER fail_before_task_upsert BEFORE INSERT ON my_tasks
+                WHEN NEW.source_key = 'gtasks:L1:a'
+                BEGIN SELECT RAISE(ABORT, 'isolated test failure'); END;
+            """)
+            gt = _FakeGT([_gt("a", title="Новое название")])
+
+            def builder():
+                return mt.MyTasksBuilder(1, ME, dbm=db, gt_ops=gt,
+                                         gtasks=(gt.items, True, gt.list_ids))
+
+            try:
+                builder().build([], [mt.HEADER_V2])
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("Expected SQLite to reject the update after rekey")
+            assert db.my_tasks_get(1, old_key)["title"] == "Старое название"
+            assert db.my_tasks_get(1, new_key) is None
+            assert not gt.calls
+            conn.execute("DROP TRIGGER fail_before_task_upsert")
+
+            for _ in range(2):
+                rows = builder().build([], [mt.HEADER_V2])
+                assert [row[7] for row in rows] == [new_key]
+            assert db.my_tasks_get(1, old_key) is None
+            assert db.my_tasks_get(1, new_key)["title"] == "Новое название"
+            assert not gt.calls
+        finally:
+            conn.close()
+
+
 def test_status_push_recovery_after_confirmed_sheet_write():
     ms, mt = _load_ms(), _load_my_tasks()
     for applied in (False, True):
@@ -1660,6 +1707,8 @@ TESTS = [
     (test_mass_cancel_in_sheet_no_deletes, "Отмена: массовая — без удалений"),
     (test_deleted_in_gt_becomes_cancelled_after_confirmation, "Удаление в GT → «Отменено»"),
     (test_concurrent_manual_edit_not_overwritten, "Гонка: ручная правка не затирается"),
+    (test_build_rolls_back_legacy_rekey_on_partial_sqlite_failure,
+     "Мои задачи: атомарное восстановление SQLite после частичного build"),
     (test_status_push_recovery_after_confirmed_sheet_write, "Google Tasks: восстановление PATCH после сбоя"),
     (test_sheet_write_failure_and_shrink_keep_data, "Лист: ошибка записи / сжатие"),
     (test_legacy_sheet_migration_and_legacy_mode, "Лист: миграция старого формата"),

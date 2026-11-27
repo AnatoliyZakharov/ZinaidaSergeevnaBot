@@ -1248,6 +1248,58 @@ def test_grouped_transport_does_not_replay_auth_or_retryable_statuses():
     assert credentials.before_request.call_count == 5
 
 
+def test_grouped_existing_cells_require_plain_text_and_comment_evidence():
+    from copy import deepcopy
+
+    ms, workbook, owner, _, provider, _ = _grouped_adapter_fixture()
+    provider.authorize_uncommented_cells.return_value = True
+    row = [1, "", "Telegram", "До", "", "", "В работе", "tg:example"]
+    rows = [ms.MY_TASKS_HEADER_ROW_V2, row]
+    changes = {"tg:example": {3: "После"}}
+    cell = {"userEnteredValue": {"stringValue": "До"}}
+    sheet = {"properties": {"sheetId": 27}, "data": [
+        {"startRow": 1, "startColumn": 3, "rowData": [{"values": [cell]}]},
+    ]}
+    reply = {"spreadsheetId": workbook.id, "sheets": [sheet]}
+    workbook.client.request.side_effect = lambda *args, **kwargs: NS(json=lambda: deepcopy(reply))
+    ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    assert workbook.client.request.call_args.kwargs["json"]["commentsViewMode"] == (
+        "COMMENTS_VIEW_MODE_INCLUDED")
+    sheet["commentAnchors"] = [{"commentId": "fixture"}]
+    try:
+        ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Reported comments must block updates")
+    del sheet["commentAnchors"]
+
+    for field, value in (("note", "Ручная заметка"), ("hyperlink", "https://example.test"),
+                         ("textFormatRuns", [{"startIndex": 0}]),
+                         ("dataValidation", {"strict": True}),
+                         ("userEnteredValue", {"formulaValue": "=A1"})):
+        original = cell.get(field)
+        cell[field] = value
+        try:
+            ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Protected task metadata must block updates")
+        if original is None:
+            del cell[field]
+        else:
+            cell[field] = original
+
+    provider.authorize_uncommented_cells.return_value = False
+    try:
+        ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Independent comment coverage must be verified")
+
+
 def test_grouped_adapter_requires_exclusive_write_window():
     from contextlib import nullcontext
 
@@ -1328,6 +1380,8 @@ TESTS = [
      "Мои задачи: конфликт чтения и отсутствие повтора позиционного batchUpdate"),
     (test_grouped_transport_does_not_replay_auth_or_retryable_statuses,
      "Мои задачи: транспорт не повторяет позиционный запрос"),
+    (test_grouped_existing_cells_require_plain_text_and_comment_evidence,
+     "Мои задачи: адресная запись только в проверенные текстовые ячейки"),
     (test_grouped_adapter_requires_exclusive_write_window,
      "Мои задачи: запись только в исключительном окне"),
     (test_grouped_adapter_recovers_applied_timeout_and_local_finalize_failure,

@@ -1292,6 +1292,54 @@ def _grouped_sheet_snapshot(spreadsheet, sheet_id, *, render="FORMULA"):
             sheet.get("rowGroups", []), _grouped_write_receipt(sheet, sheet_id))
 
 
+def _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, changes):
+    """Authorize only plain cells whose same-grid metadata can be inspected."""
+    source = {str(row[7]).strip(): (index, row) for index, row in enumerate(rows[1:], 1)
+              if len(row) > 7 and row[7]}
+    locations = [(source[key][0], col) for key, values in changes.items() for col in values]
+    ranges = [{"sheetId": destination.sheet_id, "startRowIndex": row, "endRowIndex": row + 1,
+               "startColumnIndex": col, "endColumnIndex": col + 1} for row, col in locations]
+    fields = ("spreadsheetId,sheets(properties(sheetId),data(startRow,startColumn,"
+              "rowData(values(userEnteredValue,hyperlink,textFormatRuns,note,dataValidation,"
+              "userEnteredFormat(textFormat(link),numberFormat),chipRuns,pivotTable,dataSourceFormula,"
+              "dataSourceTable))),commentAnchors)")
+    response = _gs_call(
+        spreadsheet.client.request, "post", (SPREADSHEET_URL % spreadsheet.id) + ":getByDataFilter",
+        params={"fields": fields},
+        json={"dataFilters": [{"gridRange": grid} for grid in ranges],
+              "commentsViewMode": "COMMENTS_VIEW_MODE_INCLUDED"},
+    ).json()
+    sheets = response.get("sheets", [])
+    if (response.get("spreadsheetId") != destination.spreadsheet_id or len(sheets) != 1
+            or sheets[0].get("properties", {}).get("sheetId", 0) != destination.sheet_id
+            or sheets[0].get("commentAnchors")
+            or provider.authorize_uncommented_cells(destination, tuple(locations)) is not True):
+        raise ValueError("Existing task cells lack trusted protection evidence")
+    protected = ("hyperlink", "textFormatRuns", "note", "dataValidation", "chipRuns",
+                 "pivotTable", "dataSourceFormula", "dataSourceTable")
+    cells = {}
+    for grid in sheets[0].get("data", []):
+        values = grid.get("rowData", [])
+        if len(values) != 1 or len(values[0].get("values", [])) != 1:
+            continue
+        position = grid.get("startRow", 0), grid.get("startColumn", 0)
+        if position in cells:
+            raise ValueError("Existing cell metadata is ambiguous")
+        cells[position] = values[0]["values"][0]
+    for key, values in changes.items():
+        index, row = source[key]
+        for column in values:
+            cell = cells.get((index, column))
+            if (cell is None or any(cell.get(field) for field in protected)
+                    or cell.get("userEnteredFormat", {}).get("textFormat", {}).get("link")):
+                raise ValueError("Existing task field has protected cell metadata")
+            raw = row[column] if len(row) > column else ""
+            entered = cell.get("userEnteredValue")
+            expected = {"stringValue": raw} if isinstance(raw, str) and raw else {}
+            if (isinstance(raw, str) and raw.startswith("=")) or (entered or {}) != expected:
+                raise ValueError("Existing task field is not proven plain text")
+
+
 def _submit_grouped_batch_once(spreadsheet, requests_to_apply):
     """Authorize before sending, avoiding gspread backoff and auth replay."""
     url = (SPREADSHEET_URL % spreadsheet.id) + ":batchUpdate"
@@ -1363,10 +1411,14 @@ def _sync_grouped_my_tasks(
             # the complete reconciled inventory, including saved assignments.
             tasks = provider.task_rows(destination, rows_builder, built)
             if ({task.key for task in tasks} != expected.keys()
-                    or any(observed[key] != expected[key] for key in observed.keys() & expected.keys())
                     or any(fields([task.values]).get(task.key) != expected[task.key]
                            for task in tasks if task.key not in observed)):
                 raise ValueError("Grouped writer cannot safely publish reconciled task fields")
+            changes = {
+                key: {column: after for column, (before, after)
+                      in enumerate(zip(observed[key], expected[key]), start=1) if before != after}
+                for key in observed.keys() & expected.keys() if observed[key] != expected[key]
+            }
             existing_keys = [
                 str(row[7]).strip() if len(row) > 7 and row[7] is not None else None
                 for row in rows[1:]
@@ -1376,14 +1428,25 @@ def _sync_grouped_my_tasks(
                             if group.key.startswith(GROUP_HEADER_PREFIX + "meeting:")}
             labels = {row[7]: row[2] for row in rows[1:]
                       if len(row) > 7 and isinstance(row[7], str) and row[7] in meeting_keys}
+            checked_cells = dict(changes)
+            for task in tasks:
+                header_key = f"{GROUP_HEADER_PREFIX}meeting:{task.meeting_id}"
+                if task.source == "MYmeet" and task.meeting_date and header_key in labels:
+                    title_value = f"{task.meeting_name} · {task.meeting_date:%d.%m.%Y}"
+                    if labels[header_key] != title_value:
+                        checked_cells[header_key] = {2: title_value}
+            if checked_cells:
+                _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, checked_cells)
             plan = plan_grouped_sheet_update(
                 destination.sheet_id, row_count, existing_keys, groups, tasks,
-                owned_groups=owned, existing_header_labels=labels,
+                owned_groups=owned, existing_header_labels=labels, existing_cell_updates=changes,
             )
             if (destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id)
                     or snapshot != _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
                     or owned != tuple(provider.load_groups(destination))):
                 raise ValueError("Task destination changed while planning")
+            if checked_cells:
+                _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, checked_cells)
             if plan.requests:
                 pending = PendingGroupedWrite(uuid4().hex, tuple(plan.owned_groups))
                 provider.begin_grouped_write(destination, pending)

@@ -174,6 +174,21 @@ class GroupingTests(unittest.TestCase):
             plan_grouped_sheet_update(SHEET, 6, keys, groups, [meeting], owned_groups=owned,
                                       existing_header_labels={MEETING + "old": "=A1"})
 
+    def test_existing_cell_update_uses_final_key_position(self):
+        tasks = self.tasks[:2]
+        keys = [SOURCE + "Telegram", "late", "urgent", SOURCE + "Google Tasks", SOURCE + "MYmeet"]
+        plan = plan_grouped_sheet_update(
+            SHEET, 6, keys, [group(2, 4, 1)], tasks,
+            owned_groups=(GroupSpan(SOURCE + "Telegram", 2, 4, 1),),
+            existing_cell_updates={"urgent": {3: "Новое название"}},
+        )
+        self.assertEqual(requests_of(plan.requests, "moveDimension")[0]["destinationIndex"], 2)
+        self.assertEqual(requests_of(plan.requests, "updateCells"), [{
+            "start": {"sheetId": SHEET, "rowIndex": 2, "columnIndex": 3},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": "Новое название"}}]}],
+            "fields": "userEnteredValue",
+        }])
+
     def test_empty_sheets_append_only_and_duplicate_meeting_titles_do_not_merge(self):
         tasks = [task("first", "MYmeet", meeting="instance1", meeting_day=TODAY),
                  task("second", "MYmeet", meeting="instance2", meeting_day=TODAY)]
@@ -185,6 +200,8 @@ class GroupingTests(unittest.TestCase):
 
 
 TESTS = [
+    (GroupingTests("test_existing_cell_update_uses_final_key_position").debug,
+     "Мои задачи: разрешённая ячейка обновляется по позиции устойчивого ключа"),
     (GroupingTests("test_renamed_meeting_updates_only_managed_header_value").debug,
      "Мои задачи: обновление заголовка встречи по постоянному ID"),
     (GroupingTests("test_google_tasks_sorts_roots_and_siblings_without_separating_subtasks").debug,

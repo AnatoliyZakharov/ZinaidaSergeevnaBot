@@ -132,6 +132,7 @@ def plan_grouped_sheet_update(
     *,
     owned_groups: tuple[GroupSpan, ...] = (),
     existing_header_labels: dict[str, str] | None = None,
+    existing_cell_updates: dict[str, dict[int, str]] | None = None,
 ) -> GroupedSheetPlan:
     """Plan one batchUpdate for rows after the fixed column header.
 
@@ -181,6 +182,18 @@ def plan_grouped_sheet_update(
             "rows": [{"values": [_value(values[key][2])]}],
             "fields": "userEnteredValue",
         }})
+    updates = existing_cell_updates or {}
+    if not updates.keys() <= (set(desired) & set(known)):
+        raise ValueError("Existing cell update must name a displayed stable task")
+    for index, key in enumerate(desired, start=1):
+        for column, value in sorted(updates.get(key, {}).items()):
+            if key.startswith(GROUP_HEADER_PREFIX) or column not in range(1, 7):
+                raise ValueError("Existing cell update targets a protected column")
+            header_updates.append({"updateCells": {
+                "start": {"sheetId": sheet_id, "rowIndex": index, "columnIndex": column},
+                "rows": [{"values": [_value(value)]}],
+                "fields": "userEnteredValue",
+            }})
     if keys[:len(desired)] == desired and old_group_set == set(expected_groups):
         return GroupedSheetPlan(header_updates, expected_groups)
 

@@ -811,9 +811,10 @@ def reconcile_gtasks(records: dict, items: list, complete: bool, list_ids,
                     elif raw == GT_OPEN and status == ST_DONE:
                         rec["status"] = ST_IN_WORK
                         stats["gtasks_status_in"] = stats.get("gtasks_status_in", 0) + 1
-                elif local_changed and gt_class(status) != raw:
+                if local_changed and gt_class(status) != raw:
                     plan.pushes.append((key, it["_listId"], it["id"], gt_class(status)))
-                rec["ext_synced_status"] = rec["status"]
+                else:
+                    rec["ext_synced_status"] = rec["status"]
             rec["ext_status"] = raw
             rec["_dirty"] = True
         for field, val in (("title", title[:TITLE_MAX_LEN]), ("origin", origin),
@@ -1270,6 +1271,7 @@ class MyTasksBuilder:
             rec = recs[key]
             if ok:
                 rec["ext_status"] = gt_status
+                rec["ext_synced_status"] = rec["status"]
                 _inc(self.stats, "gtasks_status_out")
             else:
                 rec["ext_synced_status"] = None    # повторим при следующей сверке

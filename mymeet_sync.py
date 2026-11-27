@@ -26,6 +26,7 @@ from uuid import uuid4
 
 import gspread
 import requests
+from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
 from gspread.urls import SPREADSHEET_URL
 
@@ -1271,14 +1272,14 @@ def _grouped_receipt_request(sheet_id, previous, value):
     }}
 
 
-def _grouped_sheet_snapshot(spreadsheet, sheet_id):
+def _grouped_sheet_snapshot(spreadsheet, sheet_id, *, render="FORMULA"):
     sheet = _grouped_sheet_metadata(spreadsheet, sheet_id)
     properties = sheet["properties"]
     data_filter = {"gridRange": {"sheetId": sheet_id, "endColumnIndex": 8}}
     response = _gs_call(
         spreadsheet.client.request, "post",
         (SPREADSHEET_URL % spreadsheet.id) + "/values:batchGetByDataFilter",
-        json={"dataFilters": [data_filter], "valueRenderOption": "FORMULA"},
+        json={"dataFilters": [data_filter], "valueRenderOption": render},
     ).json()
     matched = response["valueRanges"]
     if (response["spreadsheetId"] != spreadsheet.id or len(matched) != 1
@@ -1291,10 +1292,31 @@ def _grouped_sheet_snapshot(spreadsheet, sheet_id):
             sheet.get("rowGroups", []), _grouped_write_receipt(sheet, sheet_id))
 
 
+def _submit_grouped_batch_once(spreadsheet, requests_to_apply):
+    """Authorize before sending, avoiding gspread backoff and auth replay."""
+    url = (SPREADSHEET_URL % spreadsheet.id) + ":batchUpdate"
+    headers = {}
+    with requests.Session() as session:
+        # Credential refresh can retry before mutation. Use the plain session
+        # for the batch so 401/429/503 and redirects cannot trigger replay.
+        spreadsheet.client.auth.before_request(Request(session=session), "POST", url, headers)
+        _throttle()
+        response = session.post(url, json={"requests": requests_to_apply}, headers=headers,
+                                timeout=(5, 30), allow_redirects=False)
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise ValueError("Structural batch returned an unexpected status")
+
+
 def _sync_grouped_my_tasks(
     spreadsheet, rows_builder, provider, assigned_candidates, preflight_destination,
 ):
+    from my_tasks import sheet_snapshot
     from my_tasks_grouping import GROUP_HEADER_PREFIX, plan_grouped_sheet_update
+
+    def fields(by_row):
+        return {row[7]: row[1:7] for row in sheet_snapshot(by_row)
+                if row[7] and not row[7].startswith(GROUP_HEADER_PREFIX)}
 
     # The provider must prove a window that excludes external editors and other
     # writers, not merely acquire a process-local lock. It must also implement
@@ -1328,9 +1350,23 @@ def _sync_grouped_my_tasks(
                     raise ValueError("Earlier structural write has an unknown outcome")
                 provider.finalize_grouped_write(destination, pending)
 
-            # The provider supplies the complete trusted inventory, including
-            # stable meeting metadata and revalidated provenance of saved tasks.
-            tasks = provider.task_rows(destination, rows_builder, assigned_candidates)
+            displayed = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id,
+                                                render="FORMATTED_VALUE")[2]
+            # build persists retryable reconciliation intent; the emitted plan
+            # remains local to this attempt, including Google Tasks operations.
+            built = rows_builder.build(list(assigned_candidates), displayed)
+            if built is None:
+                raise ValueError("Task reconciliation was blocked")
+            expected = fields(built)
+            observed = fields(displayed[1:])
+            # The provider attaches trusted source and meeting provenance to
+            # the complete reconciled inventory, including saved assignments.
+            tasks = provider.task_rows(destination, rows_builder, built)
+            if ({task.key for task in tasks} != expected.keys()
+                    or any(observed[key] != expected[key] for key in observed.keys() & expected.keys())
+                    or any(fields([task.values]).get(task.key) != expected[task.key]
+                           for task in tasks if task.key not in observed)):
+                raise ValueError("Grouped writer cannot safely publish reconciled task fields")
             existing_keys = [
                 str(row[7]).strip() if len(row) > 7 and row[7] is not None else None
                 for row in rows[1:]
@@ -1354,12 +1390,19 @@ def _sync_grouped_my_tasks(
                 marker = _grouped_receipt_request(destination.sheet_id, receipt, pending.receipt)
                 # The receipt is in the same atomic Sheets batch as the moves.
                 # The journal is retained if delivery or finalization fails.
-                _gs_call(spreadsheet.batch_update, {"requests": [*plan.requests, marker]}, retries=1)
+                _submit_grouped_batch_once(spreadsheet, [*plan.requests, marker])
                 receipt_sheet = _grouped_sheet_metadata(spreadsheet, destination.sheet_id)
                 applied = _grouped_write_receipt(receipt_sheet, destination.sheet_id)
                 if applied is None or applied[1] != pending.receipt:
                     raise ValueError("Structural write receipt was not confirmed")
                 provider.finalize_grouped_write(destination, pending)
+            published = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id,
+                                                render="FORMATTED_VALUE")[2]
+            actual = fields(published[1:])
+            if any(actual.get(key) != value for key, value in expected.items()):
+                raise ValueError("Confirmed sheet differs from reconciled task fields")
+            rows_builder.commit()
+            rows_builder.execute_external()
         return [], len(tasks), title
     except Exception as exc:
         if rows_builder is not None:

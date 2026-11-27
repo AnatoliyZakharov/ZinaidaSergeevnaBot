@@ -228,8 +228,9 @@ def set_task_status(telegram_id: int, list_id: str, task_id: str, gt_status: str
     if gt_status == "needsAction":
         body["completed"] = None
     try:
-        _execute_with_retry(
-            lambda: service.tasks().patch(tasklist=list_id, task=task_id, body=body))
+        # An ambiguous response can follow an applied PATCH. Reconcile with a
+        # fresh task snapshot before sending another status change.
+        service.tasks().patch(tasklist=list_id, task=task_id, body=body).execute()
         return True
     except HttpError as e:
         logger.error("Tasks: ошибка смены статуса: HTTP %s", _status_code(e))

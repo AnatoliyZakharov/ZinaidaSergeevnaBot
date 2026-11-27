@@ -988,6 +988,35 @@ def test_concurrent_manual_edit_not_overwritten():
         assert book.rows(MY_TITLE)["B"][6] == "Выполнено"
 
 
+def test_status_push_recovery_after_confirmed_sheet_write():
+    ms, mt = _load_ms(), _load_my_tasks()
+    for applied in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _tmp_db(tmp)
+            _user(db)
+            book = _Book({"Планёрка": [PROTO_HDR]})
+            gt = _FakeGT([_gt("a", title="A")])
+            _sync(mt, ms, db, book, gt)
+            book.set_status(MY_TITLE, "A", "Выполнено")
+            builder = mt.MyTasksBuilder(1, ME, dbm=db, gt_ops=gt,
+                                        gtasks=(gt.items, True, gt.list_ids))
+            rows = builder.build([], book.data[MY_TITLE])
+            book.data[MY_TITLE] = [ms.MY_TASKS_HEADER_ROW_V2, *rows]
+            builder.commit()
+            record = db.my_tasks_get(1, "gtasks:L1:a")
+            assert record["sheet_status"] == "Выполнено"
+            assert record["ext_synced_status"] == "В работе"
+
+            # Simulate restart without executing the plan, or after PATCH applied
+            # but before the local acknowledgement could be recorded.
+            if applied:
+                gt.items[0]["status"] = "completed"
+            _sync(mt, ms, db, book, gt)
+            expected = [] if applied else [("status", "L1", "a", "completed")]
+            assert gt.calls == expected
+            assert db.my_tasks_get(1, "gtasks:L1:a")["ext_synced_status"] == "Выполнено"
+
+
 def test_sheet_write_failure_and_shrink_keep_data():
     ms, mt = _load_ms(), _load_my_tasks()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1309,6 +1338,9 @@ def test_gtasks_api_wrappers():
     assert patches[0]["body"] == {"status": "completed"}
     assert patches[1]["body"] == {"status": "needsAction", "completed": None}
     assert not gt.set_task_status(1, "L1", "1", "deleted", service=s)
+    s = _GTService(lists, pages, HttpError, op_errors=[503, 0])
+    assert not gt.set_task_status(1, "L1", "1", "completed", service=s)
+    assert len(s.calls) == 1
 
 
 def test_auth_scopes_no_gmail_and_no_gt_insert():
@@ -1628,6 +1660,7 @@ TESTS = [
     (test_mass_cancel_in_sheet_no_deletes, "Отмена: массовая — без удалений"),
     (test_deleted_in_gt_becomes_cancelled_after_confirmation, "Удаление в GT → «Отменено»"),
     (test_concurrent_manual_edit_not_overwritten, "Гонка: ручная правка не затирается"),
+    (test_status_push_recovery_after_confirmed_sheet_write, "Google Tasks: восстановление PATCH после сбоя"),
     (test_sheet_write_failure_and_shrink_keep_data, "Лист: ошибка записи / сжатие"),
     (test_legacy_sheet_migration_and_legacy_mode, "Лист: миграция старого формата"),
     (test_run_sync_outcomes_and_retry_no_duplicates, "run_sync: итоги, повтор без дублей"),

@@ -1065,6 +1065,7 @@ def _grouped_adapter_fixture():
     provider = MagicMock()
     provider.authorize.return_value = owner
     provider.task_rows.return_value = [task]
+    builder.build.side_effect = lambda *_: [list(t.values) for t in provider.task_rows.return_value]
     state = {"pending": None, "owned": (), "rows": [ms.MY_TASKS_HEADER_ROW_V2],
              "external_writes_disabled": False}
     provider.external_writes_disabled.side_effect = lambda: state["external_writes_disabled"]
@@ -1109,6 +1110,7 @@ def _grouped_adapter_fixture():
     provider.begin_grouped_write.side_effect = begin
     provider.finalize_grouped_write.side_effect = finalize
     workbook.batch_update.side_effect = apply
+    ms._submit_grouped_batch_once = lambda sheet, ops: sheet.batch_update({"requests": ops})
 
     def matched(*args, **kwargs):
         return NS(json=lambda: {"spreadsheetId": workbook.id, "valueRanges": [{
@@ -1127,12 +1129,14 @@ def test_grouped_adapter_pins_access_and_requests_ranges_by_id():
                                      grouped_provider=provider)
     assert result == ([], 1, "Изолированная книга")
     assert provider.authorize.call_count == 4
-    assert workbook.client.request.call_count == 2
+    assert workbook.client.request.call_count == 4
     for call in workbook.client.request.call_args_list:
         assert call.args[1].endswith("/values:batchGetByDataFilter")
         assert call.kwargs["json"]["dataFilters"][0]["gridRange"]["sheetId"] == owner.sheet_id
     workbook.values_batch_get.assert_not_called()
     workbook.batch_update.assert_called_once()
+    builder.commit.assert_called_once()
+    builder.execute_external.assert_called_once()
     provider.finalize_grouped_write.assert_called_once()
     assert provider.finalize_grouped_write.call_args.args[0] == owner
     assert not provider.load_pending_grouped_write(owner)
@@ -1182,7 +1186,7 @@ def test_grouped_adapter_blocks_conflict_and_does_not_replay_503():
         return NS(json=lambda: reply)
 
     workbook.client.request.side_effect = lambda *a, **kw: (
-        matched(*a, **kw) if workbook.client.request.call_count == 1 else changed(*a, **kw)
+        matched(*a, **kw) if workbook.client.request.call_count < 3 else changed(*a, **kw)
     )
     result = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
     assert result[1] is None
@@ -1202,6 +1206,34 @@ def test_grouped_adapter_blocks_conflict_and_does_not_replay_503():
     assert result[1] is None
     workbook.batch_update.assert_called_once()
     assert provider.external_writes_disabled()
+
+
+def test_grouped_transport_does_not_replay_auth_or_retryable_statuses():
+    from unittest.mock import MagicMock, patch
+    from requests import HTTPError, Response, Timeout
+
+    ms = _ms()
+    workbook = MagicMock(id="isolated-workbook")
+    credentials = workbook.client.auth
+    for status in (401, 429, 503, 307, None):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        if status is None:
+            session.post.side_effect = Timeout()
+        else:
+            response = Response()
+            response.status_code = status
+            session.post.return_value = response
+        with patch.object(ms.requests, "Session", return_value=session):
+            try:
+                ms._submit_grouped_batch_once(workbook, [{"test": {}}])
+            except (HTTPError, Timeout, ValueError):
+                pass
+            else:
+                raise AssertionError("Unconfirmed status must fail")
+        session.post.assert_called_once()
+        assert session.post.call_args.kwargs["allow_redirects"] is False
+    assert credentials.before_request.call_count == 5
 
 
 def test_grouped_adapter_requires_exclusive_write_window():
@@ -1234,6 +1266,8 @@ def test_grouped_adapter_recovers_applied_timeout_and_local_finalize_failure():
             provider.finalize_grouped_write.side_effect = OSError("synthetic journal unavailable")
         first = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
         assert first[1] is None
+        builder.commit.assert_not_called()
+        builder.execute_external.assert_not_called()
         pending = provider.load_pending_grouped_write(owner)
         assert pending and provider.load_groups(owner) == ()
         assert provider.external_writes_disabled()
@@ -1278,6 +1312,8 @@ TESTS = [
      "Мои задачи: отказ при смене пользователя, листа или прав"),
     (test_grouped_adapter_blocks_conflict_and_does_not_replay_503,
      "Мои задачи: конфликт чтения и отсутствие повтора позиционного batchUpdate"),
+    (test_grouped_transport_does_not_replay_auth_or_retryable_statuses,
+     "Мои задачи: транспорт не повторяет позиционный запрос"),
     (test_grouped_adapter_requires_exclusive_write_window,
      "Мои задачи: запись только в исключительном окне"),
     (test_grouped_adapter_recovers_applied_timeout_and_local_finalize_failure,

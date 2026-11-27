@@ -1599,6 +1599,10 @@ if __name__ == "__main__":
     # «Мои задачи»: Google Tasks, пересланные сообщения, распознавание исполнителей
     from test_my_tasks import TESTS as _MY_TASKS_TESTS
     tests += _MY_TASKS_TESTS
+    from test_my_tasks_grouping import TESTS as _MY_TASKS_GROUPING_TESTS
+    tests += _MY_TASKS_GROUPING_TESTS
+    from test_my_tasks_group_journal import TESTS as _MY_TASKS_JOURNAL_TESTS
+    tests += _MY_TASKS_JOURNAL_TESTS
     # issue #36: иерархия Google Tasks, ссылки на письма, ссылка Телемоста
     from test_gt_hierarchy_links import TESTS as _ISSUE36_TESTS
     tests += _ISSUE36_TESTS
@@ -1608,6 +1612,16 @@ if __name__ == "__main__":
     # issue #39: ежедневный автоимпорт MYmeet (догон, дедупликация, уведомления)
     from test_mymeet_daily import TESTS as _MYMEET_DAILY_TESTS
     tests += _MYMEET_DAILY_TESTS
+    from test_mymeet_calendar_identity import (
+        test_primary_calendar_requires_organizer_and_participation_evidence,
+        test_shared_calendar_and_unknown_primary_disable_other_evidence_only,
+    )
+    tests += [
+        (test_primary_calendar_requires_organizer_and_participation_evidence,
+         "MYmeet: организатор и участие по основному Google Calendar"),
+        (test_shared_calendar_and_unknown_primary_disable_other_evidence_only,
+         "MYmeet: неизвестный владелец и общий календарь"),
+    ]
     # issue #41: заголовки встреч «Разовые встречи» (OVERFLOW_CELL, без объединения)
     from test_grouper_format import TESTS as _GROUPER_TESTS
     tests += _GROUPER_TESTS

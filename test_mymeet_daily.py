@@ -291,7 +291,8 @@ def _load_main(names, extra_ns, assigns):
 class Env:
     """Реальные функции main.py + реальный mymeet_sync + временная БД."""
 
-    def __init__(self, tmp, users=((1, "Europe/Moscow"),), gcal_reason=None):
+    def __init__(self, tmp, users=((1, "Europe/Moscow"),), gcal_reason=None, *,
+                 assigned_only=False):
         import test_my_tasks as tmt
         self.db = _tmp_db(tmp)
         self.ms = _ms()
@@ -302,6 +303,7 @@ class Env:
         self.gcal_reason = dict(gcal_reason or {})
         self.gcal_calls = []
         enc = _crypto.encrypt_token("tok-plain")
+        self.grouped_provider = None
         for tid, tzname in users:
             self.db.upsert_user(tid, f"u{tid}")
             conn = __import__("sqlite3").connect(self.db.DB_PATH)
@@ -311,12 +313,14 @@ class Env:
             conn.commit()
             conn.close()
             self.books[f"sheet-{tid}"] = Book()
+            self.books[f"sheet-{tid}"].ss.id = f"sheet-{tid}"
         gc = NS(open_by_key=lambda key: self.books[key].ss)
         self.ms._gs_client = lambda: gc
         mt = self.mt
         dbm = self.db
-        my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None:
-                         mt.MyTasksBuilder(tid, name, tz_name=tz_name, dbm=dbm))
+        my_tasks_ns = NS(MyTasksBuilder=lambda tid, name, tz_name=None, **kwargs:
+                         mt.MyTasksBuilder(tid, name, tz_name=tz_name, dbm=dbm,
+                                           assigned_mymeet_only=assigned_only))
 
         def _gcal_checked(tid, days):
             self.gcal_calls.append((tid, days))
@@ -325,7 +329,8 @@ class Env:
 
         async def _sync_async(days=30, append=False, user_config=None, stats=None):
             return self.ms.sync_to_sheets(days=days, append=append,
-                                          user_config=user_config, stats=stats)
+                                          user_config=user_config, stats=stats,
+                                          grouped_provider=self.grouped_provider)
         self.ns = _load_main(_MAIN_FUNCS, extra_ns={
             "asyncio": asyncio, "db": self.db, "mymeet_sync": self.ms,
             "my_tasks": my_tasks_ns, "_crypto": _crypto,
@@ -924,7 +929,465 @@ def test_logs_have_no_sheet_title_or_names():
             assert secret not in text, (secret, text)
 
 
+def test_assigned_foreign_pipeline_and_backfill():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Env(tmp, assigned_only=True, users=((1, "Europe/Moscow"), (2, "Europe/Moscow")))
+        now = _now()
+        env.mm.add("own", "Своя", now - timedelta(hours=3), [("Своя задача", ME, False)])
+        env.mm.add("other", "Чужая", now - timedelta(hours=4),
+                   [("Личное", "Петров И.", False), ("Однофамилец", ME, False),
+                    ("Не указан email", ME, False), ("Коллеги", "Анна Смирнова", False)])
+        env.mm.add("unknown", "Неясно", now - timedelta(hours=5), [("Неясное", ME, False)])
+        env.mm.add("old", "Пропущенная", now - timedelta(days=11), [("Догон", ME, False)])
+        env.mm.gcal = lambda: {"ids": {"ev-own"}, "times": set(),
+                              "other_ids": {"ev-other", "ev-old"},
+                              "primary_email": "participant@example.test"}
+        original = env.ms._fetch_protocol
+        fetched = []
+
+        def protocol(mid, token=None):
+            fetched.append((mid, token))
+            report = original(mid, token=token)
+            items = report["followup_v2"]["templates"][0]["entities"][0]["html_text"]
+            for item in items:
+                if item["task"] in {"Личное", "Личное уточнено", "Догон"}:
+                    item["id"] = "assigned-task"
+                    item["assignee"]["email"] = " Participant@example.test "
+                elif item["task"] in {"Однофамилец", "Коллеги"}:
+                    item["assignee"]["email"] = "colleague@example.test"
+            return report
+
+        env.ms._fetch_protocol = protocol
+
+        # Fixture authorizes isolated data only. The in-memory write below tests
+        # output of the evening/manual MYmeet fetch path, not Sheets batchUpdate.
+        env.grouped_provider = NS(
+            authorize=lambda tid, sheet: env.ms.VerifiedGroupedDestination(tid, sheet, 10)
+            if tid == 1 and sheet == "sheet-1" else None,
+            authorize_mymeet=lambda dest, email, ws, token: (
+                dest.telegram_id == 1 and email == "participant@example.test" and token == "tok-plain"
+            ),
+        )
+
+        def fixture_delivery(sheet, builder, provider, candidates, preflight):
+            verified = env.ms._verify_grouped_destination(provider, builder, sheet.id)
+            if verified is None or verified != preflight:
+                builder.blocked("grouped_destination_unverified")
+                return [], None, None
+            book = env.book(builder.telegram_id)
+            title = f"Мои задачи — {ME}"
+            header = env.ms.MY_TASKS_HEADER_ROW_V2
+            rows = builder.build(candidates, book.data.get(title, [header]))
+            book.data[title] = [header, *rows]
+            builder.commit()
+            return [], len(rows), title
+
+        env.ms._sync_grouped_my_tasks = fixture_delivery
+        env.mm.proto_fail.add("other")
+        env.force_due()
+        env.ns["_get_gcal_organizer_data_checked"] = (
+            lambda tid, days: (env.mm.gcal(), None) if tid == 1
+            else ({"ids": set(), "times": set(), "other_ids": set()}, None))
+        env.tick()
+        assert env.db.mymeet_sync_get(1)["last_outcome"] == "partial"
+        assert not env.my_tasks_sheet()[1:]
+        env.mm.proto_fail.clear()
+        env.force_due()
+        env.tick()
+        rows = env.my_tasks_sheet()
+        assert any("Личное" in row and UNVERIFIED in row for row in rows[1:]), rows
+        rejected = {"Своя задача", "Коллеги", "Неясное", "Однофамилец", "Не указан email"}
+        assert not any(rejected.intersection(row) for row in rows[1:]), rows
+        assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
+        assert not env.my_tasks_sheet(2)[1:]
+        assert "unknown" not in {mid for mid, _ in fetched}
+        assert all(token == "tok-plain" for _, token in fetched)
+
+        task = next(row for row in rows[1:] if "Личное" in row)
+        task[env.ms.MY_TASKS_STATUS_COL] = "В работе"
+        env.mm.add("other", "Чужая", now - timedelta(hours=4),
+                   [("Личное уточнено", "Петров И.", False)])
+        for _ in range(2):
+            cfg = env.ns["_user_row_to_mymeet_config"](env.db.get_user(1))
+            cfg["gcal_organizer_data"] = env.mm.gcal()
+            env.ms.sync_to_sheets(days=14, append=True, user_config=cfg,
+                                  grouped_provider=env.grouped_provider)
+        rows = env.my_tasks_sheet()
+        personal = [row for row in rows[1:] if "Личное уточнено" in row]
+        assert len(personal) == 1 and "В работе" in personal[0], rows
+        assert sum("Догон" in row for row in rows[1:]) == 1, rows
+        assert [row[1] for row in env.book().task_rows()] == ["Своя задача"]
+
+
+def test_assigned_task_requires_unique_provider_id():
+    ms = _ms()
+    tasks = [
+        {"id": "", "name": "Без ID", "assignee_email": "participant@example.test"},
+        {"id": "duplicate", "name": "Первое", "assignee_email": "participant@example.test"},
+        {"id": "duplicate", "name": "Второе", "assignee_email": "other@example.test"},
+    ]
+    assert not ms._assigned_mymeet_rows([{"tasks": tasks}], "participant@example.test")
+
+
+def test_foreign_import_is_disabled_in_default_runtime():
+    for assigned_only, outcome in [(False, "ok"), (True, "partial")]:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Env(tmp, assigned_only=assigned_only)
+            env.mm.add("other", "Чужая", _now() - timedelta(hours=3), [("Личное", ME, False)])
+            env.mm.gcal = lambda: {"ids": set(), "times": set(), "other_ids": {"ev-other"}}
+            fetched = []
+            env.ms._fetch_protocol = lambda mid, **kwargs: fetched.append(mid)
+            env.force_due()
+            env.tick()
+            assert not fetched
+            assert env.db.mymeet_sync_get(1)["last_outcome"] == outcome
+            assert not env.db.my_tasks_load(1)
+            assert not env.my_tasks_sheet()[1:]
+
+
+def _grouped_adapter_fixture():
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from my_tasks_grouping import TaskRow
+    from test_my_tasks_grouping import apply_row_plan, group
+
+    ms = _ms()
+    workbook = MagicMock()
+    workbook.id = "isolated-workbook"
+    worksheet = {"sheetId": 27, "title": "Изолированная книга", "sheetType": "GRID",
+                 "gridProperties": {"rowCount": 8}}
+    sheet = {"properties": worksheet}
+    workbook.fetch_sheet_metadata.return_value = {"sheets": [sheet]}
+    owner = ms.VerifiedGroupedDestination(1, workbook.id, 27)
+    builder = MagicMock(telegram_id=1)
+    task = TaskRow("tg:example", "Telegram", values=(1, "", "Telegram", "Пример", "", "",
+                                                   "В работе", "tg:example"))
+    provider = MagicMock()
+    provider.authorize.return_value = owner
+    provider.task_rows.return_value = [task]
+    builder.build.side_effect = lambda *_: [list(t.values) for t in provider.task_rows.return_value]
+    state = {"pending": None, "owned": (), "rows": [ms.MY_TASKS_HEADER_ROW_V2],
+             "external_writes_disabled": False}
+    provider.external_writes_disabled.side_effect = lambda: state["external_writes_disabled"]
+    provider.load_groups.side_effect = lambda _: state["owned"]
+    provider.load_pending_grouped_write.side_effect = lambda _: state["pending"]
+
+    @contextmanager
+    def exclusive(_):
+        state["external_writes_disabled"] = True
+        try:
+            yield True
+        finally:
+            state["external_writes_disabled"] = state["pending"] is not None
+
+    def begin(_, pending):
+        assert state["external_writes_disabled"]
+        assert state["pending"] is None
+        state["pending"] = pending
+
+    def finalize(_, pending):
+        assert state["external_writes_disabled"]
+        assert state["pending"] == pending
+        state.update(owned=pending.owned_groups, pending=None)
+
+    def apply(body):
+        assert state["external_writes_disabled"]
+        pending = state["pending"]
+        requests = body["requests"]
+        marker = requests[-1].get("createDeveloperMetadata") or requests[-1]["updateDeveloperMetadata"]
+        metadata = marker["developerMetadata"]
+        assert pending.receipt == metadata["metadataValue"]
+        sheet["developerMetadata"] = [{"metadataId": 47, "metadataKey": ms._GROUPED_RECEIPT_KEY,
+                                       "visibility": "PROJECT", "metadataValue": pending.receipt,
+                                       "location": {"locationType": "SHEET", "sheetId": 27}}]
+        state["rows"] = apply_row_plan(requests, state["rows"])
+        worksheet["gridProperties"]["rowCount"] += sum(
+            bool("insertDimension" in req or "appendDimension" in req) for req in requests)
+        sheet["rowGroups"] = [group(span.start, span.end, span.depth)
+                              for span in pending.owned_groups]
+
+    provider.exclusive_write.side_effect = exclusive
+    provider.begin_grouped_write.side_effect = begin
+    provider.finalize_grouped_write.side_effect = finalize
+    workbook.batch_update.side_effect = apply
+    ms._submit_grouped_batch_once = lambda sheet, ops: sheet.batch_update({"requests": ops})
+
+    def matched(*args, **kwargs):
+        return NS(json=lambda: {"spreadsheetId": workbook.id, "valueRanges": [{
+            "valueRange": {"values": [list(row) for row in state["rows"]]},
+            "dataFilters": kwargs["json"]["dataFilters"],
+        }]})
+
+    workbook.client.request.side_effect = matched
+    return ms, workbook, owner, builder, provider, matched
+
+
+def test_grouped_adapter_pins_access_and_requests_ranges_by_id():
+    ms, workbook, owner, builder, provider, _ = _grouped_adapter_fixture()
+    ms._gs_client = lambda: NS(open_by_key=lambda key: workbook)
+    result = ms.refresh_my_tasks_sheet(workbook.id, "Непроверенное ФИО", builder,
+                                     grouped_provider=provider)
+    assert result == ([], 1, "Изолированная книга")
+    assert provider.authorize.call_count == 5
+    assert workbook.client.request.call_count == 4
+    for call in workbook.client.request.call_args_list:
+        assert call.args[1].endswith("/values:batchGetByDataFilter")
+        assert call.kwargs["json"]["dataFilters"][0]["gridRange"]["sheetId"] == owner.sheet_id
+    workbook.values_batch_get.assert_not_called()
+    workbook.batch_update.assert_called_once()
+    builder.commit.assert_called_once()
+    builder.execute_external.assert_called_once()
+    provider.finalize_grouped_write.assert_called_once()
+    assert provider.finalize_grouped_write.call_args.args[0] == owner
+    assert not provider.load_pending_grouped_write(owner)
+    assert provider.load_groups(owner)
+    assert not provider.external_writes_disabled()
+    assert any("addDimensionGroup" in op
+               for op in workbook.batch_update.call_args.args[0]["requests"])
+
+
+def test_grouped_adapter_refuses_other_user_missing_rights_and_changed_destination():
+    ms, workbook, owner, builder, provider, _ = _grouped_adapter_fixture()
+    for invalid in (None, ms.VerifiedGroupedDestination(2, workbook.id, 27),
+                    ms.VerifiedGroupedDestination(1, workbook.id, 28)):
+        provider.authorize.return_value = invalid
+        result = ms._sync_my_tasks_and_colors(
+            workbook, "Пользователь", builder, grouped_provider=provider,
+            preflight_destination=owner, assigned_candidates=[["fixture"]],
+        )
+        assert result[1] is None
+        provider.task_rows.assert_not_called()
+        workbook.fetch_sheet_metadata.assert_not_called()
+        workbook.batch_update.assert_not_called()
+
+    # Reauthorization is required both before reading and before writing.
+    provider.authorize.side_effect = [owner, owner, None]
+    result = ms._sync_my_tasks_and_colors(workbook, "Пользователь", builder,
+                                        grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_not_called()
+
+    provider.authorize.side_effect = None
+    provider.authorize.return_value = None
+    ms._gs_client = lambda: (_ for _ in ()).throw(AssertionError("must not open workbook"))
+    assert ms.refresh_my_tasks_sheet(workbook.id, "Пользователь", builder,
+                                     grouped_provider=provider)[1] is None
+
+
+def test_grouped_adapter_blocks_external_effects_on_post_write_revocation():
+    ms, workbook, owner, builder, provider, _ = _grouped_adapter_fixture()
+    provider.authorize.side_effect = [owner, owner, owner, None]
+    result = ms._sync_my_tasks_and_colors(workbook, "Пользователь", builder,
+                                         grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_called_once()
+    provider.finalize_grouped_write.assert_called_once()
+    builder.commit.assert_not_called()
+    builder.execute_external.assert_not_called()
+
+
+def test_grouped_adapter_blocks_conflict_and_does_not_replay_503():
+    from unittest.mock import MagicMock
+    from requests import Response
+
+    ms, workbook, _, builder, provider, matched = _grouped_adapter_fixture()
+
+    def changed(*args, **kwargs):
+        reply = matched(*args, **kwargs).json()
+        reply["valueRanges"][0]["valueRange"]["values"].append(["Ручная правка"])
+        return NS(json=lambda: reply)
+
+    workbook.client.request.side_effect = lambda *a, **kw: (
+        matched(*a, **kw) if workbook.client.request.call_count < 3 else changed(*a, **kw)
+    )
+    result = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_not_called()
+
+    workbook.client.request.side_effect = matched
+    response = Response()
+    response.status_code = 503
+    response.json = MagicMock(return_value={"error": {"code": 503}})
+    workbook.batch_update.side_effect = gspread.exceptions.APIError(response)
+    result = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_called_once()
+    provider.finalize_grouped_write.assert_not_called()
+    assert provider.external_writes_disabled()
+    result = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_called_once()
+    assert provider.external_writes_disabled()
+
+
+def test_grouped_transport_does_not_replay_auth_or_retryable_statuses():
+    from unittest.mock import MagicMock, patch
+    from requests import HTTPError, Response, Timeout
+
+    ms = _ms()
+    workbook = MagicMock(id="isolated-workbook")
+    credentials = workbook.client.auth
+    for status in (401, 429, 503, 307, None):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        if status is None:
+            session.post.side_effect = Timeout()
+        else:
+            response = Response()
+            response.status_code = status
+            session.post.return_value = response
+        with patch.object(ms.requests, "Session", return_value=session):
+            try:
+                ms._submit_grouped_batch_once(workbook, [{"test": {}}])
+            except (HTTPError, Timeout, ValueError):
+                pass
+            else:
+                raise AssertionError("Unconfirmed status must fail")
+        session.post.assert_called_once()
+        assert session.post.call_args.kwargs["allow_redirects"] is False
+    assert credentials.before_request.call_count == 5
+
+
+def test_grouped_existing_cells_require_plain_text_and_comment_evidence():
+    from copy import deepcopy
+
+    ms, workbook, owner, _, provider, _ = _grouped_adapter_fixture()
+    provider.authorize_uncommented_cells.return_value = True
+    row = [1, "", "Telegram", "До", "", "", "В работе", "tg:example"]
+    rows = [ms.MY_TASKS_HEADER_ROW_V2, row]
+    changes = {"tg:example": {3: "После"}}
+    cell = {"userEnteredValue": {"stringValue": "До"}}
+    sheet = {"properties": {"sheetId": 27}, "data": [
+        {"startRow": 1, "startColumn": 3, "rowData": [{"values": [cell]}]},
+    ]}
+    reply = {"spreadsheetId": workbook.id, "sheets": [sheet]}
+    workbook.client.request.side_effect = lambda *args, **kwargs: NS(json=lambda: deepcopy(reply))
+    ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    assert workbook.client.request.call_args.kwargs["json"]["commentsViewMode"] == (
+        "COMMENTS_VIEW_MODE_INCLUDED")
+    sheet["commentAnchors"] = [{"commentId": "fixture"}]
+    try:
+        ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Reported comments must block updates")
+    del sheet["commentAnchors"]
+
+    for field, value in (("note", "Ручная заметка"), ("hyperlink", "https://example.test"),
+                         ("textFormatRuns", [{"startIndex": 0}]),
+                         ("dataValidation", {"strict": True}),
+                         ("userEnteredValue", {"formulaValue": "=A1"})):
+        original = cell.get(field)
+        cell[field] = value
+        try:
+            ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Protected task metadata must block updates")
+        if original is None:
+            del cell[field]
+        else:
+            cell[field] = original
+
+    provider.authorize_uncommented_cells.return_value = False
+    try:
+        ms._verify_grouped_cell_updates(workbook, owner, provider, rows, changes)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Independent comment coverage must be verified")
+
+
+def test_grouped_adapter_requires_exclusive_write_window():
+    from contextlib import nullcontext
+
+    ms, workbook, _, builder, provider, _ = _grouped_adapter_fixture()
+    provider.exclusive_write.side_effect = lambda _: nullcontext(False)
+    assert ms._sync_my_tasks_and_colors(workbook, "", builder,
+                                        grouped_provider=provider)[1] is None
+    workbook.fetch_sheet_metadata.assert_not_called()
+    workbook.batch_update.assert_not_called()
+    provider.begin_grouped_write.assert_not_called()
+
+
+def test_grouped_adapter_recovers_applied_timeout_and_local_finalize_failure():
+    from dataclasses import replace
+
+    for failure in ("timeout", "journal"):
+        ms, workbook, owner, builder, provider, _ = _grouped_adapter_fixture()
+        apply = workbook.batch_update.side_effect
+        finalizer = provider.finalize_grouped_write.side_effect
+
+        def apply_then_fail(body):
+            apply(body)
+            raise TimeoutError("synthetic ambiguity after apply")
+
+        if failure == "timeout":
+            workbook.batch_update.side_effect = apply_then_fail
+        else:
+            provider.finalize_grouped_write.side_effect = OSError("synthetic journal unavailable")
+        first = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+        assert first[1] is None
+        builder.commit.assert_not_called()
+        builder.execute_external.assert_not_called()
+        pending = provider.load_pending_grouped_write(owner)
+        assert pending and provider.load_groups(owner) == ()
+        assert provider.external_writes_disabled()
+        workbook.batch_update.side_effect = apply
+        provider.finalize_grouped_write.side_effect = finalizer
+        second = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+        assert second == ([], 1, "Изолированная книга")
+        workbook.batch_update.assert_called_once()
+        assert provider.load_pending_grouped_write(owner) is None
+        assert provider.load_groups(owner) == pending.owned_groups
+        assert not provider.external_writes_disabled()
+
+        existing = provider.task_rows.return_value[0]
+        extra = replace(existing, key="tg:new", values=(*existing.values[:-1], "tg:new"))
+        provider.task_rows.return_value = [existing, extra]
+        third = ms._sync_my_tasks_and_colors(workbook, "", builder, grouped_provider=provider)
+        assert third == ([], 2, "Изолированная книга")
+        assert workbook.batch_update.call_count == 2
+        marker = workbook.batch_update.call_args.args[0]["requests"][-1]
+        assert marker["updateDeveloperMetadata"]["dataFilters"] == [
+            {"developerMetadataLookup": {"metadataId": 47}},
+        ]
+
+
+def test_foreign_calendar_link_must_be_explicit_and_unambiguous():
+    ms = _ms()
+    gcal = {"ids": {"mine"}, "times": set(), "other_ids": {"mine", "theirs"}}
+    assert ms._foreign_calendar_id({"googleEventId": "theirs"}, gcal)
+    assert not ms._foreign_calendar_id({"googleEventId": "mine"}, gcal)
+    assert not ms._foreign_calendar_id({"googleEventId": "unknown"}, gcal)
+    assert not ms._foreign_calendar_id({"eventId": "theirs"}, gcal)
+    assert not ms._foreign_calendar_id(
+        {"googleEventId": "theirs", "calendarEventId": "mine"}, gcal)
+
+
 TESTS = [
+    (test_grouped_adapter_blocks_external_effects_on_post_write_revocation,
+     "Мои задачи: отзыв доступа блокирует внешние эффекты"),
+    (test_assigned_task_requires_unique_provider_id, "MYmeet: только уникальный ID поручения"),
+    (test_foreign_import_is_disabled_in_default_runtime, "MYmeet: рабочий импорт выключен"),
+    (test_grouped_adapter_pins_access_and_requests_ranges_by_id,
+     "Мои задачи: проверенная книга и числовой ID листа"),
+    (test_grouped_adapter_refuses_other_user_missing_rights_and_changed_destination,
+     "Мои задачи: отказ при смене пользователя, листа или прав"),
+    (test_grouped_adapter_blocks_conflict_and_does_not_replay_503,
+     "Мои задачи: конфликт чтения и отсутствие повтора позиционного batchUpdate"),
+    (test_grouped_transport_does_not_replay_auth_or_retryable_statuses,
+     "Мои задачи: транспорт не повторяет позиционный запрос"),
+    (test_grouped_existing_cells_require_plain_text_and_comment_evidence,
+     "Мои задачи: адресная запись только в проверенные текстовые ячейки"),
+    (test_grouped_adapter_requires_exclusive_write_window,
+     "Мои задачи: запись только в исключительном окне"),
+    (test_grouped_adapter_recovers_applied_timeout_and_local_finalize_failure,
+     "Мои задачи: восстановление журнала по квитанции Sheets после сбоя"),
+    (test_assigned_foreign_pipeline_and_backfill, "MYmeet: личные поручения и догон"),
+    (test_foreign_calendar_link_must_be_explicit_and_unambiguous, "MYmeet: точная связь с Calendar"),
     (test_slot_and_due_daily, "MYmeet авто: слот 19:00, ежедневный запуск, переход даты"),
     (test_timezones_per_user, "MYmeet авто: часовые поясы пользователей"),
     (test_missed_evening_and_first_run, "MYmeet авто: пропущенный вечер, первый запуск, окно"),

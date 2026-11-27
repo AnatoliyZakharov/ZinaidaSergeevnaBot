@@ -1490,9 +1490,42 @@ _GCAL_REASONS = {
 }
 
 
-def _get_gcal_organizer_data_checked(telegram_id: int, days: int) -> tuple:
+def _calendar_person_email(value) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", value):
+        return None
+    email = value.casefold()
+    if email.endswith(("@resource.calendar.google.com", "@group.calendar.google.com")):
+        return None
+    return email
+
+
+def _primary_calendar_participation(event: dict, primary_email: str) -> bool:
+    """Require concrete organizer and attendee evidence on the user's primary calendar."""
+    organizer = event.get("organizer")
+    if event.get("status") == "cancelled" or not isinstance(organizer, dict):
+        return False
+    email = _calendar_person_email(organizer.get("email"))
+    if not email or email == primary_email or organizer.get("self") or organizer.get("resource"):
+        return False
+    attendees = event.get("attendees")
+    if not isinstance(attendees, list):
+        return False
+    my_attendees = [
+        attendee for attendee in attendees
+        if isinstance(attendee, dict) and not attendee.get("resource")
+        and (attendee.get("self") is True or _calendar_person_email(attendee.get("email")) == primary_email)
+    ]
+    statuses = [attendee.get("responseStatus") for attendee in my_attendees]
+    return "declined" not in statuses and any(
+        status in ("accepted", "tentative", "needsAction") for status in statuses
+    )
+
+
+def _get_gcal_organizer_data_checked(telegram_id: int, days: int, *,
+                                      include_personal: bool = False) -> tuple:
     """Как _get_gcal_organizer_data, но (data | None, причина | None).
-    Причина — категория auth.classify_google_error / «no_auth»."""
+    Идентификаторы other_ids подтверждают участие в событии другого организатора
+    на основном календаре. Причина — категория auth.classify_google_error / «no_auth»."""
     try:
         creds, reason = auth.get_credentials_checked(telegram_id)
     except Exception as exc:
@@ -1509,33 +1542,64 @@ def _get_gcal_organizer_data_checked(telegram_id: int, days: int) -> tuple:
         now = datetime.now(timezone.utc)
         time_min = (now - timedelta(days=days)).isoformat()
         time_max = now.isoformat()
-        result = service.events().list(
-            calendarId=cal_id,
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            maxResults=2500,
-        ).execute()
+        primary_email = None
+        if include_personal and cal_id == "primary":
+            try:
+                primary = service.calendars().get(calendarId="primary").execute()
+                primary_email = _calendar_person_email(primary.get("id"))
+            except Exception as exc:
+                logger.warning("Google Calendar primary identity unavailable: %s", type(exc).__name__)
+
         organizer_ids: set[str] = set()
         organizer_times: set[int] = set()
-        for event in result.get("items", []):
-            if event.get("organizer", {}).get("self"):
-                organizer_ids.add(event["id"])
-                start = event.get("start", {})
-                dt_str = start.get("dateTime") or start.get("date")
-                if not dt_str:
+        other_ids: set[str] = set()
+        list_args = dict(
+            calendarId=cal_id, timeMin=time_min, timeMax=time_max, singleEvents=True, maxResults=2500,
+        )
+        events = service.events()
+        page_tokens = set()
+        while True:
+            result = events.list(**list_args).execute()
+            for event in result.get("items", []):
+                if not isinstance(event, dict):
                     continue
-                try:
-                    if "T" in dt_str:
-                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-                    else:
-                        dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
-                    organizer_times.add(int(dt.timestamp() / 60) * 60 * 1000)
-                except Exception:
-                    pass
+                event_id = event.get("id")
+                if not isinstance(event_id, str) or not event_id:
+                    continue
+                organizer = event.get("organizer")
+                if isinstance(organizer, dict) and organizer.get("self"):
+                    organizer_ids.add(event_id)
+                    start = event.get("start")
+                    if not isinstance(start, dict):
+                        continue
+                    dt_str = start.get("dateTime") or start.get("date")
+                    if not dt_str:
+                        continue
+                    try:
+                        if "T" in dt_str:
+                            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                        else:
+                            dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+                        organizer_times.add(int(dt.timestamp() / 60) * 60 * 1000)
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+                elif primary_email and _primary_calendar_participation(event, primary_email):
+                    other_ids.add(event_id)
+
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+            if not isinstance(page_token, str) or page_token in page_tokens:
+                raise RuntimeError("Invalid Google Calendar page token")
+            page_tokens.add(page_token)
+            list_args["pageToken"] = page_token
         logger.info("_get_gcal_organizer_data: %d organizer events for user %s",
                     len(organizer_ids), telegram_id)
-        return {"ids": organizer_ids, "times": organizer_times}, None
+        data = {"ids": organizer_ids, "times": organizer_times,
+                "other_ids": other_ids - organizer_ids}
+        if primary_email:
+            data["primary_email"] = primary_email
+        return data, None
     except Exception as exc:
         err = auth.classify_google_error(exc)
         logger.warning("_get_gcal_organizer_data failed for user %s: %s (%s)",
@@ -1576,7 +1640,8 @@ def _user_row_to_mymeet_config(user) -> dict | None:
     # «Мои задачи» в редактируемом режиме (протоколы + Google Tasks + Telegram).
     # Google Tasks здесь не опрашивается — только при ежедневной сверке в 19:00.
     cfg["my_tasks_builder"] = my_tasks.MyTasksBuilder(
-        user["telegram_id"], _user_full_name(user), tz_name=user["timezone"])
+        user["telegram_id"], _user_full_name(user), tz_name=user["timezone"],
+    )
     return cfg
 
 

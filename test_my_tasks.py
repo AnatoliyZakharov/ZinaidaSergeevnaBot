@@ -988,6 +988,82 @@ def test_concurrent_manual_edit_not_overwritten():
         assert book.rows(MY_TITLE)["B"][6] == "Выполнено"
 
 
+def test_build_rolls_back_legacy_rekey_on_partial_sqlite_failure():
+    import sqlite3
+
+    mt = _load_my_tasks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+        _user(db)
+        old_key, new_key = "gtasks:a", "gtasks:L1:a"
+        db.my_tasks_upsert(1, [{
+            "source": "gtasks", "source_key": old_key, "title": "Старое название",
+            "status": "В работе", "gtasks_list_id": "L1", "gtasks_task_id": "a",
+        }])
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript("""
+                PRAGMA journal_mode = WAL;
+                CREATE TRIGGER fail_before_task_upsert BEFORE INSERT ON my_tasks
+                WHEN NEW.source_key = 'gtasks:L1:a'
+                BEGIN SELECT RAISE(ABORT, 'isolated test failure'); END;
+            """)
+            gt = _FakeGT([_gt("a", title="Новое название")])
+
+            def builder():
+                return mt.MyTasksBuilder(1, ME, dbm=db, gt_ops=gt,
+                                         gtasks=(gt.items, True, gt.list_ids))
+
+            try:
+                builder().build([], [mt.HEADER_V2])
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("Expected SQLite to reject the update after rekey")
+            assert db.my_tasks_get(1, old_key)["title"] == "Старое название"
+            assert db.my_tasks_get(1, new_key) is None
+            assert not gt.calls
+            conn.execute("DROP TRIGGER fail_before_task_upsert")
+
+            for _ in range(2):
+                rows = builder().build([], [mt.HEADER_V2])
+                assert [row[7] for row in rows] == [new_key]
+            assert db.my_tasks_get(1, old_key) is None
+            assert db.my_tasks_get(1, new_key)["title"] == "Новое название"
+            assert not gt.calls
+        finally:
+            conn.close()
+
+
+def test_status_push_recovery_after_confirmed_sheet_write():
+    ms, mt = _load_ms(), _load_my_tasks()
+    for applied in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _tmp_db(tmp)
+            _user(db)
+            book = _Book({"Планёрка": [PROTO_HDR]})
+            gt = _FakeGT([_gt("a", title="A")])
+            _sync(mt, ms, db, book, gt)
+            book.set_status(MY_TITLE, "A", "Выполнено")
+            builder = mt.MyTasksBuilder(1, ME, dbm=db, gt_ops=gt,
+                                        gtasks=(gt.items, True, gt.list_ids))
+            rows = builder.build([], book.data[MY_TITLE])
+            book.data[MY_TITLE] = [ms.MY_TASKS_HEADER_ROW_V2, *rows]
+            builder.commit()
+            record = db.my_tasks_get(1, "gtasks:L1:a")
+            assert record["sheet_status"] == "Выполнено"
+            assert record["ext_synced_status"] == "В работе"
+
+            # Simulate restart without executing the plan, or after PATCH applied
+            # but before the local acknowledgement could be recorded.
+            if applied:
+                gt.items[0]["status"] = "completed"
+            _sync(mt, ms, db, book, gt)
+            expected = [] if applied else [("status", "L1", "a", "completed")]
+            assert gt.calls == expected
+            assert db.my_tasks_get(1, "gtasks:L1:a")["ext_synced_status"] == "Выполнено"
+
+
 def test_sheet_write_failure_and_shrink_keep_data():
     ms, mt = _load_ms(), _load_my_tasks()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1043,6 +1119,15 @@ def test_legacy_sheet_migration_and_legacy_mode():
     _, cnt, _ = ms._sync_my_tasks_and_colors(book.ss, ME)
     assert cnt == 1 and book.data[MY_TITLE][0] == ms.MY_TASKS_HEADER_ROW
     assert not [r for r in book.requests() if "setDataValidation" in r]
+    private_row = [1, "10.11.2026", "MYmeet", "Тестовое поручение", ME, "",
+                   "В работе", mt.KEY_MYMEET_ASSIGNED + "a" * 64]
+    expected = [ms.MY_TASKS_HEADER_ROW_V2, private_row]
+    book = _Book({MY_TITLE: [list(row) for row in expected]})
+    warnings, cnt, _ = ms._sync_my_tasks_and_colors(book.ss, ME)
+    assert cnt is None and any("проверки доступа" in msg for msg in warnings)
+    assert book.data[MY_TITLE] == expected
+    assert book.ws[MY_TITLE].update.call_count == 0
+    assert book.ws[MY_TITLE].batch_clear.call_count == 0
 
 
 # ══ 7. run_sync: итоги ═══════════════════════════════════════════════════
@@ -1300,6 +1385,9 @@ def test_gtasks_api_wrappers():
     assert patches[0]["body"] == {"status": "completed"}
     assert patches[1]["body"] == {"status": "needsAction", "completed": None}
     assert not gt.set_task_status(1, "L1", "1", "deleted", service=s)
+    s = _GTService(lists, pages, HttpError, op_errors=[503, 0])
+    assert not gt.set_task_status(1, "L1", "1", "completed", service=s)
+    assert len(s.calls) == 1
 
 
 def test_auth_scopes_no_gmail_and_no_gt_insert():
@@ -1401,6 +1489,47 @@ def test_protocol_verification_db_restore_and_migration():
         _sync(mt, ms, db3, book, with_gtasks=False)
         assert book.rows(MY_TITLE)["Сводка"][6] == "Требует верификации"
         assert db3.my_tasks_load(1)[0]["verified"] == 0
+
+
+def test_assigned_mymeet_persists_without_feed_and_keeps_manual_edits():
+    mt = _load_my_tasks()
+    key = "mymeet_assigned:" + "a" * 64
+    own_row = [1, "10.11.2026", "Собственная встреча", "Своё поручение", ME, "", "В работе", "own"]
+    legacy_row = [2, "10.11.2026", "Старый лист", "Сохранённая строка", ME, "", "Выполнено", "old"]
+    assigned = [None, "11.11.2026", "Тестовая встреча", "Тестовое поручение", ME,
+                "12.11.2026", "Выполнено", "other", key]
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _tmp_db(tmp)
+
+        def build(candidates, sheet, user=1, *, commit=True):
+            builder = mt.MyTasksBuilder(user, ME, dbm=db, assigned_mymeet_only=True)
+            rows = builder.build(candidates, sheet)
+            if commit:
+                builder.commit()
+            return rows
+
+        rows = build([own_row, assigned, assigned], [mt.HEADER_V2, legacy_row], commit=False)
+        assert {r[3]: r[6] for r in rows} == {
+            "Тестовое поручение": mt.ST_UNVERIFIED, "Сохранённая строка": mt.ST_DONE,
+        }
+        assert len(db.my_tasks_load(1)) == 1  # legacy sheet-only row stays on the sheet only
+        # Sheet write can fail after DB persistence. Recovery needs no fresh MYmeet feed.
+        rows = build(None, [mt.HEADER_V2, legacy_row])
+        task = next(r for r in rows if r[7] == key)
+        task[3], task[6] = "Ручное название", mt.ST_DONE
+        updated = [*assigned[:5], "13.11.2026", *assigned[6:]]
+        rows = build([updated], [mt.HEADER_V2, *rows])
+        task = next(r for r in rows if r[7] == key)
+        assert (task[3], task[5], task[6]) == ("Ручное название", "13.11.2026", mt.ST_DONE)
+        assert build([], [mt.HEADER_V2, *rows]) == rows
+        assert build([], [mt.HEADER_V2], user=2) == []
+        assert db.my_tasks_get(1, key)["source"] == mt.SRC_MYMEET_ASSIGNED
+
+        builder = mt.MyTasksBuilder(1, ME, dbm=db)
+        assert builder.build([assigned], [mt.HEADER_V2]) == []
+        assert db.my_tasks_get(1, key)["status"] == mt.ST_DONE
+        assert builder.build([], [mt.HEADER_V2, *rows]) is None
+        assert builder.block_reason == "unverified_mymeet_destination"
 
 
 def test_gtasks_task_date_not_invented():
@@ -1578,6 +1707,9 @@ TESTS = [
     (test_mass_cancel_in_sheet_no_deletes, "Отмена: массовая — без удалений"),
     (test_deleted_in_gt_becomes_cancelled_after_confirmation, "Удаление в GT → «Отменено»"),
     (test_concurrent_manual_edit_not_overwritten, "Гонка: ручная правка не затирается"),
+    (test_build_rolls_back_legacy_rekey_on_partial_sqlite_failure,
+     "Мои задачи: атомарное восстановление SQLite после частичного build"),
+    (test_status_push_recovery_after_confirmed_sheet_write, "Google Tasks: восстановление PATCH после сбоя"),
     (test_sheet_write_failure_and_shrink_keep_data, "Лист: ошибка записи / сжатие"),
     (test_legacy_sheet_migration_and_legacy_mode, "Лист: миграция старого формата"),
     (test_run_sync_outcomes_and_retry_no_duplicates, "run_sync: итоги, повтор без дублей"),
@@ -1588,6 +1720,8 @@ TESTS = [
     (test_auth_scopes_no_gmail_and_no_gt_insert, "OAuth без Gmail; задачи в GT не создаются"),
     (test_protocol_verification_only_by_manual_change, "Протоколы: подтверждение только вручную"),
     (test_protocol_verification_db_restore_and_migration, "Протоколы: восстановление БД, лист V1"),
+    (test_assigned_mymeet_persists_without_feed_and_keeps_manual_edits,
+     "MYmeet: чужие поручения, повтор, сбой записи, ручные правки и изоляция"),
     (test_gtasks_task_date_not_invented, "GT: дата постановки не выдумывается"),
     (test_manual_field_edits_preserved, "Лист: ручные правки полей сохраняются"),
     (test_concurrent_edit_any_field_conflict, "Гонка: правка любого поля → конфликт"),

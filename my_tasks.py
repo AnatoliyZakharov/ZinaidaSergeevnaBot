@@ -56,11 +56,13 @@ ST_CANCELLED = "Отменено"
 STATUS_VALUES = [ST_UNVERIFIED, ST_IN_WORK, ST_DONE, ST_OVERDUE, ST_CANCELLED]
 
 SRC_PROTOCOL = "protocol"
+SRC_MYMEET_ASSIGNED = "mymeet_assigned"
 SRC_GTASKS = "gtasks"
 SRC_TELEGRAM = "telegram"
 KEY_GTASKS = "gtasks:"
 KEY_TELEGRAM = "tg:"
 KEY_PROTOCOL = "p:"
+KEY_MYMEET_ASSIGNED = "mymeet_assigned:"
 
 GT_OPEN = "needsAction"
 GT_DONE = "completed"
@@ -547,17 +549,21 @@ def _gt_email_link(item: dict) -> str:
 
 def row_key(row) -> str | None:
     """Ключ строки листа «Мои задачи» (A–H).  H содержит ключ записи
-    (gtasks:/tg:/p:) — тогда правка видимых ячеек не меняет привязку строки.
+    (gtasks:/tg:/p:/mymeet_assigned:) — правка ячеек не меняет привязку строки.
     Старые строки (H = mtg_id или пусто) — ключ протокола из ячеек."""
     cells = _cells(row)
     h = cells[7]
-    if h.startswith((KEY_GTASKS, KEY_TELEGRAM, KEY_PROTOCOL)):
+    if h.startswith((KEY_GTASKS, KEY_TELEGRAM, KEY_PROTOCOL)) or _is_assigned_key(h):
         return h
     date_, meeting, task, assignee = cells[1], cells[2], cells[3], cells[4]
     if not date_ or not task:
         return None
     base = h or f"~{meeting.lower()}"
     return f"{KEY_PROTOCOL}{base}|{date_}|{task.lower()}|{assignee.lower()}"
+
+
+def _is_assigned_key(key) -> bool:
+    return isinstance(key, str) and bool(re.fullmatch(KEY_MYMEET_ASSIGNED + r"[0-9a-f]{64}", key))
 
 
 def _cells(row) -> list:
@@ -661,7 +667,7 @@ def apply_sheet_edit(rec: dict, sheet_val: str | None) -> bool:
 
 
 def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
-                       stats: dict) -> list:
+                       stats: dict, *, assigned_only: bool = False) -> list:
     """Строки протоколов (формат mymeet_sync._build_my_tasks_rows) → записи.
 
     Новая задача — ВСЕГДА «Требует верификации», verified=0, независимо от
@@ -674,7 +680,11 @@ def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
     """
     active, seen = [], set()
     for row in candidates:
-        key = row_key(row)
+        candidate_key = row[8] if len(row) > 8 else None
+        assigned = _is_assigned_key(candidate_key)
+        if assigned != assigned_only:
+            continue
+        key = candidate_key if assigned else row_key(row)
         if not key or key in seen:
             continue
         seen.add(key)
@@ -684,7 +694,7 @@ def reconcile_protocol(records: dict, candidates: list, sheet_vals: dict,
         rec = records.get(key)
         if rec is None:
             rec = {
-                "source": SRC_PROTOCOL, "source_key": key,
+                "source": SRC_MYMEET_ASSIGNED if assigned else SRC_PROTOCOL, "source_key": key,
                 "status": ST_UNVERIFIED, "verified": 0,
                 "ext_status": pstatus, "sheet_status": None, "_dirty": True,
             }
@@ -801,9 +811,10 @@ def reconcile_gtasks(records: dict, items: list, complete: bool, list_ids,
                     elif raw == GT_OPEN and status == ST_DONE:
                         rec["status"] = ST_IN_WORK
                         stats["gtasks_status_in"] = stats.get("gtasks_status_in", 0) + 1
-                elif local_changed and gt_class(status) != raw:
+                if local_changed and gt_class(status) != raw:
                     plan.pushes.append((key, it["_listId"], it["id"], gt_class(status)))
-                rec["ext_synced_status"] = rec["status"]
+                else:
+                    rec["ext_synced_status"] = rec["status"]
             rec["ext_status"] = raw
             rec["_dirty"] = True
         for field, val in (("title", title[:TITLE_MAX_LEN]), ("origin", origin),
@@ -931,7 +942,7 @@ def _row_number(path: tuple):
 
 
 def build_sheet_rows(records: dict, active_protocol: list) -> list:
-    """Строки листа: все gtasks/telegram + активные протокольные.
+    """Строки листа: постоянные источники и активные старые протокольные записи.
     [№, Дата, Источник, Задача, Ответственный, Срок, Статус, H=ключ, ключ]
     Значения — с учётом ручных правок пользователя (display_values).
 
@@ -1045,13 +1056,15 @@ class MyTasksBuilder:
     """
 
     def __init__(self, telegram_id: int, full_name: str, *, gtasks=None,
-                 gt_ops=None, dbm=None, tz_name: str | None = None):
+                 gt_ops=None, dbm=None, tz_name: str | None = None,
+                 assigned_mymeet_only: bool = False):
         self.telegram_id = telegram_id
         self.full_name = (full_name or "").strip()
         self.gtasks = gtasks
         self.gt_ops = gt_ops
         self.dbm = dbm
         self.tz_name = tz_name
+        self.assigned_mymeet_only = assigned_mymeet_only
         self.built = False
         self.committed = False
         self.block_reason = None
@@ -1067,17 +1080,19 @@ class MyTasksBuilder:
         return self.dbm or _db()
 
     def _save(self, records) -> None:
-        dirty = [r for r in records if r.pop("_dirty", False)]
-        for r in dirty:
-            for old in r.pop("_old_keys", []):
-                self._store().my_tasks_rekey(self.telegram_id, old, r["source_key"])
+        dirty = [r for r in records if r.get("_dirty")]
         if dirty:
             self._store().my_tasks_upsert(self.telegram_id, dirty)
+            for record in dirty:
+                record.pop("_dirty", None)
+                record.pop("_old_keys", None)
 
     def matcher(self):
         name = self.full_name
 
         def _m(assignee, _mid) -> bool:
+            if self.assigned_mymeet_only and is_speaker_label(assignee):
+                return False
             return match_assignee(assignee, name) is not None
         return _m
 
@@ -1085,8 +1100,19 @@ class MyTasksBuilder:
               sheet_available: bool = True) -> list | None:
         """Возвращает строки листа или None (аномалия — лист не писать)."""
         self.built = True
-        store = self._store()
-        loaded = store.my_tasks_load(self.telegram_id)
+        sheet_read = bool(sheet_available and my_rows)
+        sheet_cells = sheet_rows_by_key(my_rows) if sheet_read else {}
+        if not self.assigned_mymeet_only and any(map(_is_assigned_key, sheet_cells)):
+            self.blocked("unverified_mymeet_destination")
+            self.warnings.append(
+                "В листе найдены личные поручения MYmeet. Лист сохранён без изменений "
+                "до проверки доступа и назначения."
+            )
+            return None
+        loaded = self._store().my_tasks_load(self.telegram_id)
+        if not self.assigned_mymeet_only:
+            loaded = [r for r in loaded if r.get("source") != SRC_MYMEET_ASSIGNED
+                      and not _is_assigned_key(r["source_key"])]
         bad = [r for r in loaded if r.get("_decrypt_error")]
         if bad:
             self.anomaly = "decrypt"
@@ -1098,8 +1124,6 @@ class MyTasksBuilder:
         for r in records.values():
             if r.pop("_plaintext", False):
                 r["_dirty"] = True              # старая запись → будет зашифрована
-        sheet_read = bool(sheet_available and my_rows)
-        sheet_cells = sheet_rows_by_key(my_rows) if sheet_read else {}
         sheet_vals = {k: c[6] for k, c in sheet_cells.items()}
         v2 = is_v2_sheet(my_rows) if sheet_read else False
 
@@ -1109,11 +1133,11 @@ class MyTasksBuilder:
             if n:
                 _inc(self.stats, "manual_field_edits", n)
 
-        # 1. Ручные правки gtasks/telegram (по ключам, как они сейчас в листе)
+        # 1. Ручные правки постоянных задач и ранее опубликованных протокольных строк.
         gt_total = sum(1 for r in records.values() if r.get("source") == SRC_GTASKS)
         new_cancels = []
         for key, rec in records.items():
-            if rec.get("source") == SRC_PROTOCOL:
+            if rec.get("source") == SRC_PROTOCOL and not self.assigned_mymeet_only:
                 continue
             was = rec.get("status")
             if apply_sheet_edit(rec, sheet_vals.get(key)):
@@ -1133,8 +1157,12 @@ class MyTasksBuilder:
         migrate_legacy_gt_keys(records)
 
         # 2. Протоколы
-        active = (reconcile_protocol(records, protocol_candidates or [], sheet_vals, self.stats)
+        active = (reconcile_protocol(records, protocol_candidates or [], sheet_vals, self.stats,
+                                     assigned_only=self.assigned_mymeet_only)
                   if sheet_available else [])
+        if self.assigned_mymeet_only:
+            active.extend(key for key in sheet_cells
+                          if records.get(key, {}).get("source") == SRC_PROTOCOL)
 
         # 3. Google Tasks
         if self.gtasks is not None:
@@ -1207,7 +1235,14 @@ class MyTasksBuilder:
             span = email_link_span(r[3], rec["link"])
             if span:
                 self.link_spans[r[8]] = span
-        return [r[:8] for r in rows]
+        output = [r[:8] for r in rows]
+        if self.assigned_mymeet_only:
+            # Old sheet-only rows have no DB record to update. Keep them visible
+            # without treating them as evidence for importing new personal tasks.
+            for key, cells in sheet_cells.items():
+                if key not in records and (key.startswith(KEY_PROTOCOL) or _is_assigned_key(key)):
+                    output.append([len(output) + 1, *cells[1:7], key])
+        return output
 
     def sheet_unchanged(self, before_rows, fresh_rows) -> bool:
         """Лист (A:H целиком) не менялся между первым и повторным чтением."""
@@ -1236,6 +1271,7 @@ class MyTasksBuilder:
             rec = recs[key]
             if ok:
                 rec["ext_status"] = gt_status
+                rec["ext_synced_status"] = rec["status"]
                 _inc(self.stats, "gtasks_status_out")
             else:
                 rec["ext_synced_status"] = None    # повторим при следующей сверке

@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -19,11 +20,15 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import gspread
 import requests
+from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
+from gspread.urls import SPREADSHEET_URL
 
 logger = logging.getLogger(__name__)
 
@@ -504,7 +509,13 @@ def _extract_tasks(protocol: dict | None) -> list:
                     else:
                         assignee = str(assignee_raw).strip()
 
+                    assignee_email = assignee_raw.get("email") if isinstance(assignee_raw, dict) else None
+                    assigner = item.get("assigner")
+                    if isinstance(assigner, dict):
+                        assigner = assigner.get("speaker")
                     tasks.append({
+                        "assignee_email": assignee_email,
+                        "assigner": assigner.strip() if isinstance(assigner, str) else "",
                         "id":       item.get("id", ""),
                         "name":     (item.get("task") or item.get("name") or
                                      item.get("text") or "").strip(),
@@ -515,7 +526,7 @@ def _extract_tasks(protocol: dict | None) -> list:
                                          item.get("status") == "done"),
                     })
     except Exception as e:
-        logger.debug("Task extraction error: %s", e)
+        logger.debug("Task extraction error: %s", type(e).__name__)
     return tasks
 
 
@@ -658,6 +669,45 @@ def _extract_gcal_event_id(m: dict) -> str | None:
         if obj and isinstance(obj, str):
             return obj
     return None
+
+
+def _foreign_calendar_id(m: dict, gcal_data: dict) -> str | None:
+    # Generic meeting/event IDs can identify objects outside Google Calendar.
+    ids = {m[field] for field in ("googleEventId", "gcalEventId", "google_event_id",
+                                  "calendarEventId", "calendar_event_id")
+           if isinstance(m.get(field), str) and m[field]}
+    if len(ids) != 1:
+        return None
+    event_id = next(iter(ids))
+    if (event_id in gcal_data.get("other_ids", ())
+            and event_id not in gcal_data.get("ids", ())):
+        return event_id
+    return None
+
+
+def _assigned_mymeet_rows(meetings: list, primary_email: str | None) -> list:
+    if not isinstance(primary_email, str) or not primary_email.strip():
+        return []
+    primary_email = primary_email.strip().casefold()
+    rows = []
+    for meeting in meetings:
+        ids = Counter(task["id"] for task in meeting["tasks"]
+                      if isinstance(task.get("id"), str) and task["id"].strip())
+        for task in meeting["tasks"]:
+            task_id = task.get("id")
+            assignee_email = task.get("assignee_email")
+            if (not isinstance(task_id, str) or ids[task_id] != 1 or not task["name"].strip()
+                    or not isinstance(assignee_email, str)
+                    or assignee_email.strip().casefold() != primary_email):
+                continue
+            # Titles can change after MYmeet regenerates the report.
+            key = hashlib.sha256(json.dumps([meeting["calendar_id"], task_id]).encode()).hexdigest()
+            label = meeting["name"]
+            if task.get("assigner"):
+                label += f" · постановщик: {task['assigner']}"
+            rows.append([None, meeting["date"], label, task["name"], task["assignee"],
+                         task["deadline"], "", meeting["id"], f"mymeet_assigned:{key}"])
+    return rows
 
 
 def _is_organizer_by_gcal(m: dict, gcal_data: dict) -> bool:
@@ -1152,7 +1202,283 @@ def _my_tasks_sheet_stable(spreadsheet, title: str, before_rows, rows_builder) -
     return rows_builder.sheet_unchanged(before_rows, fresh)
 
 
-def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) -> tuple:
+@dataclass(frozen=True)
+class VerifiedGroupedDestination:
+    telegram_id: int
+    spreadsheet_id: str
+    sheet_id: int
+
+
+@dataclass(frozen=True)
+class PendingGroupedWrite:
+    receipt: str
+    owned_groups: tuple
+
+
+_GROUPED_RECEIPT_KEY = "my_tasks_structural_write"
+
+
+def _verify_grouped_destination(provider, rows_builder, spreadsheet_id):
+    if provider is None or rows_builder is None or not spreadsheet_id:
+        return None
+    user_id = rows_builder.telegram_id
+    destination = provider.authorize(user_id, spreadsheet_id)
+    if (not isinstance(destination, VerifiedGroupedDestination)
+            or destination.telegram_id != user_id
+            or destination.spreadsheet_id != spreadsheet_id):
+        return None
+    return destination
+
+
+def _grouped_sheet_metadata(spreadsheet, sheet_id):
+    fields = ("sheets(properties(sheetId,title,gridProperties(rowCount),sheetType),rowGroups,"
+              "developerMetadata(metadataId,metadataKey,metadataValue,location,visibility))")
+    metadata = _gs_call(spreadsheet.fetch_sheet_metadata, params={"fields": fields})
+    for sheet in metadata["sheets"]:
+        properties = sheet["properties"]
+        if properties["sheetId"] != sheet_id:
+            continue
+        if properties["sheetType"] != "GRID":
+            raise ValueError("Grouped task destination must be a grid sheet")
+        return sheet
+    raise ValueError("Verified task sheet is absent")
+
+
+def _grouped_write_receipt(sheet, sheet_id):
+    receipts = [item for item in sheet.get("developerMetadata", [])
+                if item.get("metadataKey") == _GROUPED_RECEIPT_KEY]
+    if not receipts:
+        return None
+    receipt = receipts[0]
+    location = receipt.get("location", {})
+    if (len(receipts) != 1 or receipt.get("visibility") != "PROJECT"
+            or location.get("locationType") != "SHEET" or location.get("sheetId", 0) != sheet_id
+            or not isinstance(receipt.get("metadataId"), int) or receipt["metadataId"] <= 0
+            or not isinstance(receipt.get("metadataValue"), str)):
+        raise ValueError("Grouped write receipt metadata is ambiguous")
+    return receipt["metadataId"], receipt["metadataValue"]
+
+
+def _grouped_receipt_request(sheet_id, previous, value):
+    if previous is None:
+        return {"createDeveloperMetadata": {"developerMetadata": {
+            "metadataKey": _GROUPED_RECEIPT_KEY, "metadataValue": value,
+            "location": {"sheetId": sheet_id}, "visibility": "PROJECT",
+        }}}
+    return {"updateDeveloperMetadata": {
+        "dataFilters": [{"developerMetadataLookup": {"metadataId": previous[0]}}],
+        "developerMetadata": {"metadataValue": value},
+        "fields": "metadataValue",
+    }}
+
+
+def _grouped_sheet_snapshot(spreadsheet, sheet_id, *, render="FORMULA"):
+    sheet = _grouped_sheet_metadata(spreadsheet, sheet_id)
+    properties = sheet["properties"]
+    data_filter = {"gridRange": {"sheetId": sheet_id, "endColumnIndex": 8}}
+    response = _gs_call(
+        spreadsheet.client.request, "post",
+        (SPREADSHEET_URL % spreadsheet.id) + "/values:batchGetByDataFilter",
+        json={"dataFilters": [data_filter], "valueRenderOption": render},
+    ).json()
+    matched = response["valueRanges"]
+    if (response["spreadsheetId"] != spreadsheet.id or len(matched) != 1
+            or matched[0]["dataFilters"] != [data_filter]):
+        raise ValueError("Grouped task sheet snapshot did not match the verified destination")
+    rows = matched[0]["valueRange"].get("values", [])
+    if not rows or rows[0] != MY_TASKS_HEADER_ROW_V2:
+        raise ValueError("Grouped task destination needs a pre-provisioned V2 task sheet")
+    return (properties["title"], properties["gridProperties"]["rowCount"], rows,
+            sheet.get("rowGroups", []), _grouped_write_receipt(sheet, sheet_id))
+
+
+def _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, changes):
+    """Authorize only plain cells whose same-grid metadata can be inspected."""
+    source = {str(row[7]).strip(): (index, row) for index, row in enumerate(rows[1:], 1)
+              if len(row) > 7 and row[7]}
+    locations = [(source[key][0], col) for key, values in changes.items() for col in values]
+    ranges = [{"sheetId": destination.sheet_id, "startRowIndex": row, "endRowIndex": row + 1,
+               "startColumnIndex": col, "endColumnIndex": col + 1} for row, col in locations]
+    fields = ("spreadsheetId,sheets(properties(sheetId),data(startRow,startColumn,"
+              "rowData(values(userEnteredValue,hyperlink,textFormatRuns,note,dataValidation,"
+              "userEnteredFormat(textFormat(link),numberFormat),chipRuns,pivotTable,dataSourceFormula,"
+              "dataSourceTable))),commentAnchors)")
+    response = _gs_call(
+        spreadsheet.client.request, "post", (SPREADSHEET_URL % spreadsheet.id) + ":getByDataFilter",
+        params={"fields": fields},
+        json={"dataFilters": [{"gridRange": grid} for grid in ranges],
+              "commentsViewMode": "COMMENTS_VIEW_MODE_INCLUDED"},
+    ).json()
+    sheets = response.get("sheets", [])
+    if (response.get("spreadsheetId") != destination.spreadsheet_id or len(sheets) != 1
+            or sheets[0].get("properties", {}).get("sheetId", 0) != destination.sheet_id
+            or sheets[0].get("commentAnchors")
+            or provider.authorize_uncommented_cells(destination, tuple(locations)) is not True):
+        raise ValueError("Existing task cells lack trusted protection evidence")
+    protected = ("hyperlink", "textFormatRuns", "note", "dataValidation", "chipRuns",
+                 "pivotTable", "dataSourceFormula", "dataSourceTable")
+    cells = {}
+    for grid in sheets[0].get("data", []):
+        values = grid.get("rowData", [])
+        if len(values) != 1 or len(values[0].get("values", [])) != 1:
+            continue
+        position = grid.get("startRow", 0), grid.get("startColumn", 0)
+        if position in cells:
+            raise ValueError("Existing cell metadata is ambiguous")
+        cells[position] = values[0]["values"][0]
+    for key, values in changes.items():
+        index, row = source[key]
+        for column in values:
+            cell = cells.get((index, column))
+            if (cell is None or any(cell.get(field) for field in protected)
+                    or cell.get("userEnteredFormat", {}).get("textFormat", {}).get("link")):
+                raise ValueError("Existing task field has protected cell metadata")
+            raw = row[column] if len(row) > column else ""
+            entered = cell.get("userEnteredValue")
+            expected = {"stringValue": raw} if isinstance(raw, str) and raw else {}
+            if (isinstance(raw, str) and raw.startswith("=")) or (entered or {}) != expected:
+                raise ValueError("Existing task field is not proven plain text")
+
+
+def _submit_grouped_batch_once(spreadsheet, requests_to_apply):
+    """Authorize before sending, avoiding gspread backoff and auth replay."""
+    url = (SPREADSHEET_URL % spreadsheet.id) + ":batchUpdate"
+    headers = {}
+    with requests.Session() as session:
+        # Credential refresh can retry before mutation. Use the plain session
+        # for the batch so 401/429/503 and redirects cannot trigger replay.
+        spreadsheet.client.auth.before_request(Request(session=session), "POST", url, headers)
+        _throttle()
+        response = session.post(url, json={"requests": requests_to_apply}, headers=headers,
+                                timeout=(5, 30), allow_redirects=False)
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise ValueError("Structural batch returned an unexpected status")
+
+
+def _sync_grouped_my_tasks(
+    spreadsheet, rows_builder, provider, assigned_candidates, preflight_destination,
+):
+    from my_tasks import sheet_snapshot
+    from my_tasks_grouping import GROUP_HEADER_PREFIX, plan_grouped_sheet_update
+
+    def fields(by_row):
+        return {row[7]: row[1:7] for row in sheet_snapshot(by_row)
+                if row[7] and not row[7].startswith(GROUP_HEADER_PREFIX)}
+
+    # The provider must prove a window that excludes external editors and other
+    # writers, not merely acquire a process-local lock. It must also implement
+    # a durable journal keyed by this user, spreadsheet and sheet. Begin must
+    # reject an existing entry. Finalize must atomically store the entry's
+    # owned groups and remove that exact entry. The exclusive window must
+    # survive context exit and worker crash while a journal entry is pending.
+    # External edits may resume only after proof of application or conclusive
+    # proof the original request cannot apply. A timeout is neither.
+    title = None
+    try:
+        destination = _verify_grouped_destination(
+            provider, rows_builder, getattr(spreadsheet, "id", None))
+        if (destination is None
+                or (preflight_destination is not None and destination != preflight_destination)
+                or (assigned_candidates and preflight_destination is None)):
+            raise ValueError("Private task destination was not verified")
+        with provider.exclusive_write(destination) as exclusive:
+            if (exclusive is not True or destination != _verify_grouped_destination(
+                    provider, rows_builder, spreadsheet.id)):
+                raise ValueError("Exclusive structural write window was not verified")
+            snapshot = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
+            title, row_count, rows, groups, receipt = snapshot
+            pending = provider.load_pending_grouped_write(destination)
+            if pending is not None:
+                if (not isinstance(pending, PendingGroupedWrite)
+                        or receipt is None or receipt[1] != pending.receipt):
+                    # An earlier request might still reach Google. Never clear
+                    # the journal or send further positional writes based on
+                    # a missing receipt.
+                    raise ValueError("Earlier structural write has an unknown outcome")
+                provider.finalize_grouped_write(destination, pending)
+
+            displayed = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id,
+                                                render="FORMATTED_VALUE")[2]
+            # build persists retryable reconciliation intent; the emitted plan
+            # remains local to this attempt, including Google Tasks operations.
+            built = rows_builder.build(list(assigned_candidates), displayed)
+            if built is None:
+                raise ValueError("Task reconciliation was blocked")
+            expected = fields(built)
+            observed = fields(displayed[1:])
+            # The provider attaches trusted source and meeting provenance to
+            # the complete reconciled inventory, including saved assignments.
+            tasks = provider.task_rows(destination, rows_builder, built)
+            if ({task.key for task in tasks} != expected.keys()
+                    or any(fields([task.values]).get(task.key) != expected[task.key]
+                           for task in tasks if task.key not in observed)):
+                raise ValueError("Grouped writer cannot safely publish reconciled task fields")
+            changes = {
+                key: {column: after for column, (before, after)
+                      in enumerate(zip(observed[key], expected[key]), start=1) if before != after}
+                for key in observed.keys() & expected.keys() if observed[key] != expected[key]
+            }
+            existing_keys = [
+                str(row[7]).strip() if len(row) > 7 and row[7] is not None else None
+                for row in rows[1:]
+            ]
+            owned = tuple(provider.load_groups(destination))
+            meeting_keys = {group.key for group in owned
+                            if group.key.startswith(GROUP_HEADER_PREFIX + "meeting:")}
+            labels = {row[7]: row[2] for row in rows[1:]
+                      if len(row) > 7 and isinstance(row[7], str) and row[7] in meeting_keys}
+            checked_cells = dict(changes)
+            for task in tasks:
+                header_key = f"{GROUP_HEADER_PREFIX}meeting:{task.meeting_id}"
+                if task.source == "MYmeet" and task.meeting_date and header_key in labels:
+                    title_value = f"{task.meeting_name} · {task.meeting_date:%d.%m.%Y}"
+                    if labels[header_key] != title_value:
+                        checked_cells[header_key] = {2: title_value}
+            if checked_cells:
+                _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, checked_cells)
+            plan = plan_grouped_sheet_update(
+                destination.sheet_id, row_count, existing_keys, groups, tasks,
+                owned_groups=owned, existing_header_labels=labels, existing_cell_updates=changes,
+            )
+            if (destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id)
+                    or snapshot != _grouped_sheet_snapshot(spreadsheet, destination.sheet_id)
+                    or owned != tuple(provider.load_groups(destination))):
+                raise ValueError("Task destination changed while planning")
+            if checked_cells:
+                _verify_grouped_cell_updates(spreadsheet, destination, provider, rows, checked_cells)
+            if plan.requests:
+                pending = PendingGroupedWrite(uuid4().hex, tuple(plan.owned_groups))
+                provider.begin_grouped_write(destination, pending)
+                marker = _grouped_receipt_request(destination.sheet_id, receipt, pending.receipt)
+                # The receipt is in the same atomic Sheets batch as the moves.
+                # The journal is retained if delivery or finalization fails.
+                _submit_grouped_batch_once(spreadsheet, [*plan.requests, marker])
+                receipt_sheet = _grouped_sheet_metadata(spreadsheet, destination.sheet_id)
+                applied = _grouped_write_receipt(receipt_sheet, destination.sheet_id)
+                if applied is None or applied[1] != pending.receipt:
+                    raise ValueError("Structural write receipt was not confirmed")
+                provider.finalize_grouped_write(destination, pending)
+            published = _grouped_sheet_snapshot(spreadsheet, destination.sheet_id,
+                                                render="FORMATTED_VALUE")[2]
+            actual = fields(published[1:])
+            if any(actual.get(key) != value for key, value in expected.items()):
+                raise ValueError("Confirmed sheet differs from reconciled task fields")
+            if destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id):
+                raise ValueError("Private task destination changed after the write")
+            rows_builder.commit()
+            rows_builder.execute_external()
+        return [], len(tasks), title
+    except Exception as exc:
+        if rows_builder is not None:
+            rows_builder.blocked("grouped_destination_unverified")
+        logger.warning("Grouped task sheet was not confirmed: %s", type(exc).__name__)
+        return ["Обновление личного листа с группами не подтверждено."], None, title
+
+
+def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None, *,
+                              assigned_candidates=(), grouped_provider=None,
+                              preflight_destination=None) -> tuple:
     """Post-sync step: status colours on protocol sheets and on every
     «Мои задачи — …» sheet; when full_name is set, the user's personal
     «Мои задачи — {ФИО}» sheet is (re)written.  Other users' sheets are never
@@ -1168,6 +1494,10 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
     builder.commit() is called only after a successful write.  The sheet is
     not rewritten if it would shrink below half (mass-deletion guard).
     """
+    if grouped_provider is not None:
+        return _sync_grouped_my_tasks(
+            spreadsheet, rows_builder, grouped_provider, assigned_candidates, preflight_destination,
+        )
     warnings: list[str] = []
     full_name = (full_name or "").strip()
 
@@ -1218,13 +1548,30 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
             try:
                 proto = {t: values[t] for t in protocol_titles}
                 exists = my_title in sheet_ids
-                if rows_builder is None:
+                from my_tasks import KEY_MYMEET_ASSIGNED
+                from my_tasks_grouping import GROUP_HEADER_PREFIX
+
+                existing_rows = values.get(my_title, [])
+                if any(len(row) > 7 and str(row[7]).strip().startswith(
+                           (KEY_MYMEET_ASSIGNED, GROUP_HEADER_PREFIX))
+                       for row in existing_rows):
+                    rows = None
+                    warnings.append(
+                        "Лист с группами или личными поручениями MYmeet сохранён до проверки доступа."
+                    )
+                    if rows_builder is not None:
+                        rows_builder.blocked("grouped_destination_unverified")
+                elif rows_builder is None:
                     rows = _build_my_tasks_rows(proto, full_name)
                 else:
                     my_rows = values.get(my_title) if exists else None
-                    candidates = _build_my_tasks_rows(
-                        proto, full_name, matcher=rows_builder.matcher())
-                    rows = rows_builder.build(candidates, my_rows)
+                    if getattr(rows_builder, "assigned_mymeet_only", False):
+                        rows_builder.blocked("grouped_destination_unverified")
+                        rows = None
+                    else:
+                        candidates = _build_my_tasks_rows(
+                            proto, full_name, matcher=rows_builder.matcher())
+                        rows = rows_builder.build(candidates, my_rows)
                     before = _count_my_task_rows(my_rows)
                     if rows is None:
                         pass                    # аномалия builder-а (см. его warnings)
@@ -1286,19 +1633,34 @@ def _sync_my_tasks_and_colors(spreadsheet, full_name: str, rows_builder=None) ->
     return warnings, my_count, my_title
 
 
-def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder) -> tuple:
+def refresh_my_tasks_sheet(sheet_id: str, full_name: str, rows_builder, *,
+                           grouped_provider=None) -> tuple:
     """Rewrite only the personal «Мои задачи» sheet (+ status colours) without
     touching MYmeet: used by the daily Google Tasks sync and after a forwarded
     Telegram task.  Returns the same tuple as _sync_my_tasks_and_colors."""
+    spreadsheet_id = sheet_id or SPREADSHEET_ID
+    destination = None
+    if grouped_provider is not None:
+        try:
+            destination = _verify_grouped_destination(grouped_provider, rows_builder, spreadsheet_id)
+        except Exception as exc:
+            logger.warning("Grouped task destination check failed: %s", type(exc).__name__)
+        if destination is None:
+            if rows_builder is not None:
+                rows_builder.blocked("grouped_destination_unverified")
+            return ["Обновление личного листа с группами не подтверждено."], None, None
     gc = _gs_client()
-    spreadsheet = gc.open_by_key(sheet_id or SPREADSHEET_ID)
-    return _sync_my_tasks_and_colors(spreadsheet, full_name, rows_builder=rows_builder)
+    spreadsheet = gc.open_by_key(spreadsheet_id)
+    return _sync_my_tasks_and_colors(
+        spreadsheet, full_name, rows_builder=rows_builder, grouped_provider=grouped_provider,
+        preflight_destination=destination,
+    )
 
 
 # ── Core sync ─────────────────────────────────────────────────────────────────
 
 def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | None = None,
-                   stats: dict | None = None) -> str:
+                   stats: dict | None = None, *, grouped_provider=None) -> str:
     """
     Fetch MYmeet data and write to Google Sheets.
 
@@ -1343,7 +1705,26 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
             "проверки организатора. "
             "Синхронизация отменена — Google Sheets не изменён."
         )
+    builder = cfg.get("my_tasks_builder")
+    personal_config = user_config or {}
+    foreign_meetings = []
+    preflight_destination = None
+    if (getattr(builder, "assigned_mymeet_only", False) and grouped_provider is not None
+            and personal_config.get("mymeet_token")
+            and personal_config.get("mymeet_spreadsheet_id")):
+        try:
+            destination = _verify_grouped_destination(grouped_provider, builder, cfg["sheet_id"])
+            primary_email = _gcal_data.get("primary_email")
+            if (destination is not None and primary_email
+                    and grouped_provider.authorize_mymeet(
+                        destination, primary_email, cfg["ws_id"], cfg["token"],
+                    ) is True):
+                preflight_destination = destination
+                foreign_meetings = [m for m in raw_meetings if _foreign_calendar_id(m, _gcal_data)]
+        except Exception as exc:
+            logger.warning("Grouped task destination check failed: %s", type(exc).__name__)
     raw_meetings = [m for m in raw_meetings if _is_organizer_by_gcal(m, _gcal_data)]
+    foreign_meetings = [m for m in foreign_meetings if not _is_organizer_by_gcal(m, _gcal_data)]
     _after_org_count = len(raw_meetings)
     st.update(fetched=_fetched_count, after_date=_after_date_count, after_org=_after_org_count)
     logger.info("After organizer filter (GCal ids=%d times=%d): %d meetings",
@@ -1356,6 +1737,7 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         date = m.get("startTime") or m.get("date") or m.get("createdAt") or ""
         protocol = _fetch_protocol(mid, token=cfg["token"]) if mid else None
         return {
+            "calendar_id": _foreign_calendar_id(m, _gcal_data),
             "missing": protocol is None,   # ещё не готов (404) — догонится позже
             "id":    mid,
             "name":  name,
@@ -1364,14 +1746,16 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
         }
 
     all_meetings = []
+    personal_meetings = []
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_one, m): m for m in raw_meetings}
+        futures = {pool.submit(_fetch_one, m): all_meetings for m in raw_meetings}
+        futures.update({pool.submit(_fetch_one, m): personal_meetings for m in foreign_meetings})
         for fut in as_completed(futures):
             try:
                 res_m = fut.result()
                 if res_m.pop("missing", False):
                     st["protocols_missing"] += 1
-                all_meetings.append(res_m)
+                futures[fut].append(res_m)
             except Exception as e:
                 st["protocols_failed"] += 1
                 logger.warning("Protocol fetch error: %s", type(e).__name__)
@@ -1804,8 +2188,15 @@ def sync_to_sheets(days: int = 30, append: bool = False, user_config: dict | Non
     my_tasks_title = None
     _builder = cfg.get("my_tasks_builder")
     try:
+        kwargs = {"rows_builder": _builder}
+        if grouped_provider is not None:
+            kwargs["grouped_provider"] = grouped_provider
+            kwargs["preflight_destination"] = preflight_destination
+        if personal_meetings:
+            kwargs["assigned_candidates"] = _assigned_mymeet_rows(
+                personal_meetings, _gcal_data.get("primary_email"))
         _mt_warnings, my_tasks_count, my_tasks_title = _sync_my_tasks_and_colors(
-            spreadsheet, full_name, rows_builder=_builder)
+            spreadsheet, full_name, **kwargs)
         all_fmt_warnings.extend(_mt_warnings)
     except Exception as e:
         logger.warning("Sheet formatting error: %s", _err_brief(e))
@@ -2411,10 +2802,12 @@ async def sync_to_sheets_async(
     append: bool = False,
     user_config: dict | None = None,
     stats: dict | None = None,
+    *,
+    grouped_provider=None,
 ) -> str:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
         lambda: sync_to_sheets(days=days, append=append, user_config=user_config,
-                               stats=stats),
+                               stats=stats, grouped_provider=grouped_provider),
     )

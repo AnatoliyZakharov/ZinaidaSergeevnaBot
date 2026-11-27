@@ -1401,6 +1401,8 @@ def _sync_grouped_my_tasks(
             actual = fields(published[1:])
             if any(actual.get(key) != value for key, value in expected.items()):
                 raise ValueError("Confirmed sheet differs from reconciled task fields")
+            if destination != _verify_grouped_destination(provider, rows_builder, spreadsheet.id):
+                raise ValueError("Private task destination changed after the write")
             rows_builder.commit()
             rows_builder.execute_external()
         return [], len(tasks), title

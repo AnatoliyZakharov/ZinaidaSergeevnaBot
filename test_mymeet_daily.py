@@ -1128,7 +1128,7 @@ def test_grouped_adapter_pins_access_and_requests_ranges_by_id():
     result = ms.refresh_my_tasks_sheet(workbook.id, "Непроверенное ФИО", builder,
                                      grouped_provider=provider)
     assert result == ([], 1, "Изолированная книга")
-    assert provider.authorize.call_count == 4
+    assert provider.authorize.call_count == 5
     assert workbook.client.request.call_count == 4
     for call in workbook.client.request.call_args_list:
         assert call.args[1].endswith("/values:batchGetByDataFilter")
@@ -1172,6 +1172,18 @@ def test_grouped_adapter_refuses_other_user_missing_rights_and_changed_destinati
     ms._gs_client = lambda: (_ for _ in ()).throw(AssertionError("must not open workbook"))
     assert ms.refresh_my_tasks_sheet(workbook.id, "Пользователь", builder,
                                      grouped_provider=provider)[1] is None
+
+
+def test_grouped_adapter_blocks_external_effects_on_post_write_revocation():
+    ms, workbook, owner, builder, provider, _ = _grouped_adapter_fixture()
+    provider.authorize.side_effect = [owner, owner, owner, None]
+    result = ms._sync_my_tasks_and_colors(workbook, "Пользователь", builder,
+                                         grouped_provider=provider)
+    assert result[1] is None
+    workbook.batch_update.assert_called_once()
+    provider.finalize_grouped_write.assert_called_once()
+    builder.commit.assert_not_called()
+    builder.execute_external.assert_not_called()
 
 
 def test_grouped_adapter_blocks_conflict_and_does_not_replay_503():
@@ -1304,6 +1316,8 @@ def test_foreign_calendar_link_must_be_explicit_and_unambiguous():
 
 
 TESTS = [
+    (test_grouped_adapter_blocks_external_effects_on_post_write_revocation,
+     "Мои задачи: отзыв доступа блокирует внешние эффекты"),
     (test_assigned_task_requires_unique_provider_id, "MYmeet: только уникальный ID поручения"),
     (test_foreign_import_is_disabled_in_default_runtime, "MYmeet: рабочий импорт выключен"),
     (test_grouped_adapter_pins_access_and_requests_ranges_by_id,

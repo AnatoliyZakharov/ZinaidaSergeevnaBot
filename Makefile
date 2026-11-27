@@ -5,12 +5,13 @@ PYTHON ?= python3
 PY_SOURCES := main.py mymeet_sync.py db.py auth.py gtasks.py crypto.py
 
 .DEFAULT_GOAL := help
-.PHONY: help test lint run
+.PHONY: help test test-mymeet-stand lint run
 
 help:
 	@echo "Available targets:"
 	@echo "  make help  - show this help (default)"
 	@echo "  make test  - run smoke tests (test_smoke.py) with empty MYmeet/Google env"
+	@echo "  make test-mymeet-stand - run isolated synthetic MYmeet/Sheets scenarios"
 	@echo "  make lint  - ruff check if installed, otherwise syntax check only"
 	@echo "  make run   - start the bot locally (python main.py)"
 	@echo ""
@@ -20,6 +21,9 @@ help:
 
 test:
 	MYMEET_TOKEN="" MYMEET_WS_ID="" MYMEET_SPREADSHEET_ID="" ORGANIZER_EMAIL="" GOOGLE_SA_KEY="{}" $(PYTHON) test_smoke.py
+
+test-mymeet-stand:
+	env -i PATH="$$PATH" PYTHONDONTWRITEBYTECODE=1 $(PYTHON) ci/run_mymeet_stand.py
 
 lint:
 	@if $(PYTHON) -m ruff --version >/dev/null 2>&1; then \
